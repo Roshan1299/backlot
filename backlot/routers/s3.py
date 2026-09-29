@@ -12,15 +12,16 @@ the bucket first.
 Responses are S3 XML (namespace ``http://s3.amazonaws.com/doc/2006-03-01/``) or raw object bytes;
 errors use the S3 ``<Error>`` envelope.
 
-S3 dispatches on the query string: ``?acl``, ``?versioning``, ``?tagging`` and the rest each select a
-different operation at the same path. Two of them are answered at a bucket's path, ``?location``
-(GetBucketLocation) and ``?uploads`` (ListMultipartUploads, always the empty page, since data
-enters through ``backlot import`` and no upload is ever in progress), and ``?uploadId`` at a key
-(ListParts) is ``NoSuchUpload`` for the same reason. A selector whose operations are all on another
-method is the 405 a GET gets on real (``_BUCKET_READ_REFUSED``, ``_OBJECT_READ_REFUSED``). The
-other ones Backlot does not implement are refused with ``NotImplemented`` (501) rather than
-answered with the listing or the object's bytes, so a caller gets an error to handle instead of
-another operation's body to parse.
+S3 dispatches on the query string: ``?acl``, ``?versioning``, ``?tagging`` and the rest each select
+a different operation at the same path. Two of them are answered at a bucket's path, ``?location``
+(GetBucketLocation, at a key's path too) and ``?uploads`` (ListMultipartUploads, always the empty
+page, since data enters through ``backlot import`` and no upload is ever in progress), and
+``?uploadId`` at a key (ListParts) is ``NoSuchUpload`` for the same reason. A selector whose
+operations are all on another method is the 405 a GET gets on real (``_BUCKET_READ_REFUSED``,
+``_OBJECT_READ_REFUSED``), and a few more are refused at one path the way real refuses them there
+(``_BUCKET_OBJECT_SELECTORS``, ``_KEY_BUCKET_REFUSALS``). The other ones Backlot does not implement
+are refused with ``NotImplemented`` (501) rather than answered with the listing or the object's
+bytes, so a caller gets an error to handle instead of another operation's body to parse.
 
 Object model: a bucket is the grouping/ACL unit (``s3_buckets``); an object is one doc
 (``s3_objects``), ``key`` is its address and ``content`` its verbatim body. "Folders" are pure
@@ -225,6 +226,49 @@ _OBJECT_SELECTORS = frozenset(
 # `Allow` on the HEAD refusal and the GET it names cannot drift apart. No object selector is served,
 # so an object's refusal names no method at all.
 _BUCKET_GETS = frozenset({"location", "uploads"})
+# Two object selectors a bucket's path answers, after the bucket: `?torrent` is the 405 naming
+# `TORRENT` on a GET, and `?uploadId` is 400 `InvalidRequest`, "A key must be specified", on a GET,
+# a `POST` and a `DELETE`, where each is `NoSuchBucket` for a bucket that does not exist (measured
+# 2026-09-29 against us-east-1, the public bucket and a name nobody owns). A HEAD naming either is
+# the 405.
+_BUCKET_OBJECT_SELECTORS = frozenset({"torrent", "uploadId"})
+_KEY_REQUIRED_FOR_UPLOAD = "A key must be specified"
+# The bucket selectors a key's path answers as the bucket's own operation, whatever the key: real
+# answered each of these on a GET at a key with the bucket's answer, the same for a key the bucket
+# has and one it does not, and `NoSuchBucket` in a bucket that does not exist, where the other
+# bucket selectors are ignored there and the key answered (measured 2026-09-29, every bucket
+# selector on a GET and a HEAD at a key). Here they are what the bucket's path answers them with:
+# `?location` its constraint, and the rest the 501, apart from `?logging` and `?versions`, which
+# real refuses at a key with a 400 of their own.
+_KEY_BUCKET_SELECTORS = frozenset(
+    {
+        "accelerate",
+        "cors",
+        "inventory",
+        "lifecycle",
+        "location",
+        "logging",
+        "notification",
+        "policy",
+        "replication",
+        "requestPayment",
+        "versioning",
+        "versions",
+        "website",
+    }
+)
+_KEY_BUCKET_REFUSALS = {
+    "logging": (
+        "NoLoggingStatusForKey",
+        "There is no such thing as the ?logging sub-resource for a key",
+    ),
+    "versions": (
+        "InvalidRequest",
+        "There is no such thing as the ?versions sub-resource for a key",
+    ),
+}
+# The selectors `object_get` answers rather than refusing, which the `Allow` at a key names.
+_OBJECT_GETS = frozenset({"location"})
 
 
 # --------------------------------------------------------------------------- helpers
@@ -638,7 +682,7 @@ async def head_bucket(request: Request, bucket: str):
     after the bucket. The one it leaves is the `max-keys` range: `?max-keys=-1` is the 200 (all
     measured 2026-09-29, beside the GET, on the public bucket and a name nobody owns)."""
     q = request.query_params
-    selected = _bucket_selected(q, _BUCKET_HEAD_SELECTORS)
+    selected = _bucket_selected(q, _BUCKET_READ_SELECTORS)
     refused = _read_refusal(request, selected, _BUCKET_GET_REFUSALS, _BUCKET_GETS)
     if refused is not None:
         return refused
@@ -702,6 +746,10 @@ async def bucket_get(request: Request, bucket: str):
     conn = auth.conn(request)
     if not _bucket_visible(conn, bucket, visible):
         return _no_such_bucket(bucket)
+    if selected == ["torrent"]:
+        return _method_refusal(request, _BUCKET_WRITE_SELECTORS["torrent"][0])
+    if selected == ["uploadId"]:
+        return _error("InvalidRequest", _KEY_REQUIRED_FOR_UPLOAD)
     if selected and selected[0] not in _BUCKET_GETS:
         return _not_implemented(selected[0])
     if selected == ["location"]:
@@ -1149,14 +1197,14 @@ async def object_get(request: Request, bucket: str, key: str):
     AccessDenied, so a listing and a read agree about what exists."""
     head = request.method == "HEAD"
     q = request.query_params
-    selected = _selected(q, _OBJECT_HEAD_SELECTORS if head else _OBJECT_READ_SELECTORS)
+    selected = _selected(q, _OBJECT_READ_SELECTORS)
     if selected == ["uploadId"] and "partNumber" in q:
         # UploadPart, which real refuses a GET and a HEAD of with the 405 naming `PART`, before the
         # bucket (measured 2026-09-29).
         selected = ["PART"]
-    # An empty set, not `_BUCKET_GETS`: a key's path serves no sub-resource on a GET, so its HEAD
-    # refusal names no method even for a selector a bucket's path does serve.
-    refused = _read_refusal(request, selected, _OBJECT_GET_REFUSALS, frozenset())
+    # `_OBJECT_GETS`, not `_BUCKET_GETS`: a key's path serves `?location` alone on a GET, so its
+    # HEAD refusal names no method for `?uploads`, which a bucket's path does serve.
+    refused = _read_refusal(request, selected, _OBJECT_GET_REFUSALS, _OBJECT_GETS)
     if refused is not None:
         return refused
     if selected == ["uploadId"]:
@@ -1173,6 +1221,13 @@ async def object_get(request: Request, bucket: str, key: str):
     conn = auth.conn(request)
     if not _bucket_visible(conn, bucket, visible):
         return _head(404) if head else _no_such_bucket(bucket)
+    if selected and selected[0] in _KEY_BUCKET_SELECTORS:
+        # The bucket's own operation, whatever the key (`_KEY_BUCKET_SELECTORS`).
+        if selected == ["location"]:
+            return _xml(f'<LocationConstraint xmlns="{NS}"></LocationConstraint>')
+        if selected[0] in _KEY_BUCKET_REFUSALS:
+            return _error(*_KEY_BUCKET_REFUSALS[selected[0]])
+        return _not_implemented(selected[0])
     if selected == ["uploads"]:
         return _error("InvalidRequest", _UPLOADS_ON_A_KEY)
     if selected == ["uploadId"]:
@@ -1312,9 +1367,9 @@ _WRITE_IS_NOT_SERVED = (
 # other method the 405 naming the type, before the bucket, and with an `Allow` that is exactly the
 # set plus `GET` where the selector has a GET form. A bucket's `restore` and a key's `delete` and
 # `encryption` were measured 2026-09-29 the same way, at the absent name and the public bucket, 23
-# requests, and answered by the same rule. A
-# key's `tagging` is a different type from a bucket's, so the two paths keep their own tables. The
-# selectors here with no GET form are the ones a GET is refused for (`_BUCKET_READ_REFUSED`,
+# requests, and answered by the same rule. A key's `tagging` is a different type from a bucket's, so
+# the two paths keep their own tables. The selectors here with no GET form, a bucket's `torrent` and
+# `uploadId` apart, are the ones a GET is refused for (`_BUCKET_READ_REFUSED`,
 # `_OBJECT_READ_REFUSED`); `session` and `renameObject` answered as the bare path does and are left
 # out.
 _BUCKET_WRITE_SELECTORS: dict[str, tuple[str, frozenset[str]]] = {
@@ -1343,6 +1398,10 @@ _BUCKET_WRITE_SELECTORS: dict[str, tuple[str, frozenset[str]]] = {
     "requestPayment": ("REQUEST_PAYMENT", frozenset({"PUT"})),
     "restore": ("RESTORE", frozenset({"POST"})),
     "tagging": ("TAGGING", frozenset({"DELETE", "PUT"})),
+    # Two of an object's, which a bucket's path answers too: each write method on 2026-09-29, 14
+    # requests at the absent name and the public bucket (`_BUCKET_OBJECT_SELECTORS`).
+    "torrent": ("TORRENT", frozenset()),
+    "uploadId": ("UPLOAD", frozenset({"DELETE", "POST"})),
     "uploads": ("UPLOADS", frozenset({"POST"})),
     "versioning": ("VERSIONING", frozenset({"PUT"})),
     "versions": ("BUCKETVERSIONS", frozenset()),
@@ -1369,7 +1428,8 @@ _UPLOAD_PART = ("PART", frozenset({"PUT"}))
 
 # The selectors a GET and a HEAD naming one are refused for with the 405 naming its type, before the
 # bucket is looked up: those whose operations are all on the methods above, which is every selector
-# of a write table outside `_BUCKET_SELECTORS` and `_OBJECT_SELECTORS`, a key's `uploads` apart.
+# of a write table outside `_BUCKET_SELECTORS` and `_OBJECT_SELECTORS`, a key's `uploads` and a
+# bucket's `torrent` and `uploadId` apart.
 # Measured 2026-09-29 against `s3.us-east-1.amazonaws.com`: the selectors of both tables and
 # `partNumber`, `renameObject`, `select-type` and `session`, 40 in all, each on a GET and a HEAD at
 # a bucket nobody owns and at a key in it, 160 requests. These are the ones a GET answered with a
@@ -1380,7 +1440,7 @@ _UPLOAD_PART = ("PART", frozenset({"PUT"}))
 _BUCKET_READ_REFUSED = {
     selector: resource_type
     for selector, (resource_type, _) in _BUCKET_WRITE_SELECTORS.items()
-    if selector not in _BUCKET_SELECTORS
+    if selector not in _BUCKET_SELECTORS | _BUCKET_OBJECT_SELECTORS
 }
 _OBJECT_READ_REFUSED = {
     selector: resource_type
@@ -1391,37 +1451,24 @@ _OBJECT_READ_REFUSED = {
 # the bucket is looked up: `NoSuchBucket` for the absent bucket, this for the public one's object
 # and for a key it does not have (same date). A HEAD naming it is the 405 the others are.
 _UPLOADS_ON_A_KEY = "Key is not expected for the GET method ?uploads subresource"
-# What a GET at each path reads as a selector, and so what a pair of them conflicts over (a HEAD's
-# are `_BUCKET_HEAD_SELECTORS` and `_OBJECT_HEAD_SELECTORS` below): `?acl&delete`,
-# `?restore&location` and a key's `?uploads&acl` are each the conflict (same date).
-_BUCKET_READ_SELECTORS = _BUCKET_SELECTORS | frozenset(_BUCKET_READ_REFUSED)
-_OBJECT_READ_SELECTORS = _OBJECT_SELECTORS | frozenset(_OBJECT_READ_REFUSED) | {"uploads"}
+# What a GET and a HEAD at each path read as a selector, and so what a pair of them conflicts
+# over: `?acl&delete`, `?restore&location` and a key's `?uploads&acl` are each the conflict, and a
+# HEAD naming any one of them is the 405 (same date).
+_BUCKET_READ_SELECTORS = (
+    _BUCKET_SELECTORS | frozenset(_BUCKET_READ_REFUSED) | _BUCKET_OBJECT_SELECTORS
+)
+_OBJECT_READ_SELECTORS = (
+    _OBJECT_SELECTORS | frozenset(_OBJECT_READ_REFUSED) | {"uploads"} | _KEY_BUCKET_SELECTORS
+)
 # What a GET's 405 names for each selector it is refused for, UploadPart's pair among them.
 _BUCKET_GET_REFUSALS = {**_BUCKET_READ_REFUSED, "PART": _UPLOAD_PART[0]}
 _OBJECT_GET_REFUSALS = {**_OBJECT_READ_REFUSED, "PART": _UPLOAD_PART[0]}
-# A HEAD is refused for selectors a GET at the same path does not read: at a bucket's path two of
-# an object's, and at a key's path the bucket selectors below, each with the 405, before the bucket
-# and after a signature that was sent; real's carried an `Allow` naming the selector's methods,
-# not repeated here for the reason given above `_BUCKET_READ_REFUSED`. Measured
-# 2026-09-29: of the bucket selectors on a HEAD at a key, in a bucket nobody owns and at the public
-# bucket's object, these answered the 405 and the rest the key's own 404 or 200; of the object
-# selectors on a HEAD at a bucket, these two. A GET at a key naming one of them is the bucket's own
-# operation on real, which this server does not answer there.
-_BUCKET_HEAD_SELECTORS = _BUCKET_READ_SELECTORS | {"torrent", "uploadId"}
-_OBJECT_HEAD_SELECTORS = _OBJECT_READ_SELECTORS | {
-    "accelerate",
-    "cors",
-    "inventory",
-    "lifecycle",
-    "location",
-    "logging",
-    "notification",
-    "policy",
-    "replication",
-    "requestPayment",
-    "versioning",
-    "versions",
-    "website",
+# What a method at a key's path naming a selector gets: the object's own table, and for a bucket
+# selector the bucket's row, which is what each of those answered at a key in a bucket nobody owns
+# on `PUT`, `POST`, `DELETE` and `PATCH` (52 requests, same date).
+_OBJECT_PATH_WRITE_SELECTORS = {
+    **_OBJECT_WRITE_SELECTORS,
+    **{selector: _BUCKET_WRITE_SELECTORS[selector] for selector in _KEY_BUCKET_SELECTORS},
 }
 _KEY_REQUIRED = "Object must have a valid key name."
 # What real answers an unsigned ListBuckets with: a 307 to here (measured 2026-09-29).
@@ -1455,9 +1502,16 @@ def _cors_preflight(request: Request, message: str) -> Response:
     return _error("AccessForbidden", message, extra=_method_type(asked, "BUCKET"))
 
 
-def _refuse_write(request: Request, bucket: str, method: str, *, resolve: bool = True) -> Response:
-    """The 501 for a write, once the credential and, unless ``resolve`` is false, the bucket it
-    names resolve.
+def _refuse_write(
+    request: Request,
+    bucket: str,
+    method: str,
+    *,
+    resolve: bool = True,
+    instead: Response | None = None,
+) -> Response:
+    """The 501 for a write, or ``instead``, once the credential and, unless ``resolve`` is false,
+    the bucket it names resolve.
 
     Real answers a write naming a bucket that does not exist — a `DELETE`, a key's `PUT`, a
     selector's own method such as `POST ?delete` or `PUT ?acl` — with `NoSuchBucket` at 404, where
@@ -1479,7 +1533,7 @@ def _refuse_write(request: Request, bucket: str, method: str, *, resolve: bool =
         )
     if resolve and not _bucket_visible(auth.conn(request), bucket, visible):
         return _no_such_bucket(bucket)
-    return _error("NotImplemented", _WRITE_IS_NOT_SERVED + method)
+    return instead or _error("NotImplemented", _WRITE_IS_NOT_SERVED + method)
 
 
 def _selector_refusal(
@@ -1545,6 +1599,10 @@ async def bucket_method_refusal(request: Request, bucket: str) -> Response:
     if method == "OPTIONS":
         return _cors_preflight(request, _CORS_DISABLED)
     selected = _bucket_selected(request.query_params, frozenset(_BUCKET_WRITE_SELECTORS))
+    if selected == ["uploadId"] and method in _BUCKET_WRITE_SELECTORS["uploadId"][1]:
+        # Resolved as a write, and then real's own 400 for the bucket that exists.
+        instead = _error("InvalidRequest", _KEY_REQUIRED_FOR_UPLOAD)
+        return _refuse_write(request, bucket, method, instead=instead)
     by_selector = _selector_refusal(
         request, bucket, selected, _BUCKET_WRITE_SELECTORS, _BUCKET_GETS
     )
@@ -1575,10 +1633,12 @@ async def object_method_refusal(request: Request, bucket: str, key: str) -> Resp
     if method == "OPTIONS":
         return _cors_preflight(request, _CORS_DISABLED)
     q = request.query_params
-    selected = _selected(q, frozenset(_OBJECT_WRITE_SELECTORS))
+    selected = _selected(q, frozenset(_OBJECT_PATH_WRITE_SELECTORS))
     if selected == ["uploadId"] and "partNumber" in q:
         selected = ["PART"]
-    by_selector = _selector_refusal(request, bucket, selected, _OBJECT_WRITE_SELECTORS, frozenset())
+    by_selector = _selector_refusal(
+        request, bucket, selected, _OBJECT_PATH_WRITE_SELECTORS, _OBJECT_GETS
+    )
     if by_selector is not None:
         return by_selector
     if method in ("PATCH", "POST"):

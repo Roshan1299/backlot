@@ -14,7 +14,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from urllib.parse import quote, unquote, urlencode
+from urllib.parse import parse_qsl, quote, unquote, urlencode
 
 import pytest
 import yaml
@@ -246,6 +246,12 @@ _REFUSAL_ROWS = [
     ("/s3/eng-artifacts?restore", "DELETE", 405, "MethodNotAllowed", ">RESTORE</", None),
     (f"{_KEY}?delete", "PUT", 405, "MethodNotAllowed", ">MULTI_OBJECT_DELETE</", None),
     (f"{_KEY}?encryption", "POST", 405, "MethodNotAllowed", ">OBJECT_ENCRYPTION</", None),
+    # A bucket's `torrent` and `uploadId`, and a bucket's selectors at a key, on the write methods.
+    ("/s3/eng-artifacts?torrent", "POST", 405, "MethodNotAllowed", ">TORRENT</", None),
+    ("/s3/eng-artifacts?uploadId=x", "PATCH", 405, "MethodNotAllowed", ">UPLOAD</", None),
+    (f"{_KEY}?versioning", "PATCH", 405, "MethodNotAllowed", ">VERSIONING</", None),
+    (f"{_KEY}?location", "PUT", 405, "MethodNotAllowed", ">LOCATION</", "GET"),
+    (f"{_KEY}?cors&acl", "PUT", 400, "InvalidArgument", "parameters: acl, cors", None),
     (
         "/s3/eng-artifacts?acl&versioning",
         "PATCH",
@@ -303,7 +309,7 @@ def test_s3_every_selector_a_get_reads_has_an_answer_for_the_other_methods():
     from backlot.routers import s3 as s3_router
 
     assert s3_router._BUCKET_READ_SELECTORS <= set(s3_router._BUCKET_WRITE_SELECTORS)
-    assert s3_router._OBJECT_READ_SELECTORS <= set(s3_router._OBJECT_WRITE_SELECTORS)
+    assert s3_router._OBJECT_READ_SELECTORS <= set(s3_router._OBJECT_PATH_WRITE_SELECTORS)
 
 
 _WRITE_ROWS = [
@@ -319,6 +325,7 @@ _WRITE_ROWS = [
     (f"{_KEY}?partNumber=1&uploadId=u", "PUT", b"part"),
     (f"{_KEY}?uploadId=u", "DELETE", None),
     (f"{_KEY}?tagging", "DELETE", None),
+    (f"{_KEY}?cors", "PUT", None),
 ]
 
 
@@ -551,6 +558,8 @@ _TAMPERED_ROWS = [
     ("GET", "/s3/eng-artifacts?start-after=x", 400),
     ("GET", "/s3/eng-artifacts?uploads&max-uploads=abc", 400),
     ("GET", f"{_KEY}?uploadId=x&max-parts=abc", 400),
+    ("GET", f"{_KEY}?uploadId=x&part-number-marker=abc", 400),
+    ("GET", "/s3/eng-artifacts?torrent", 403),
     ("POST", "/s3/eng-artifacts", 412),
     ("OPTIONS", "/s3/eng-artifacts", 400),
 ]
@@ -671,7 +680,7 @@ def test_s3_a_signature_mismatch_names_what_this_server_signed(live_server):
         ("StringToSign", "StringToSignBytes"),
         ("CanonicalRequest", "CanonicalRequestBytes"),
     ):
-        assert bytes.fromhex(members[as_bytes].replace(" ", "")).decode() == members[text]
+        assert members[as_bytes] == " ".join(f"{b:02x}" for b in members[text].encode())
 
 
 def test_s3_key_containing_a_question_mark_verifies(live_server):
@@ -1169,6 +1178,9 @@ def test_the_listing_location_and_object_still_answer_and_an_unknown_key_is_igno
         root = _get_xml(base_url, f"/s3/eng-artifacts{query}", token)
         assert root.tag == f"{NS}ListBucketResult", query
     assert _get_xml(base_url, "/s3/eng-artifacts?location", token).tag == f"{NS}LocationConstraint"
+    # At a key's path too, the bucket's own answer whatever the key (measured 2026-09-29).
+    for path in (f"{OBJECT_PATH}?location", "/s3/eng-artifacts/no/such.md?location"):
+        assert _get_xml(base_url, path, token).tag == f"{NS}LocationConstraint", path
     for query in ("", "?x-id=GetObject", "?foo=bar"):
         url, headers = _sign_get(base_url, f"{OBJECT_PATH}{query}", token)
         with urllib.request.urlopen(urllib.request.Request(url, headers=headers)) as r:
@@ -1257,10 +1269,10 @@ def test_head_with_a_subresource_names_what_a_get_serves_and_a_bare_head_still_a
         (f"{OBJECT_PATH}?encryption", None),
         (f"{OBJECT_PATH}?select", None),
         (f"{OBJECT_PATH}?uploads", None),
-        # A HEAD reads selectors its path's GET does not: a bucket's selectors at a key, and two
-        # of an object's at a bucket (measured 2026-09-29).
+        # A bucket's selectors at a key and two of an object's at a bucket, which the GET at the
+        # same path answers after the bucket (measured 2026-09-29); `?location` is served at a key.
         (f"{OBJECT_PATH}?versioning", None),
-        (f"{OBJECT_PATH}?location", None),
+        (f"{OBJECT_PATH}?location", "GET"),
         ("/s3/no-such-bucket/a.txt?website", None),
         ("/s3/eng-artifacts?torrent", None),
         ("/s3/eng-artifacts?uploadId=x", None),
@@ -1351,6 +1363,49 @@ _MEMBER_ROWS = [
         "<ArgumentName>max-parts</ArgumentName><ArgumentValue>abc</ArgumentValue>",
     ),
     ("GET", "/s3/eng-artifacts?partNumber=1", 400, "InvalidRequest", ""),
+    (
+        "GET",
+        "/s3/eng-artifacts/runbooks/oncall.md?uploadId=x&part-number-marker=abc",
+        400,
+        "InvalidArgument",
+        "<ArgumentName>part-number-marker</ArgumentName><ArgumentValue>abc</ArgumentValue>",
+    ),
+    # Two object selectors at a bucket's path, after the bucket (measured 2026-09-29).
+    (
+        "GET",
+        "/s3/eng-artifacts?torrent",
+        405,
+        "MethodNotAllowed",
+        "<Method>GET</Method><ResourceType>TORRENT</ResourceType>",
+    ),
+    ("GET", "/s3/eng-artifacts?uploadId=x", 400, "InvalidRequest", ""),
+    ("POST", "/s3/eng-artifacts?uploadId=x", 400, "InvalidRequest", ""),
+    (
+        "GET",
+        "/s3/no-such-bucket?torrent",
+        404,
+        "NoSuchBucket",
+        "<BucketName>no-such-bucket</BucketName>",
+    ),
+    (
+        "DELETE",
+        "/s3/no-such-bucket?uploadId=x",
+        404,
+        "NoSuchBucket",
+        "<BucketName>no-such-bucket</BucketName>",
+    ),
+    # A bucket's selectors at a key's path are the bucket's own operations, whatever the key.
+    ("GET", "/s3/eng-artifacts/runbooks/oncall.md?versioning", 501, "NotImplemented", ""),
+    ("GET", "/s3/eng-artifacts/no/such.md?policy", 501, "NotImplemented", ""),
+    ("GET", "/s3/eng-artifacts/runbooks/oncall.md?logging", 400, "NoLoggingStatusForKey", ""),
+    ("GET", "/s3/eng-artifacts/runbooks/oncall.md?versions", 400, "InvalidRequest", ""),
+    (
+        "GET",
+        "/s3/no-such-bucket/a.txt?versioning",
+        404,
+        "NoSuchBucket",
+        "<BucketName>no-such-bucket</BucketName>",
+    ),
     # This server's own refusals, which have no real body to copy.
     ("GET", "/s3/eng-artifacts?versioning", 501, "NotImplemented", ""),
     ("DELETE", "/s3/eng-artifacts", 501, "NotImplemented", ""),
@@ -2075,7 +2130,9 @@ def test_presigned_expired_is_access_denied():
     assert caller is None
     assert (err.code, err.message) == ("AccessDenied", "Request has expired")
     assert [name for name, _ in err.members] == ["X-Amz-Expires", "Expires", "ServerTime"]
-    assert dict(err.members)["X-Amz-Expires"] == "60"
+    # `Expires` is the request's date plus its lifetime, as real's was (2026-09-29).
+    expires = datetime.strptime(stale, AMZ_DATE_FORMAT) + timedelta(seconds=60)
+    assert dict(err.members)["Expires"] == expires.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 @pytest.mark.parametrize("path", SIGNED_PATHS)
@@ -2105,9 +2162,42 @@ def _query(**params) -> str:
 
 
 _UNKNOWN = "AKIAIOSFODNN7EXAMPLE"
-# One fault each, and the pairs whose order was measured (2026-09-29, us-east-1): an unknown access
-# key beside a skewed or an unreadable date, and an expired presign beside a malformed credential.
+_MALFORMED = "The authorization header is malformed; "
+_SHAPE = (
+    'the Credential is mal-formed; expecting "<YOUR-AKID>/YYYYMMDD/REGION/SERVICE/aws4_request".'
+)
+_NO_DATE = "AWS authentication requires a valid Date or x-amz-date header"
+_SKEWED = "The difference between the request time and the current time is too large."
+_NO_KEY = "The AWS Access Key Id you provided does not exist in our records."
+_WEEK = (
+    "X-Amz-Expires must be less than a week (in seconds); that is, the given X-Amz-Expires must "
+    "be less than 604800 seconds"
+)
+
+
+def _presign(date: str, expires="60", credential=None, **extra) -> str:
+    """A presign's query with every parameter present, the scope dated `date` unless given."""
+    return _query(
+        X_Amz_Algorithm="AWS4-HMAC-SHA256",
+        X_Amz_Credential=credential or f"{AK}/{date[:8]}/us-east-1/s3/aws4_request",
+        X_Amz_Date=date,
+        X_Amz_Expires=expires,
+        X_Amz_SignedHeaders="host",
+        X_Amz_Signature="00",
+        **extra,
+    )
+
+
+# One fault each, and each pair whose order was measured (2026-09-29, us-east-1).
 _REFUSAL_ROWS_UNIT = [
+    (
+        "header and query",
+        {"authorization": "Bearer abc"},
+        _query(X_Amz_Algorithm="bogus"),
+        "InvalidArgument",
+        "Only one auth mechanism allowed; only the X-Amz-Algorithm query parameter, Signature "
+        "query string parameter or the Authorization header should be specified",
+    ),
     (
         "bearer",
         {"authorization": "Bearer abc"},
@@ -2130,75 +2220,100 @@ _REFUSAL_ROWS_UNIT = [
         "Authorization header is invalid -- one and only one ' ' (space) required",
     ),
     (
-        "no parts",
-        {"authorization": "AWS4-HMAC-SHA256 nonsense"},
+        "no space before scheme",
+        {"authorization": "AWS4-HMAC-SHA512"},
         "",
-        "AuthorizationHeaderMalformed",
-        "The authorization header is malformed; the authorization header requires three "
-        "components: Credential, SignedHeaders, and Signature.",
+        "InvalidArgument",
+        "Authorization header is invalid -- one and only one ' ' (space) required",
     ),
-    (
-        "scope",
-        {
-            "authorization": f"AWS4-HMAC-SHA256 Credential={AK}/garbage, SignedHeaders=host, "
-            "Signature=00"
-        },
-        "",
-        "AuthorizationHeaderMalformed",
-        "The authorization header is malformed; the Credential is mal-formed; expecting "
-        '"<YOUR-AKID>/YYYYMMDD/REGION/SERVICE/aws4_request".',
-    ),
-    (
-        "service",
-        {"x-amz-date": _now(), "authorization": _v4(AK, _now(), service="ec2")},
-        "",
-        "AuthorizationHeaderMalformed",
-        'The authorization header is malformed; incorrect service "ec2". This endpoint belongs to '
-        '"s3".',
-    ),
-    (
-        "terminal",
-        {"x-amz-date": _now(), "authorization": _v4(AK, _now(), terminal="aws5_request")},
-        "",
-        "AuthorizationHeaderMalformed",
-        'The authorization header is malformed; incorrect terminal "aws5_request". This endpoint '
-        'uses "aws4_request".',
-    ),
-    (
-        "no date",
-        {"authorization": _v4(_UNKNOWN, _now())},
-        "",
-        "AccessDenied",
-        "AWS authentication requires a valid Date or x-amz-date header",
-    ),
+    ("no date", {"authorization": _v4(_UNKNOWN, _now())}, "", "AccessDenied", _NO_DATE),
     (
         "bad date",
         {"x-amz-date": "garbage", "authorization": _v4(_UNKNOWN, _now())},
         "",
         "AccessDenied",
-        "AWS authentication requires a valid Date or x-amz-date header",
+        _NO_DATE,
     ),
     (
-        "scope date",
-        {"x-amz-date": _now(), "authorization": _v4(AK, "20200101")},
+        "date before parts",
+        {"authorization": "AWS4-HMAC-SHA256 nonsense"},
         "",
-        "AuthorizationHeaderMalformed",
-        "The authorization header is malformed; Invalid credential date. Date is not the same as "
-        "X-Amz-Date.",
+        "AccessDenied",
+        _NO_DATE,
     ),
     (
         "skew first",
         {"x-amz-date": _now(-30), "authorization": _v4(_UNKNOWN, _now(-30))},
         "",
         "RequestTimeTooSkewed",
-        "The difference between the request time and the current time is too large.",
+        _SKEWED,
+    ),
+    (
+        "skew before parts",
+        {"x-amz-date": _now(-30), "authorization": "AWS4-HMAC-SHA256 nonsense"},
+        "",
+        "RequestTimeTooSkewed",
+        _SKEWED,
+    ),
+    (
+        "skew before scope",
+        {
+            "x-amz-date": _now(-30),
+            "authorization": (
+                f"AWS4-HMAC-SHA256 Credential={AK}/garbage, SignedHeaders=host, Signature=00"
+            ),
+        },
+        "",
+        "RequestTimeTooSkewed",
+        _SKEWED,
+    ),
+    (
+        "no parts",
+        {"x-amz-date": _now(), "authorization": "AWS4-HMAC-SHA256 nonsense"},
+        "",
+        "AuthorizationHeaderMalformed",
+        _MALFORMED + "the authorization header requires three components: Credential, "
+        "SignedHeaders, and Signature.",
+    ),
+    (
+        "scope",
+        {
+            "x-amz-date": _now(),
+            "authorization": (
+                f"AWS4-HMAC-SHA256 Credential={AK}/garbage, SignedHeaders=host, Signature=00"
+            ),
+        },
+        "",
+        "AuthorizationHeaderMalformed",
+        _MALFORMED + _SHAPE,
+    ),
+    (
+        "service",
+        {"x-amz-date": _now(), "authorization": _v4(_UNKNOWN, _now(), service="ec2")},
+        "",
+        "AuthorizationHeaderMalformed",
+        _MALFORMED + 'incorrect service "ec2". This endpoint belongs to "s3".',
+    ),
+    (
+        "terminal",
+        {"x-amz-date": _now(), "authorization": _v4(AK, _now(), terminal="aws5_request")},
+        "",
+        "AuthorizationHeaderMalformed",
+        _MALFORMED + 'incorrect terminal "aws5_request". This endpoint uses "aws4_request".',
+    ),
+    (
+        "scope date",
+        {"x-amz-date": _now(), "authorization": _v4(_UNKNOWN, "20200101")},
+        "",
+        "AuthorizationHeaderMalformed",
+        _MALFORMED + "Invalid credential date. Date is not the same as X-Amz-Date.",
     ),
     (
         "unknown key",
         {"x-amz-date": _now(), "authorization": _v4(_UNKNOWN, _now())},
         "",
         "InvalidAccessKeyId",
-        "The AWS Access Key Id you provided does not exist in our records.",
+        _NO_KEY,
     ),
     (
         "query algorithm",
@@ -2218,73 +2333,74 @@ _REFUSAL_ROWS_UNIT = [
     (
         "query date",
         {},
-        _query(
-            X_Amz_Algorithm="AWS4-HMAC-SHA256",
-            X_Amz_Credential=f"{AK}/20260929/us-east-1/s3/aws4_request",
-            X_Amz_Date="garbage",
-            X_Amz_Expires="60",
-            X_Amz_SignedHeaders="host",
-            X_Amz_Signature="00",
-        ),
+        _presign("garbage", expires="abc", credential=f"{AK}/20260929/us-east-1/s3/aws4_request"),
         "AuthorizationQueryParametersError",
         "X-Amz-Date must be in the ISO8601 Long Format \"yyyyMMdd'T'HHmmss'Z'\"",
     ),
     (
         "query expires",
         {},
-        _query(
-            X_Amz_Algorithm="AWS4-HMAC-SHA256",
-            X_Amz_Credential=f"{AK}/{_now()[:8]}/us-east-1/s3/aws4_request",
-            X_Amz_Date=_now(),
-            X_Amz_Expires="abc",
-            X_Amz_SignedHeaders="host",
-            X_Amz_Signature="00",
-        ),
+        _presign(_now(), expires="abc"),
         "AuthorizationQueryParametersError",
         "X-Amz-Expires should be a number",
     ),
     (
+        "query negative",
+        {},
+        _presign(_now(60), expires="-1"),
+        "AuthorizationQueryParametersError",
+        "X-Amz-Expires must be non-negative",
+    ),
+    (
+        "query a week",
+        {},
+        _presign(_now(-60 * 24 * 9), expires="604801"),
+        "AuthorizationQueryParametersError",
+        _WEEK,
+    ),
+    (
+        "not yet valid",
+        {},
+        _presign(_now(60), credential="garbage"),
+        "AccessDenied",
+        "Request is not yet valid",
+    ),
+    (
         "expiry first",
         {},
-        _query(
-            X_Amz_Algorithm="AWS4-HMAC-SHA256",
-            X_Amz_Credential="garbage",
-            X_Amz_Date=_now(-600),
-            X_Amz_Expires="60",
-            X_Amz_SignedHeaders="host",
-            X_Amz_Signature="00",
-        ),
+        _presign(_now(-600), credential="garbage"),
         "AccessDenied",
         "Request has expired",
     ),
     (
         "query credential",
         {},
-        _query(
-            X_Amz_Algorithm="AWS4-HMAC-SHA256",
-            X_Amz_Credential="garbage",
-            X_Amz_Date=_now(),
-            X_Amz_Expires="60",
-            X_Amz_SignedHeaders="host",
-            X_Amz_Signature="00",
-        ),
+        _presign(_now(), credential="garbage"),
         "AuthorizationQueryParametersError",
-        "Error parsing the X-Amz-Credential parameter; the Credential is mal-formed; expecting "
-        '"<YOUR-AKID>/YYYYMMDD/REGION/SERVICE/aws4_request".',
+        "Error parsing the X-Amz-Credential parameter; " + _SHAPE,
+    ),
+    (
+        "query service first",
+        {},
+        _presign(_now(), credential=f"{AK}/20200101/us-east-1/ec2/aws4_request"),
+        "AuthorizationQueryParametersError",
+        "Error parsing the X-Amz-Credential parameter; "
+        'incorrect service "ec2". This endpoint belongs to "s3".',
+    ),
+    (
+        "query scope date",
+        {},
+        _presign(_now(), credential=f"{_UNKNOWN}/20200101/us-east-1/s3/aws4_request"),
+        "AuthorizationQueryParametersError",
+        f'Invalid credential date "20200101". This date is not the same as X-Amz-Date: '
+        f'"{_now()[:8]}".',
     ),
     (
         "query key",
         {},
-        _query(
-            X_Amz_Algorithm="AWS4-HMAC-SHA256",
-            X_Amz_Credential=f"{_UNKNOWN}/{_now()[:8]}/us-east-1/s3/aws4_request",
-            X_Amz_Date=_now(),
-            X_Amz_Expires="60",
-            X_Amz_SignedHeaders="host",
-            X_Amz_Signature="00",
-        ),
+        _presign(_now(), credential=f"{_UNKNOWN}/{_now()[:8]}/us-east-1/s3/aws4_request"),
         "InvalidAccessKeyId",
-        "The AWS Access Key Id you provided does not exist in our records.",
+        _NO_KEY,
     ),
 ]
 
@@ -2310,6 +2426,12 @@ def test_a_credential_real_refuses_is_refused_with_reals_code_and_message(
         }
     if code == "InvalidAccessKeyId":
         assert err.members == (("AWSAccessKeyId", _UNKNOWN),)
+    if message == "Request is not yet valid":
+        # Real names the request's date in epoch milliseconds (2026-09-29).
+        sent = datetime.strptime(dict(parse_qsl(query))["X-Amz-Date"], AMZ_DATE_FORMAT)
+        expected_ms = str(int(sent.replace(tzinfo=timezone.utc).timestamp() * 1000))
+        assert [name for name, _ in err.members] == ["X-Amz-Date", "Expires", "ServerTime"]
+        assert dict(err.members)["X-Amz-Date"] == expected_ms
 
 
 @pytest.mark.parametrize("query", ["", "X-Amz-Signature=00", "list-type=2"])

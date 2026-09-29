@@ -358,16 +358,18 @@ virtual-hosted client looks for `acme-artifacts.localhost:8000` and finds nothin
 
 Any other sub-resource — `?versioning`, `?acl`, `?tagging` and the rest of what botocore declares at
 a bucket's or an object's path — is refused with `NotImplemented` (501), so a client gets an error
-to handle rather than the listing or the object's bytes parsed as something else. Three kinds are
+to handle rather than the listing or the object's bytes parsed as something else. These are
 answered otherwise, as real answers them. `?session` is the listing: CreateSession is for directory
 buckets only and real S3 answers it with the listing on a general purpose bucket. A sub-resource
 whose operations are all on another method, `?delete` and a key's `?restore` and `?select` among
 them, is the 405 a GET or a HEAD naming it gets, and a key's `?uploads` on a GET is real's 400. A
-`?partNumber` at a bucket's path, which names a part of an object, is real's 400 on every method,
-and beside `?uploadId` it is UploadPart's 405. A HEAD also refuses what its path's GET does not
-read, a bucket's sub-resources at a key and `?torrent` and `?uploadId` at a bucket, as real does.
-Two sub-resources at once are `InvalidArgument`, as on real S3, and an unknown query key is ignored,
-as on real S3.
+`?partNumber` at a bucket's path, which names a part of an object, is real's 400 on a GET, a HEAD,
+a `PUT`, a `POST`, a `DELETE` and a `PATCH`, and beside `?uploadId` it is UploadPart's 405. At a
+bucket's path `?torrent` is real's 405 and `?uploadId` real's 400 once the bucket is found. A
+bucket's sub-resources at a key's path are the bucket's own, whatever the key: `?location` is the
+bucket's constraint, `?logging` and `?versions` real's 400s, and the rest the 501 they are at the
+bucket. Two sub-resources at once are `InvalidArgument`, as on real S3, and an unknown query key is
+ignored, as on real S3.
 
 A method no operation above serves answers what real answers: the 405 that names the method and
 whether the resource is a `BUCKET`, an `OBJECT` or the `SERVICE`, the 400 an `OPTIONS` without an

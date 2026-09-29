@@ -316,6 +316,11 @@ _QUERY_PARAMETERS = (
     "X-Amz-Expires",
 )
 _SERVER_TIME = "%Y-%m-%dT%H:%M:%SZ"
+# The longest `X-Amz-Expires` real takes: 604800 was served and 604801 refused (2026-09-29).
+_A_WEEK = 604800
+# How far ahead a presign's date may be: real served one five minutes ahead and refused one an hour
+# ahead (2026-09-29); the header's own skew window stands in for the boundary between the two.
+_NOT_YET_VALID = 900
 
 
 def _credential_fault(credential: str) -> str | None:
@@ -346,31 +351,54 @@ def resolve_sigv4(request: Request) -> tuple[Caller | None, SigV4Refusal | None]
 
     Each refusal is real's own code, message and members, and they come in real's order:
     measured 2026-09-29 against `s3.us-east-1.amazonaws.com`, one fault at a time and, where two
-    could meet, the two together. For a header that is the scheme (anything but
+    could meet, the two together. A header beside `X-Amz-Algorithm` in the query is refused first,
+    whatever either says. For a header it is then its one space, its scheme (anything but
     `AWS4-HMAC-SHA256` is `InvalidArgument`, "Unsupported Authorization Type", Bearer and
-    `AWS4-HMAC-SHA512` alike), its one space, its three components, the credential scope's shape,
-    its service and its terminal, a missing or unreadable `x-amz-date` (an `AccessDenied`, and
-    ahead of an unknown access key), a scope date that is not the request's, the clock skew (ahead
-    of an unknown access key too), the access key and the signature. For a query it is the
-    algorithm, the six parameters, the date, `X-Amz-Expires` as a number, the expiry (ahead of a
-    malformed credential), the credential, the access key and the signature. A signature mismatch
-    names the string this server signed and the canonical request it signed it over, as bytes too,
-    the way real names its own. The region is taken from the client's own credential scope, so any
-    region validates where real names the one it expects. The canonical URI and query are the raw
-    wire path and query string (S3 signs the path verbatim)."""
+    `AWS4-HMAC-SHA512` alike), a missing or unreadable `x-amz-date` (an `AccessDenied`), the clock
+    skew, its three components, the credential scope's shape, its service and its terminal, a scope
+    date that is not the request's, the access key and the signature: the date and the skew come
+    ahead of every fault in the header's body. For a query it is the algorithm, the six
+    parameters, the date, `X-Amz-Expires` as a number, as not negative and as a week at most, a
+    date not yet valid, the expiry, the credential scope's shape, service and terminal, its date,
+    the access key and the signature. A signature mismatch names the string this server signed and
+    the canonical request it signed it over, as bytes too, the way real names its own. The region
+    is taken from the client's own credential scope, so any region validates where real names the
+    one it expects. The canonical URI and query are the raw wire path and query string (S3 signs
+    the path verbatim)."""
     hdrs = {k.lower(): v for k, v in request.headers.items()}
     qs = request.query_params
     now = datetime.now(timezone.utc)
     authz = hdrs.get("authorization", "")
     presigned = "X-Amz-Algorithm" in qs
     if authz:
-        scheme, space, _ = authz.partition(" ")
         argument = (("ArgumentName", "Authorization"), ("ArgumentValue", authz))
-        if scheme != sigv4.ALGORITHM:
-            return None, SigV4Refusal("InvalidArgument", "Unsupported Authorization Type", argument)
+        if presigned:
+            message = (
+                "Only one auth mechanism allowed; only the X-Amz-Algorithm query parameter, "
+                "Signature query string parameter or the Authorization header should be specified"
+            )
+            return None, SigV4Refusal("InvalidArgument", message, argument)
+        scheme, space, _ = authz.partition(" ")
         if not space:
             message = "Authorization header is invalid -- one and only one ' ' (space) required"
             return None, SigV4Refusal("InvalidArgument", message, argument)
+        if scheme != sigv4.ALGORITHM:
+            return None, SigV4Refusal("InvalidArgument", "Unsupported Authorization Type", argument)
+        amz_date = hdrs.get("x-amz-date", "")
+        request_time = sigv4.parse_amz_date(amz_date)
+        if request_time is None:
+            message = "AWS authentication requires a valid Date or x-amz-date header"
+            return None, SigV4Refusal("AccessDenied", message)
+        if sigv4.is_skewed(request_time, now):
+            return None, SigV4Refusal(
+                "RequestTimeTooSkewed",
+                "The difference between the request time and the current time is too large.",
+                (
+                    ("RequestTime", amz_date),
+                    ("ServerTime", now.strftime(_SERVER_TIME)),
+                    ("MaxAllowedSkewMilliseconds", "900000"),
+                ),
+            )
         parsed = sigv4.parse_authorization(authz)
         if not parsed:
             message = (
@@ -382,26 +410,11 @@ def resolve_sigv4(request: Request) -> tuple[Caller | None, SigV4Refusal | None]
         fault = _credential_fault(credential)
         if fault:
             return None, SigV4Refusal("AuthorizationHeaderMalformed", _HEADER_MALFORMED + fault)
-        signed_headers, signature = parsed["signed_headers"], parsed["signature"]
-        amz_date = hdrs.get("x-amz-date", "")
-        payload_hash = hdrs.get("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
-        request_time = sigv4.parse_amz_date(amz_date)
-        if request_time is None:
-            message = "AWS authentication requires a valid Date or x-amz-date header"
-            return None, SigV4Refusal("AccessDenied", message)
         if credential.split("/")[1] != amz_date[:8]:
             message = "Invalid credential date. Date is not the same as X-Amz-Date."
             return None, SigV4Refusal("AuthorizationHeaderMalformed", _HEADER_MALFORMED + message)
-        if sigv4.is_skewed(request_time, now):
-            return None, SigV4Refusal(
-                "RequestTimeTooSkewed",
-                "The difference between the request time and the current time is too large.",
-                (
-                    ("RequestTime", amz_date),
-                    ("ServerTime", now.strftime(_SERVER_TIME)),
-                    ("MaxAllowedSkewMilliseconds", "900000"),
-                ),
-            )
+        signed_headers, signature = parsed["signed_headers"], parsed["signature"]
+        payload_hash = hdrs.get("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
     elif presigned:
         if qs.get("X-Amz-Algorithm") != sigv4.ALGORITHM:
             message = 'X-Amz-Algorithm only supports "AWS4-HMAC-SHA256 and AWS4-ECDSA-P256-SHA256"'
@@ -423,14 +436,33 @@ def resolve_sigv4(request: Request) -> tuple[Caller | None, SigV4Refusal | None]
         except ValueError:
             message = "X-Amz-Expires should be a number"
             return None, SigV4Refusal("AuthorizationQueryParametersError", message)
+        if expires_in < 0:
+            message = "X-Amz-Expires must be non-negative"
+            return None, SigV4Refusal("AuthorizationQueryParametersError", message)
+        if expires_in > _A_WEEK:
+            message = (
+                "X-Amz-Expires must be less than a week (in seconds); that is, the given "
+                "X-Amz-Expires must be less than 604800 seconds"
+            )
+            return None, SigV4Refusal("AuthorizationQueryParametersError", message)
+        expires_at = (request_time + timedelta(seconds=expires_in)).strftime(_SERVER_TIME)
+        if (request_time - now).total_seconds() > _NOT_YET_VALID:
+            return None, SigV4Refusal(
+                "AccessDenied",
+                "Request is not yet valid",
+                (
+                    ("X-Amz-Date", str(int(request_time.timestamp() * 1000))),
+                    ("Expires", expires_at),
+                    ("ServerTime", now.strftime(_SERVER_TIME)),
+                ),
+            )
         if (now - request_time).total_seconds() > expires_in:
-            expired_at = request_time + timedelta(seconds=expires_in)
             return None, SigV4Refusal(
                 "AccessDenied",
                 "Request has expired",
                 (
                     ("X-Amz-Expires", qs["X-Amz-Expires"]),
-                    ("Expires", expired_at.strftime(_SERVER_TIME)),
+                    ("Expires", expires_at),
                     ("ServerTime", now.strftime(_SERVER_TIME)),
                 ),
             )
@@ -440,6 +472,12 @@ def resolve_sigv4(request: Request) -> tuple[Caller | None, SigV4Refusal | None]
             return None, SigV4Refusal(
                 "AuthorizationQueryParametersError", _QUERY_CREDENTIAL + fault
             )
+        if credential.split("/")[1] != amz_date[:8]:
+            message = (
+                f'Invalid credential date "{credential.split("/")[1]}". This date is not the same '
+                f'as X-Amz-Date: "{amz_date[:8]}".'
+            )
+            return None, SigV4Refusal("AuthorizationQueryParametersError", message)
         signed_headers = qs["X-Amz-SignedHeaders"]
         signature = qs["X-Amz-Signature"]
         payload_hash = "UNSIGNED-PAYLOAD"
