@@ -3038,6 +3038,9 @@ _WRITE_CHECK_ROWS = [
             ("sha256", 32),
             ("sha512", 64),
             ("md5", 16),
+            ("xxhash64", 8),
+            ("xxhash3", 8),
+            ("xxhash128", 16),
         )
     ],
     # What real performed.
@@ -3392,6 +3395,72 @@ def test_s3_an_encryption_write_signed_with_signature_version_2_is_refused_for_i
             "<Message>Requests modifying object encryption configuration require AWS Signature "
             "Version 4.</Message>" in r.text
         )
+
+
+def _right_checksum(name: str, body: bytes) -> bytes:
+    """Each checksum of ``body`` as real took it (probe38, 2026-09-29): the standard library's, the
+    xxhash library's digest, and the router's two CRCs, which the test below checks on their own."""
+    import xxhash
+
+    from backlot.routers import s3 as s3_router
+
+    if name == "crc32":
+        return zlib.crc32(body).to_bytes(4, "big")
+    if name in ("crc32c", "crc64nvme"):
+        return s3_router._checksum(name, body)
+    xx = {"xxhash64": xxhash.xxh64, "xxhash3": xxhash.xxh3_64, "xxhash128": xxhash.xxh3_128}
+    return xx[name](body).digest() if name in xx else hashlib.new(name, body).digest()
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "crc32",
+        "crc32c",
+        "crc64nvme",
+        "md5",
+        "sha1",
+        "sha256",
+        "sha512",
+        "xxhash64",
+        "xxhash3",
+        "xxhash128",
+    ],
+)
+def test_s3_a_delete_carrying_its_right_checksum_is_the_write(live_server, name):
+    """Real took each of these, the body's own value, and went on to the delete (2026-09-29); the
+    same header over another body is the BadDigest the table above asserts."""
+    base_url, settings = live_server
+    headers = {f"x-amz-checksum-{name}": _b64(_right_checksum(name, _GOOD_DELETE))}
+    r = _signed(
+        base_url,
+        "/s3/eng-artifacts?delete",
+        settings.admin_token,
+        method="POST",
+        body=_GOOD_DELETE,
+        extra_headers=headers,
+    )
+    assert r.status_code == 501 and "<Code>NotImplemented</Code>" in r.text
+    other = _signed(
+        base_url,
+        "/s3/eng-artifacts?delete",
+        settings.admin_token,
+        method="POST",
+        body=_GOOD_DELETE + b" ",
+        extra_headers=headers,
+    )
+    assert "<Code>BadDigest</Code>" in other.text
+
+
+def test_s3_an_encryption_write_reads_bucket_key_enabled_without_case(live_server):
+    """Real took `TRUE` and went on to the key's account (2026-09-29), which this server has none of,
+    so what is left is the write; `maybe` is the refusal the table above asserts."""
+    base_url, settings = live_server
+    body = _encryption("arn:aws:kms:us-east-1:111111111111:key/x", "TRUE")
+    r = _signed(
+        base_url, f"{OBJECT_PATH}?encryption", settings.admin_token, method="PUT", body=body
+    )
+    assert r.status_code == 501 and "<Code>NotImplemented</Code>" in r.text
 
 
 @pytest.mark.parametrize(

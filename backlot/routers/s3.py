@@ -40,6 +40,7 @@ import zlib
 from xml.etree import ElementTree
 from xml.sax.saxutils import escape
 
+import xxhash
 from fastapi import APIRouter, Request, Response
 
 from backlot import auth, store, synth
@@ -1466,8 +1467,8 @@ def _list_object_versions(request: Request, conn, bucket: str, visible, max_keys
     """ListObjectVersions — the bucket's keys as their versions, one each, since no bucket here is
     versioned: every one is the version real names `null` and the latest.
 
-    The shape is real's, measured 2026-09-29 on a bucket this account created that day with four
-    keys: ``Name``, ``Prefix``, ``KeyMarker`` and ``VersionIdMarker`` always, echoing what was sent;
+    The shape is real's, measured 2026-09-29 on two buckets this account created that day, one of
+    four keys and one of three: ``Name``, ``Prefix``, ``KeyMarker`` and ``VersionIdMarker`` always, echoing what was sent;
     ``NextKeyMarker`` whenever the page is truncated, the last entry by key whether a key or a
     group, and ``NextVersionIdMarker`` beside it, `null`, unless that entry is a group;
     ``MaxKeys`` as parsed, uncapped; ``Delimiter`` whenever one was sent, an empty one included;
@@ -1975,7 +1976,9 @@ def _reflected_crc_table(poly: int) -> list[int]:
 
 
 # CRC-32C and CRC-64/NVME, each reflected with every bit set before and after, as S3 computes them
-# (``tests/test_s3.py`` checks both against their standard check values).
+# (``tests/test_s3.py`` checks both against their standard check values). Real took the value of each
+# checksum ``_checksum`` computes, the two here among them, for a DeleteObjects body sent to the
+# public bucket (2026-09-29).
 _CRC32C = (_reflected_crc_table(0x82F63B78), 32)
 _CRC64NVME = (_reflected_crc_table(0x9A6C9329AC4BC9B5), 64)
 
@@ -1989,18 +1992,23 @@ def _reflected_crc(data: bytes, crc: tuple[list[int], int]) -> bytes:
     return (value ^ mask).to_bytes(bits // 8, "big")
 
 
-def _checksum(name: str, body: bytes) -> bytes | None:
-    """The checksum ``name`` of ``body``, or ``None`` for the three xxhash ones, which this server
-    cannot compute without a library it does not carry, and so takes as given."""
+# What each xxhash checksum names: real took `xxhash64` as XXH64, `xxhash3` as XXH3's 64 bits and
+# `xxhash128` as its 128, each in the byte order the library's digest has, and refused each reversed
+# (2026-09-29, the same DeleteObjects).
+_XXHASHES = {"xxhash64": xxhash.xxh64, "xxhash3": xxhash.xxh3_64, "xxhash128": xxhash.xxh3_128}
+
+
+def _checksum(name: str, body: bytes) -> bytes:
+    """The checksum ``name`` (one of ``_CHECKSUM_WIDTHS``) of ``body``."""
     if name == "crc32":
         return zlib.crc32(body).to_bytes(4, "big")
     if name == "crc32c":
         return _reflected_crc(body, _CRC32C)
     if name == "crc64nvme":
         return _reflected_crc(body, _CRC64NVME)
-    if name in ("md5", "sha1", "sha256", "sha512"):
-        return hashlib.new(name, body).digest()
-    return None
+    if name in _XXHASHES:
+        return _XXHASHES[name](body).digest()
+    return hashlib.new(name, body).digest()
 
 
 def _decoded(value: str, width: int) -> bytes | None:
@@ -2150,8 +2158,7 @@ async def _delete_objects_refusal(
         return mismatch
     if checksum is not None:
         name, expected = checksum
-        actual = _checksum(name, body)
-        if actual is not None and actual != expected:
+        if _checksum(name, body) != expected:
             return _error(
                 "BadDigest",
                 f"The {name.upper()} you specified did not match the calculated checksum.",
