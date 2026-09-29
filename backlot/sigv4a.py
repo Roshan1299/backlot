@@ -72,10 +72,10 @@ def verify(access_key: str, secret: str, to_sign: str, signature: str) -> bool:
 
 def region_set_matches(region_set: str, region: str) -> bool:
     """Whether a comma-separated region set names ``region``. Each entry is matched whole and
-    without case, `*` standing for any run of characters and nothing else for more than itself, and
-    an empty entry is skipped: real took `*`, `us-*`, `*-1`, `u*1`, `**`, `US-*`, `us-east-1*`,
-    `,us-east-1` and `us-west-2,us-east-1` for us-east-1, and refused `us-east-?`, `us-east-10`,
-    `us-east-`, `aws-global`, an empty set, `us-west-2, us-east-1`, `us-east-1;us-west-2` and
+    without case, `*` standing for any run of characters and `?` for itself, and an empty entry is
+    skipped: real took `*`, `us-*`, `*-1`, `u*1`, `**`, `US-*`, `us-east-1*`, `,us-east-1` and
+    `us-west-2,us-east-1` for us-east-1, and refused `us-east-?`, `us-east-10`, `us-east-`,
+    `aws-global`, an empty set, `us-west-2, us-east-1`, `us-east-1;us-west-2` and
     `us-east-1 us-west-2` (2026-09-29)."""
     for entry in region_set.split(","):
         if not entry:

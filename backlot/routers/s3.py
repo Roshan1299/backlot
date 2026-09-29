@@ -641,13 +641,14 @@ def _refused_credential(refusal: auth.SigV4Refusal, head: bool = False) -> Respo
 
 
 # The payload hashes that name a trailing checksum, which an upload's aws-chunked body carries
-# (``_put_object_refusal``). Real refused each elsewhere with "The value of x-amz-content-sha256
-# header is invalid.": on a GET of a listing, of a bucket's `?versioning` and `?acl`, of an object
-# and of a key the bucket does not hold, on a HEAD, a `DELETE`, a `POST ?delete`, a key's
-# `PUT ?tagging`, a presign's GET and the service root's. It came after a signature that fails,
-# after a bucket that does not exist and after what is refused before the credential, a `max-keys`
-# of `abc` and two selectors, and ahead of a `continuation-token`, a `partNumber` and a `versionId`
-# that are refused after the bucket (2026-09-29).
+# (``_put_object_refusal``). Real refused each on a GET with "The value of x-amz-content-sha256
+# header is invalid.", and `STREAMING-UNSIGNED-PAYLOAD-TRAILER` likewise on a GET of a listing, of a
+# bucket's `?versioning` and `?acl`, of an object and of a key the bucket does not hold, on a HEAD,
+# a `DELETE`, a `POST ?delete`, a key's `PUT ?tagging`, a presign's GET and the service root's. It
+# came after a signature that fails, after a bucket that does not exist and after what is refused
+# before the credential, a `max-keys` of `abc` and two selectors, and ahead of a
+# `continuation-token`, a `partNumber` and a `versionId` that are refused after the bucket
+# (2026-09-29).
 _TRAILERS = frozenset(
     {
         "STREAMING-UNSIGNED-PAYLOAD-TRAILER",

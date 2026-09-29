@@ -423,7 +423,7 @@ _MISMATCH = (
 )
 # A Signature Version 2 query's `Expires` is seconds since the epoch, read in a Java long and taken
 # up to an int32's largest: 2147483647 and `+2147483647` were dates and 2147483648 not, nor `1e9` or
-# ` 1`, where `01790000000`, `-1` and every negative down to -9223372036854775808 were, and
+# ` 1`, where `01790000000`, `-1`, -2147483649, -9999999999 and -9223372036854775808 were, and
 # -9223372036854775809 not (2026-09-29).
 _INT32 = 2**31
 # The milliseconds real's V2 query multiplies `Expires` into wrap as a Java long's do, and an
@@ -487,10 +487,13 @@ def _skewed(request_time: str, now: datetime) -> SigV4Refusal:
 
 def _unsigned(hdrs: dict[str, str], signed_headers: str) -> SigV4Refusal | None:
     """Real's refusal of a request carrying a header it requires to be signed and that is not:
-    `Host`, `Content-MD5` and every `x-amz-*` header but `x-amz-content-sha256`, which a V4 header,
-    a V4 presign and SigV4a alike were refused for and a `Content-Type`, a `Range`, a `Date`, the
-    conditional and content headers, `x-amzn-trace-id` and an unsigned `x-amz-content-sha256` were
-    not (2026-09-29). They are named in ``_hash_set_order``."""
+    `Host`, `Content-MD5` and the `x-amz-*` headers but `x-amz-content-sha256`. Each such header
+    sent unsigned was refused, in a V4 header, a V4 presign and SigV4a alike, `x-amz-date`,
+    `x-amz-region-set`, `x-amz-acl` and `x-amz-meta-*` ones among them, and a `Content-Type`, a
+    `Range`, a `Date`, `If-Match`, `If-None-Match`, `If-Modified-Since`, `Cache-Control`,
+    `Content-Length`, `Content-Encoding`, `Content-Disposition`, `Content-Language`,
+    `x-amzn-trace-id` and an unsigned `x-amz-content-sha256` were not (2026-09-29). They are named
+    in ``_hash_set_order``."""
     signed = set(signed_headers.split(";"))
     names = sorted(
         name

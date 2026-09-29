@@ -4851,7 +4851,7 @@ _WRITE_CHECK_ROWS = [
         for path in ("/s3/no-such-bucket/k.txt", "/s3/no-such-bucket/k.txt?tagging")
         for sha in (_ZEROS, _TRAILER)
     ],
-    # DeleteObjects checks the payload hash after everything else it checks.
+    # DeleteObjects checks the payload hash after its body, its keys and its digests.
     (
         "POST",
         "/s3/eng-artifacts?delete",
@@ -4983,8 +4983,9 @@ _WRITE_CHECK_ROWS = [
             ("backlot-no-such-key", {}),
         )
     ],
-    # The other writes measured: a key's and a bucket's `PUT`s check the payload hash once the
-    # bucket is found, a `DELETE` does not, and each refuses a trailer's.
+    # The other writes measured: a key's `PUT ?tagging` and a bucket's `PUT ?versioning` check the
+    # payload hash once the bucket is found, a `DELETE` does not, and the tagging and the `DELETE`
+    # refuse a trailer's.
     (
         "PUT",
         "/s3/eng-artifacts/runbooks/oncall.md?tagging",
@@ -6388,7 +6389,7 @@ _REFUSAL_ROWS_UNIT = [
         _not_signed("x-amz-meta-a, x-amz-meta-b, content-md5"),
     ),
     (
-        "unsigned headers real signs no matter",
+        "headers real takes unsigned",
         {
             "x-amz-date": _now(),
             "content-type": "text/plain",
