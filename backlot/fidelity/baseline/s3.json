@@ -3,7 +3,7 @@
   "endpoints": [
     "https://raw.githubusercontent.com/boto/botocore/develop/botocore/data/s3/2006-03-01/service-2.json"
   ],
-  "measured": "2026-09-10",
+  "measured": "2026-09-29",
   "acknowledged": [
     {
       "kind": "silent_fallthrough",
@@ -289,8 +289,8 @@
       "kind": "missing_operation",
       "severity": "gap",
       "path": "ListParts: GET /{object}?uploadId",
-      "detail": "ListParts is refused (501), which is an honest answer for an operation Backlot does not serve",
-      "note": "Refused with NotImplemented (501) rather than answered with the object's bytes. Real S3 answers 404 NoSuchUpload for an upload id that does not exist, whether or not the key does, so Backlot refuses it before looking the key up (measured in us-east-1 and ap-northeast-2 against a general purpose bucket with none of this configured)."
+      "detail": "ListParts is refused (404), which is an honest answer for an operation Backlot does not serve",
+      "note": "Answered with real's 404 NoSuchUpload naming the id, for any id: no upload is ever in progress here, and real answers that for an upload id it does not have, whether or not the key exists (measured in us-east-1 on 2026-09-29), where it answers a ListPartsResult for one it does."
     }
   ]
 }

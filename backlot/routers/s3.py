@@ -3,9 +3,11 @@
 Path-style endpoint for a client: ``http://<host>/s3`` (boto3: ``endpoint_url=".../s3"`` with
 ``addressing_style=path``; mirage: ``S3Config(endpoint_url=".../s3", path_style=True)``). Auth is
 full AWS SigV4 (``backlot.auth.resolve_sigv4``) against a per-caller access-key/secret derived from a
-bearer token; the admin/service token's key sees everything, a user's key is ACL-filtered. A method
-this router does not serve is refused before any of that, as real refuses one, and so is a GET or a
-HEAD naming a selector it cannot take (``_read_refusal``); a write resolves the credential and the
+bearer token; the admin/service token's key sees everything, a user's key is ACL-filtered, and an
+unsigned request is the anonymous caller's, who sees no bucket (``_auth``). A method this router
+does not serve, and a GET or a HEAD naming a selector it cannot take, is refused before the bucket
+and before a missing credential, as real refuses them, but after a signature that was sent and
+does not verify (``_method_refusal``, ``_read_refusal``); a write resolves the credential and the
 bucket first.
 Responses are S3 XML (namespace ``http://s3.amazonaws.com/doc/2006-03-01/``) or raw object bytes;
 errors use the S3 ``<Error>`` envelope.
@@ -141,14 +143,15 @@ _P_BUCKET_GET = [
     ),
 ]
 _ERR_STATUS = {
-    "MissingSecurityHeader": 403,
     "AuthorizationHeaderMalformed": 400,
+    "AuthorizationQueryParametersError": 400,
     "InvalidAccessKeyId": 403,
     "SignatureDoesNotMatch": 403,
     "RequestTimeTooSkewed": 403,
     "AccessDenied": 403,
     "NoSuchBucket": 404,
     "NoSuchKey": 404,
+    "NoSuchUpload": 404,
     "InvalidRange": 416,
     "InvalidArgument": 400,
     "InvalidRequest": 400,
@@ -277,7 +280,8 @@ def _error(code: str, message: str, extra: str = "", headers: dict | None = None
     `MethodNotAllowed`. Measured 2026-09-29 against `s3.us-east-1.amazonaws.com` over fifty-three
     error bodies of nine codes, a key in an absent bucket and a missing key under a prefix among
     them; none carried a `Resource`. `NotImplemented` is this server's own refusal, with no real
-    body to copy, and names nothing.
+    body to copy, and names nothing. A credential refusal's members are the ones
+    ``backlot.auth.resolve_sigv4`` names (``_refused_credential``).
     """
     ids = REQUEST_IDS.get()
     # Real names them last, after the members that describe the failure (measured over seven error
@@ -373,18 +377,60 @@ def _conflict(selected: list[str]) -> Response:
     )
 
 
-def _signature_refusal(request: Request) -> str | None:
-    """The code refusing a credential that was sent and does not verify, or ``None``.
+def _refused_credential(refusal: auth.SigV4Refusal, head: bool = False) -> Response:
+    """Real's answer for a credential it refuses, members and all; on a `HEAD`, its status alone."""
+    if head:
+        return _head(_ERR_STATUS[refusal.code])
+    members = "".join(f"<{name}>{escape(value)}</{name}>" for name, value in refusal.members)
+    return _error(refusal.code, refusal.message, members)
 
-    ``None`` as well when no credential is sent: real takes an unsigned request as an anonymous
-    caller's and gives it the selector refusal a signed one gets, where a signature that fails and
-    an access key AWS does not know are each refused with their 403 first (measured 2026-09-29
-    against `s3.us-east-1.amazonaws.com`, twelve selector refusals across a GET and a HEAD at a
-    bucket and at a key, each sent signed, unsigned, signed over a bad secret and with an unknown
-    key).
+
+def _signature_refusal(request: Request) -> auth.SigV4Refusal | None:
+    """The refusal of a credential that was sent and does not verify, or ``None``.
+
+    ``None`` as well when no credential is sent: that is an anonymous caller's request, on real and
+    here (``backlot.auth.resolve_sigv4``), and real gives it the method and selector refusals a
+    signed request gets, where a signature that fails and an access key AWS does not know are each
+    refused first. Measured 2026-09-29 against `s3.us-east-1.amazonaws.com`: twelve selector
+    refusals across a GET and a HEAD at a bucket and at a key, each sent signed, unsigned, signed
+    over a bad secret and with an unknown key, and ten method refusals at a bucket, a key and the
+    service root, which the bad secret and the unknown key each turned into their 403.
     """
-    _, err = auth.resolve_sigv4(request)
-    return None if err == "MissingSecurityHeader" else err
+    return auth.resolve_sigv4(request)[1]
+
+
+def _method_refusal(request: Request, resource_type: str, headers: dict | None = None) -> Response:
+    """The 405 naming the method and the resource type, once a signature that was sent verifies."""
+    head = request.method == "HEAD"
+    refusal = _signature_refusal(request)
+    if refusal is not None:
+        return _refused_credential(refusal, head)
+    if head:
+        return _head(405, headers)
+    return _error(
+        "MethodNotAllowed",
+        _METHOD_NOT_ALLOWED,
+        extra=_method_type(request.method, resource_type),
+        headers=headers,
+    )
+
+
+def _bucket_selected(q, selectors: frozenset[str]) -> list[str]:
+    """The selectors a request at a bucket's path carries, `partNumber` among them, with `PART`
+    standing for `partNumber` beside `uploadId`, which is UploadPart (``_UPLOAD_PART``).
+
+    `partNumber` names a part of an object, which a bucket's path has none of: real answered
+    `?partNumber=1` there with 400 `InvalidRequest`, "Object must have a valid key name.", on a
+    GET, a HEAD, a `PUT`, a `POST`, a `DELETE` and a `PATCH`, and for `abc` and an empty value as
+    for `1`, before the credential (signed, unsigned and over a bad secret alike) and before the
+    listing's own parameters (``?partNumber=1&max-keys=abc`` is still this 400); beside another
+    selector it is the conflict (``acl, partNumber``), and beside `uploadId` the 405 naming `PART`
+    with `Allow: PUT` (measured 2026-09-29, us-east-1).
+    """
+    selected = _selected(q, selectors | {"partNumber"})
+    if "partNumber" in selected and "uploadId" in q and set(selected) <= {"partNumber", "uploadId"}:
+        return ["PART"]
+    return selected
 
 
 def _read_refusal(
@@ -399,25 +445,25 @@ def _read_refusal(
     Two selectors are the conflict before any credential is read: real answered seven such requests,
     at a bucket and at a key, on a GET and a HEAD, and in a bucket that does not exist, with the 400
     whether each was signed, unsigned, signed over a bad secret or sent with an unknown key
-    (2026-09-29). One selector is refused on a HEAD whatever it is (``_head_refusal``) and on a GET
-    when the GET cannot take it (``refused``, the type its 405 names), once a signature that was
-    sent verifies (``_signature_refusal``).
+    (2026-09-29). So is a bucket's `partNumber` (``_bucket_selected``). One selector is refused on a
+    HEAD whatever it is (``_head_refusal``) and on a GET when the GET cannot take it (``refused``,
+    the type its 405 names), once a signature that was sent verifies (``_signature_refusal``).
     """
     head = request.method == "HEAD"
     if len(selected) > 1:
         return _head_refusal(selected, served_on_get) if head else _conflict(selected)
+    if selected == ["partNumber"]:
+        return _head(400) if head else _error("InvalidRequest", _KEY_REQUIRED)
     if not selected or not (head or selected[0] in refused):
         return None
-    code = _signature_refusal(request)
-    if code is not None:
-        return _head(_ERR_STATUS[code]) if head else _error(code, code)
     if head:
-        return _head_refusal(selected, served_on_get)
-    return _error(
-        "MethodNotAllowed",
-        _METHOD_NOT_ALLOWED,
-        extra=_method_type("GET", refused[selected[0]]),
-    )
+        refusal = _signature_refusal(request)
+        return (
+            _refused_credential(refusal, head)
+            if refusal
+            else _head_refusal(selected, served_on_get)
+        )
+    return _method_refusal(request, refused[selected[0]])
 
 
 def _head_refusal(selected: list[str], served_on_get: frozenset[str]) -> Response:
@@ -467,12 +513,18 @@ def _not_implemented(selector: str) -> Response:
 
 
 def _auth(request: Request):
-    """Returns ``(caller, visible_ids, None)`` on success or ``(None, None, error_response)``."""
-    caller, err = auth.resolve_sigv4(request)
-    if err:
-        return None, None, _error(err, err)
-    visible = auth.visible_ids(request, caller)
-    return caller, visible, None
+    """``(caller, visible_ids, None)``, or ``(None, None, refusal)`` for a credential real refuses.
+
+    An unsigned request is the anonymous caller's, who can see nothing (``backlot.acl``), so every
+    bucket is one it cannot see: `NoSuchBucket`, the answer a user gets for a bucket it holds no
+    readable object in. For a name no bucket has, that is real's own answer to an unsigned request
+    (measured 2026-09-29); for one this corpus holds, real says `AccessDenied`, and saying
+    `NoSuchBucket` instead keeps an anonymous caller from learning which names the corpus holds.
+    """
+    caller, refusal = auth.resolve_sigv4(request)
+    if refusal is not None:
+        return None, None, _refused_credential(refusal, request.method == "HEAD")
+    return caller, auth.visible_ids(request, caller), None
 
 
 def _owner_id(request: Request) -> str:
@@ -537,10 +589,13 @@ async def list_buckets(request: Request):
     """ListBuckets — every bucket the caller can see.
 
     A bucket is visible when any object in it is, so a caller with no readable object in a bucket
-    does not learn the bucket exists."""
+    does not learn the bucket exists. An unsigned request is real's 307 to the product page, with no
+    body (measured 2026-09-29), where it answers a signed one with the listing."""
     caller, visible, err = _auth(request)
     if err:
         return err
+    if caller.is_anonymous:
+        return Response(status_code=307, headers={"Location": _ANONYMOUS_LIST_BUCKETS})
     conn = auth.conn(request)
     buckets = [
         b["name"]
@@ -573,16 +628,30 @@ async def head_bucket(request: Request, bucket: str):
     Headers alone in every case, which is why it carries no MCP tool (see ``backlot.openapi``). The
     200 carries the two real sends beside the region, the bucket's ARN and that the name is not an
     access point alias, which boto3's ``head_bucket`` returns as ``BucketArn`` and
-    ``AccessPointAlias`` (measured 2026-09-29 on the public bucket `noaa-ghcn-pds` in us-east-1)."""
-    selected = _selected(request.query_params, _BUCKET_READ_SELECTORS)
-    refused = _read_refusal(request, selected, _BUCKET_READ_REFUSED, _BUCKET_GETS)
+    ``AccessPointAlias`` (measured 2026-09-29 on the public bucket `noaa-ghcn-pds` in us-east-1).
+
+    A HEAD reads the listing's parameters the way the listing's GET does, and answers each refusal
+    as its status alone: `max-keys` that does not parse and the other version's parameters before
+    the credential and the bucket, then an `encoding-type` or a `continuation-token` it cannot read
+    after the bucket. The one it leaves is the `max-keys` range: `?max-keys=-1` is the 200 (all
+    measured 2026-09-29, beside the GET, on the public bucket and a name nobody owns)."""
+    q = request.query_params
+    selected = _bucket_selected(q, _BUCKET_HEAD_SELECTORS)
+    refused = _read_refusal(request, selected, _BUCKET_GET_REFUSALS, _BUCKET_GETS)
     if refused is not None:
         return refused
+    v2 = _first(q, "list-type", None) == _LIST_TYPE_V2
+    _, err = _listing_parse(q, v2)
+    if err is not None:
+        return _head(err.status_code)
     caller, visible, err = _auth(request)
     if err:
-        return _head(err.status_code)
+        return err
     if not _bucket_visible(auth.conn(request), bucket, visible):
         return _head(404)
+    err = _listing_checks(q, v2)[-1]
+    if err is not None:
+        return _head(err.status_code)
     return _head(
         200,
         {
@@ -604,35 +673,31 @@ async def bucket_get(request: Request, bucket: str):
     with ``uploads`` present ListMultipartUploads, always the empty page because no upload is ever
     in progress."""
     q = request.query_params
-    selected = _selected(q, _BUCKET_READ_SELECTORS)
-    refused = _read_refusal(request, selected, _BUCKET_READ_REFUSED, _BUCKET_GETS)
+    selected = _bucket_selected(q, _BUCKET_READ_SELECTORS)
+    refused = _read_refusal(request, selected, _BUCKET_GET_REFUSALS, _BUCKET_GETS)
     if refused is not None:
         return refused
-    caller, visible, err = _auth(request)
-    if err:
-        return err
-    conn = auth.conn(request)
     max_uploads, max_keys = _MAX_UPLOADS, _MAX_KEYS
     v2 = _first(q, "list-type", None) == _LIST_TYPE_V2
+    # Both parses come before the credential as well as the bucket: an unsigned request and one
+    # signed over a bad secret get the same 400 for `?uploads&max-uploads=abc` and `?max-keys=abc`
+    # (measured 2026-09-29), where the rest of what is refused here comes after the signature.
     if selected == ["uploads"]:
-        # Also before the bucket is looked up: `?uploads&max-uploads=abc` on a bucket that does not
-        # exist is the 400, not NoSuchBucket, where `?uploads&max-uploads=-1` on it is NoSuchBucket:
-        # the value is parsed here and judged against the range after the lookup (measured). The
-        # other parameters are read after it too.
+        # Before the bucket is looked up: `?uploads&max-uploads=abc` on a bucket that does not exist
+        # is the 400, not NoSuchBucket, where `?uploads&max-uploads=-1` on it is NoSuchBucket: the
+        # value is parsed here and judged against the range after the lookup (measured). The other
+        # parameters are read after it too.
         max_uploads, err = _int32_param(q, "max-uploads", _MAX_UPLOADS)
         if err:
             return err
     elif not selected:
-        # The listing straddles the lookup the same way, and in this order: `max-keys` parses first
-        # (`?start-after=x&max-keys=abc` on a V1 request is the max-keys refusal, not start-after's),
-        # then the other version's parameters are refused, and both happen before the bucket is
-        # looked up. What is judged after it is in _list_objects, in the order its docstring gives.
-        max_keys, err = _int32_param(q, "max-keys", _MAX_KEYS)
+        max_keys, err = _listing_parse(q, v2)
         if err:
             return err
-        for name, message in _V1_ONLY if v2 else _V2_ONLY:
-            if _first(q, name, None) is not None:
-                return _error("InvalidArgument", message, extra=_argument_name(name))
+    caller, visible, err = _auth(request)
+    if err:
+        return err
+    conn = auth.conn(request)
     if not _bucket_visible(conn, bucket, visible):
         return _no_such_bucket(bucket)
     if selected and selected[0] not in _BUCKET_GETS:
@@ -643,6 +708,60 @@ async def bucket_get(request: Request, bucket: str):
     if selected == ["uploads"]:
         return _list_multipart_uploads(request, bucket, max_uploads)
     return _list_objects(request, conn, bucket, visible, v2=v2, max_keys=max_keys)
+
+
+def _listing_parse(q, v2: bool) -> tuple[int, Response | None]:
+    """What the listing refuses before the credential and the bucket, with ``max-keys`` as parsed.
+
+    In this order: `max-keys` parses first (`?start-after=x&max-keys=abc` on a V1 request is the
+    max-keys refusal, not start-after's), then the other version's parameters are refused. What is
+    judged after the bucket is in ``_listing_checks`` and ``_list_objects``, in the order the
+    latter's docstring gives.
+    """
+    max_keys, err = _int32_param(q, "max-keys", _MAX_KEYS)
+    if err:
+        return max_keys, err
+    for name, message in _V1_ONLY if v2 else _V2_ONLY:
+        if _first(q, name, None) is not None:
+            return max_keys, _error("InvalidArgument", message, extra=_argument_name(name))
+    return max_keys, None
+
+
+def _listing_checks(q, v2: bool) -> tuple[str | None, str | None, tuple | None, Response | None]:
+    """The listing's ``encoding-type`` and ``continuation-token``, judged after the bucket lookup,
+    as ``(encoding_type, continuation, decoded, refusal)``."""
+    encoding_type = _first(q, "encoding-type", None)
+    if encoding_type is not None and encoding_type.lower() != "url":
+        return (
+            encoding_type,
+            None,
+            None,
+            _argument_error(
+                "Invalid Encoding Method specified in Request", "encoding-type", encoding_type
+            ),
+        )
+    # What a readable token bounds is at `after, at` in ``_list_objects``.
+    continuation = _first(q, "continuation-token", None) if v2 else None
+    decoded = None
+    if continuation is not None:
+        decoded = _decode_token(continuation)
+        if decoded is None:
+            # Sent and unreadable is its own input, neither absent nor a token. Judged here because
+            # real does: `?continuation-token=garbage&encoding-type=bogus` is the encoding-type
+            # refusal, `&max-keys=-1` beside it is this one, and a bucket that does not exist is
+            # NoSuchBucket for an unreadable token and an empty one both (measured 2026-09-17; the
+            # shape is in ``_list_objects``'s docstring).
+            return (
+                encoding_type,
+                continuation,
+                None,
+                _error(
+                    "InvalidArgument",
+                    "The continuation token provided is incorrect",
+                    extra=_argument_name("continuation-token"),
+                ),
+            )
+    return encoding_type, continuation, decoded, None
 
 
 def _group_of(key: str, prefix: str, delimiter: str) -> str | None:
@@ -720,27 +839,9 @@ def _list_objects(
     answers V1 where the two the other way round answer V2 (measured).
     """
     q = request.query_params
-    encoding_type = _first(q, "encoding-type", None)
-    if encoding_type is not None and encoding_type.lower() != "url":
-        return _argument_error(
-            "Invalid Encoding Method specified in Request", "encoding-type", encoding_type
-        )
-    # What a readable token bounds is at `after, at` further down.
-    continuation = _first(q, "continuation-token", None) if v2 else None
-    decoded = None
-    if continuation is not None:
-        decoded = _decode_token(continuation)
-        if decoded is None:
-            # Sent and unreadable is its own input, neither absent nor a token. Judged here because
-            # real does: `?continuation-token=garbage&encoding-type=bogus` is the encoding-type
-            # refusal, `&max-keys=-1` beside it is this one, and a bucket that does not exist is
-            # NoSuchBucket for an unreadable token and an empty one both (measured 2026-09-17; the
-            # shape is in this function's docstring).
-            return _error(
-                "InvalidArgument",
-                "The continuation token provided is incorrect",
-                extra=_argument_name("continuation-token"),
-            )
+    encoding_type, continuation, decoded, err = _listing_checks(q, v2)
+    if err is not None:
+        return err
     err = _range_refusal(max_keys, "maxKeys")
     if err:
         return err
@@ -1045,25 +1146,44 @@ async def object_get(request: Request, bucket: str, key: str):
     is one in a bucket the caller cannot see. An object the caller cannot read is NoSuchKey, not
     AccessDenied, so a listing and a read agree about what exists."""
     head = request.method == "HEAD"
-    selected = _selected(request.query_params, _OBJECT_READ_SELECTORS)
+    q = request.query_params
+    selected = _selected(q, _OBJECT_HEAD_SELECTORS if head else _OBJECT_READ_SELECTORS)
+    if selected == ["uploadId"] and "partNumber" in q:
+        # UploadPart, which real refuses a GET and a HEAD of with the 405 naming `PART`, before the
+        # bucket (measured 2026-09-29).
+        selected = ["PART"]
     # An empty set, not `_BUCKET_GETS`: a key's path serves no sub-resource on a GET, so its HEAD
     # refusal names no method even for a selector a bucket's path does serve.
-    refused = _read_refusal(request, selected, _OBJECT_READ_REFUSED, frozenset())
+    refused = _read_refusal(request, selected, _OBJECT_GET_REFUSALS, frozenset())
     if refused is not None:
         return refused
+    if selected == ["uploadId"]:
+        # ListParts' own integers parse before the credential and the bucket, as the listing's do:
+        # `?uploadId=x&max-parts=abc` is the 400 in a bucket that does not exist, unsigned and over
+        # a bad secret, where `max-parts=-1` is left to the upload (measured 2026-09-29).
+        for name in ("max-parts", "part-number-marker"):
+            _, err = _int32_param(q, name, 0)
+            if err:
+                return err
     caller, visible, err = _auth(request)
     if err:
-        return _head(err.status_code) if head else err
+        return err
     conn = auth.conn(request)
     if not _bucket_visible(conn, bucket, visible):
         return _head(404) if head else _no_such_bucket(bucket)
     if selected == ["uploads"]:
         return _error("InvalidRequest", _UPLOADS_ON_A_KEY)
     if selected == ["uploadId"]:
-        # ListParts is about an upload, not about the object under the key: real S3 answers
-        # `NoSuchUpload` for a key that does not exist, not `NoSuchKey` (measured), so the refusal
-        # comes before the key is looked up.
-        return _not_implemented("uploadId")
+        # ListParts is about an upload, not about the object under the key, and no upload is ever
+        # in progress here: real answers `NoSuchUpload` naming the id for a key that exists and for
+        # one that does not, an empty id included (measured 2026-09-29), so the answer comes
+        # before the key is looked up.
+        return _error(
+            "NoSuchUpload",
+            "The specified upload does not exist. The upload ID may be invalid, or the upload may "
+            "have been aborted or completed.",
+            f"<UploadId>{escape(_first(q, 'uploadId'))}</UploadId>",
+        )
     row = _object_row(conn, bucket, key, visible)
     if row is None:
         return _head(404) if head else _no_such_key(key)
@@ -1091,15 +1211,15 @@ async def object_get(request: Request, bucket: str, key: str):
     if rng:
         parsed = _parse_range(rng, total)
         if parsed is None:
-            unsatisfiable = {"Content-Range": f"bytes */{total}"}
+            # No `Content-Range` beside it, on a GET or a HEAD (measured 2026-09-29): real names
+            # the size in the body alone.
             if head:
-                return _head(416, unsatisfiable)
+                return _head(416)
             return _error(
                 "InvalidRange",
                 "The requested range is not satisfiable",
                 f"<RangeRequested>{escape(rng)}</RangeRequested>"
                 f"<ActualObjectSize>{total}</ActualObjectSize>",
-                headers=unsatisfiable,
             )
         start, end = parsed
         status = 206
@@ -1166,11 +1286,14 @@ def _parse_range(header: str, total: int):
 # is, since an upload is a write; and a preflight names every bucket path as present
 # (`_cors_preflight`).
 #
-# No credential is resolved before a method refusal, because real answers the method first: an
-# unsigned `PATCH` on a bucket, on a key and at the root, an unsigned `HEAD` at the root, and an
-# unsigned `PATCH` or `POST` naming a selector that lacks it, answered the same 405 as a signed one,
-# and an unsigned `OPTIONS` the same 400 and 403. A write resolves the credential and the bucket
-# before its 501 (`_refuse_write`).
+# A missing credential is not refused before a method refusal, because real answers the method
+# first: an unsigned `PATCH` on a bucket, on a key and at the root, an unsigned `HEAD` at the root,
+# and an unsigned `PATCH` or `POST` naming a selector that lacks it, answered the same 405 as a
+# signed one, and an unsigned `OPTIONS` the same 400 and 403. A signature that is sent and does not
+# verify is refused first, ahead of each 405 (`_method_refusal`), and after the 412, both `OPTIONS`
+# answers and the conflict, which answered a bad secret and an unknown access key as they answer a
+# signed request (measured 2026-09-29). A write resolves the credential and the bucket before its
+# 501 (`_refuse_write`).
 
 _METHOD_NOT_ALLOWED = "The specified method is not allowed against this resource."
 _CORS_NEEDS_ORIGIN = "Insufficient information. Origin request header needed."
@@ -1269,6 +1392,35 @@ _UPLOADS_ON_A_KEY = "Key is not expected for the GET method ?uploads subresource
 # `?acl&delete`, `?restore&location` and a key's `?uploads&acl` are each the conflict (same date).
 _BUCKET_READ_SELECTORS = _BUCKET_SELECTORS | frozenset(_BUCKET_READ_REFUSED)
 _OBJECT_READ_SELECTORS = _OBJECT_SELECTORS | frozenset(_OBJECT_READ_REFUSED) | {"uploads"}
+# What a GET's 405 names for each selector it is refused for, UploadPart's pair among them.
+_BUCKET_GET_REFUSALS = {**_BUCKET_READ_REFUSED, "PART": _UPLOAD_PART[0]}
+_OBJECT_GET_REFUSALS = {**_OBJECT_READ_REFUSED, "PART": _UPLOAD_PART[0]}
+# A HEAD is refused for selectors a GET at the same path does not read: at a bucket's path two of
+# an object's, and at a key's path the bucket selectors below, each with a 405 whose `Allow` names
+# the selector's methods, before the bucket and after a signature that was sent. Measured
+# 2026-09-29: of the bucket selectors on a HEAD at a key, in a bucket nobody owns and at the public
+# bucket's object, these answered the 405 and the rest the key's own 404 or 200; of the object
+# selectors on a HEAD at a bucket, these two. A GET at a key naming one of them is the bucket's own
+# operation on real, which this server does not answer there.
+_BUCKET_HEAD_SELECTORS = _BUCKET_READ_SELECTORS | {"torrent", "uploadId"}
+_OBJECT_HEAD_SELECTORS = _OBJECT_READ_SELECTORS | {
+    "accelerate",
+    "cors",
+    "inventory",
+    "lifecycle",
+    "location",
+    "logging",
+    "notification",
+    "policy",
+    "replication",
+    "requestPayment",
+    "versioning",
+    "versions",
+    "website",
+}
+_KEY_REQUIRED = "Object must have a valid key name."
+# What real answers an unsigned ListBuckets with: a 307 to here (measured 2026-09-29).
+_ANONYMOUS_LIST_BUCKETS = "https://aws.amazon.com/s3/"
 
 # The `Access-Control-Request-Method` values real's preflight accepts, case and all: any other is
 # "Invalid Access-Control-Request-Method: <value>" at 400 (same date, `put`, `Get`, `FOO`, `TRACE`,
@@ -1309,11 +1461,17 @@ def _refuse_write(request: Request, bucket: str, method: str, *, resolve: bool =
     something that is not there learns it is not there, and one asking to delete something that is
     learns this server does not write. A bare bucket `PUT` is CreateBucket, which real answered with
     `BucketAlreadyExists` for a taken name and by creating a free one, not with `NoSuchBucket`, so
-    it is refused with ``resolve=False`` and says nothing about the name.
+    it is refused with ``resolve=False`` and says nothing about the name. An unsigned one is real's
+    `AccessDenied` for an anonymous caller (measured 2026-09-29), and any other unsigned write
+    names a bucket that caller cannot see.
     """
     caller, visible, err = _auth(request)
     if err is not None:
         return err
+    if not resolve and caller.is_anonymous:
+        return _error(
+            "AccessDenied", "Anonymous users cannot invoke this API. Please authenticate."
+        )
     if resolve and not _bucket_visible(auth.conn(request), bucket, visible):
         return _no_such_bucket(bucket)
     return _error("NotImplemented", _WRITE_IS_NOT_SERVED + method)
@@ -1322,32 +1480,33 @@ def _refuse_write(request: Request, bucket: str, method: str, *, resolve: bool =
 def _selector_refusal(
     request: Request,
     bucket: str,
+    selected: list[str],
     table: dict[str, tuple[str, frozenset[str]]],
     served_on_get: frozenset[str],
 ) -> Response | None:
-    """The answer to a method carrying a sub-resource selector, or ``None`` when it carries none.
+    """The answer to a method carrying the sub-resource selectors ``selected``, or ``None`` when it
+    carries none.
 
-    Two selectors are the conflict a GET gets. One is a write when the method is an operation of
-    that selector, and otherwise the 405 naming the selector's type, whose `Allow` is `GET` for a
-    selector this server answers on a GET and absent otherwise — the line ``_head_refusal`` draws.
+    Two selectors are the conflict a GET gets, and a bucket's `partNumber` the 400 a GET gets
+    (``_bucket_selected``), both before the credential. One is a write when the method is an
+    operation of that selector, and otherwise the 405 naming the selector's type, whose `Allow` is
+    `GET` for a selector this server answers on a GET and absent otherwise — the line
+    ``_head_refusal`` draws.
     """
-    q = request.query_params
-    selected = _selected(q, frozenset(table))
     if not selected:
         return None
     if len(selected) > 1:
         return _conflict(selected)
-    if selected == ["uploadId"] and "partNumber" in q:
+    if selected == ["partNumber"]:
+        return _error("InvalidRequest", _KEY_REQUIRED)
+    if selected == ["PART"]:
         resource_type, writes = _UPLOAD_PART
     else:
         resource_type, writes = table[selected[0]]
     if request.method in writes:
         return _refuse_write(request, bucket, request.method)
-    return _error(
-        "MethodNotAllowed",
-        _METHOD_NOT_ALLOWED,
-        extra=_method_type(request.method, resource_type),
-        headers={"Allow": "GET"} if selected[0] in served_on_get else None,
+    return _method_refusal(
+        request, resource_type, {"Allow": "GET"} if selected[0] in served_on_get else None
     )
 
 
@@ -1362,17 +1521,11 @@ async def service_method_refusal(request: Request) -> Response:
     `PATCH` there with one 405 naming `SERVICE`, each measured, and the same with a selector on
     `PATCH`, `POST` and `PUT`. A `HEAD` is the same 405, with or without `?acl` or `?versioning`
     (measured 2026-09-23), framed as ``_head`` frames every `HEAD` refusal; it is declared here
-    because a method no route here takes is answered by ``backlot.errors.s3`` as the parse 400."""
+    because a method no route here takes is answered by ``backlot.errors.s3`` as the parse 400.
+    Each comes after a signature that was sent verifies (``_method_refusal``)."""
     if request.method == "OPTIONS":
         return _cors_preflight(request, _CORS_NO_BUCKET)
-    if request.method == "HEAD":
-        return _head(405, {"Allow": "GET"})
-    return _error(
-        "MethodNotAllowed",
-        _METHOD_NOT_ALLOWED,
-        extra=_method_type(request.method, "SERVICE"),
-        headers={"Allow": "GET"},
-    )
+    return _method_refusal(request, "SERVICE", {"Allow": "GET"})
 
 
 @router.api_route(
@@ -1386,16 +1539,14 @@ async def bucket_method_refusal(request: Request, bucket: str) -> Response:
     method = request.method
     if method == "OPTIONS":
         return _cors_preflight(request, _CORS_DISABLED)
-    by_selector = _selector_refusal(request, bucket, _BUCKET_WRITE_SELECTORS, _BUCKET_GETS)
+    selected = _bucket_selected(request.query_params, frozenset(_BUCKET_WRITE_SELECTORS))
+    by_selector = _selector_refusal(
+        request, bucket, selected, _BUCKET_WRITE_SELECTORS, _BUCKET_GETS
+    )
     if by_selector is not None:
         return by_selector
     if method == "PATCH":
-        return _error(
-            "MethodNotAllowed",
-            _METHOD_NOT_ALLOWED,
-            extra=_method_type("PATCH", "BUCKET"),
-            headers={"Allow": _ALLOW_BUCKET},
-        )
+        return _method_refusal(request, "BUCKET", {"Allow": _ALLOW_BUCKET})
     if method == "POST":
         # Real refuses a bucket POST that is not a form upload before reading anything else; a
         # multipart one is the upload itself, which is a write, so it is refused here as well.
@@ -1418,14 +1569,13 @@ async def object_method_refusal(request: Request, bucket: str, key: str) -> Resp
     method = request.method
     if method == "OPTIONS":
         return _cors_preflight(request, _CORS_DISABLED)
-    by_selector = _selector_refusal(request, bucket, _OBJECT_WRITE_SELECTORS, frozenset())
+    q = request.query_params
+    selected = _selected(q, frozenset(_OBJECT_WRITE_SELECTORS))
+    if selected == ["uploadId"] and "partNumber" in q:
+        selected = ["PART"]
+    by_selector = _selector_refusal(request, bucket, selected, _OBJECT_WRITE_SELECTORS, frozenset())
     if by_selector is not None:
         return by_selector
     if method in ("PATCH", "POST"):
-        return _error(
-            "MethodNotAllowed",
-            _METHOD_NOT_ALLOWED,
-            extra=_method_type(method, "OBJECT"),
-            headers={"Allow": _ALLOW_OBJECT},
-        )
+        return _method_refusal(request, "OBJECT", {"Allow": _ALLOW_OBJECT})
     return _refuse_write(request, bucket, method)

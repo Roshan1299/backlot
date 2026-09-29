@@ -7,6 +7,7 @@ or call the response builder directly.
 from __future__ import annotations
 
 import base64
+import copy
 import json
 import re
 import urllib.request
@@ -20,7 +21,7 @@ import yaml
 from starlette.requests import Request
 
 from backlot import auth, synth
-from backlot.acl import Acl, Caller
+from backlot.acl import ANONYMOUS, Acl, Caller
 from backlot.sigv4 import (
     expected_signature,
     is_skewed,
@@ -235,6 +236,12 @@ _REFUSAL_ROWS = [
         None,
     ),
     (f"{_KEY}?uploads&acl", "GET", 400, "InvalidArgument", "parameters: acl, uploads", None),
+    # `partNumber` at a bucket's path, on any method, and beside `uploadId` or a selector.
+    ("/s3/eng-artifacts?partNumber=1", "PATCH", 400, "InvalidRequest", "valid key name.", None),
+    ("/s3/no-such-bucket?partNumber=abc", "DELETE", 400, "InvalidRequest", "valid key name.", None),
+    ("/s3/eng-artifacts?partNumber=1&uploadId=u", "GET", 405, "MethodNotAllowed", ">PART</", None),
+    ("/s3/eng-artifacts?partNumber=1&acl", "GET", 400, "InvalidArgument", "acl, partNumber", None),
+    (f"{_KEY}?partNumber=1&uploadId=u", "GET", 405, "MethodNotAllowed", ">PART</", None),
     # The write methods of the selectors that rows above refuse on a GET.
     ("/s3/eng-artifacts?restore", "DELETE", 405, "MethodNotAllowed", ">RESTORE</", None),
     (f"{_KEY}?delete", "PUT", 405, "MethodNotAllowed", ">MULTI_OBJECT_DELETE</", None),
@@ -479,10 +486,10 @@ def test_s3_a_request_in_a_bucket_the_caller_cannot_see_is_nosuchbucket(live_ser
 )
 def test_s3_the_method_is_refused_before_the_credential(live_server, method, path, write):
     """Measured: an unsigned request answers each of these as a signed one does, so real reaches
-    the method, and a selector a GET or a HEAD cannot take, before it reads the credential (the
-    selectors' rows 2026-09-29). A write resolves the credential first, so the same path unsigned
-    under the method that writes there is the missing-signature refusal; the service root and a
-    conflict have no such method."""
+    the method, and a selector a GET or a HEAD cannot take, before it refuses a missing credential
+    (the selectors' rows 2026-09-29). A write resolves the caller and the bucket first, so the same
+    path unsigned under the method that writes there names a bucket the anonymous caller cannot
+    see; the service root and a conflict have no such method."""
     import httpx
 
     base_url, settings = live_server
@@ -494,56 +501,179 @@ def test_s3_the_method_is_refused_before_the_credential(live_server, method, pat
         assert f"<Code>{code}</Code>" in unsigned.text
     if write:
         refused = httpx.request(write, f"{base_url}{path}")
-        assert refused.status_code == 403, write
-        assert "<Code>MissingSecurityHeader</Code>" in refused.text
+        assert refused.status_code == 404, write
+        assert "<Code>NoSuchBucket</Code>" in refused.text
 
 
 def test_s3_unknown_access_key_rejected(live_server):
-    import urllib.request
+    """Real's own message and the key it does not know, measured 2026-09-29."""
+    import httpx
 
-    base_url, settings = live_server
-    url = f"{base_url}/s3/eng-artifacts?list-type=2"
-    req = urllib.request.Request(
-        url,
-        headers={
-            "Authorization": (
-                "AWS4-HMAC-SHA256 Credential=AKIABOGUS0000000BOGUS/"
-                "20260720/us-east-1/s3/aws4_request, "
-                "SignedHeaders=host, Signature=00"
-            ),
-            "x-amz-date": "20260720T000000Z",
-        },
+    base_url, _ = live_server
+    now = datetime.now(timezone.utc).strftime(AMZ_DATE_FORMAT)
+    r = httpx.get(
+        f"{base_url}/s3/eng-artifacts?list-type=2",
+        headers={"authorization": _v4("AKIABOGUS0000000BOGUS", now), "x-amz-date": now},
     )
-    with pytest.raises(urllib.error.HTTPError) as e:
-        urllib.request.urlopen(req)
-    assert e.value.code == 403 and b"InvalidAccessKeyId" in e.value.read()
+    assert r.status_code == 403
+    assert (
+        "<Code>InvalidAccessKeyId</Code><Message>The AWS Access Key Id you provided does not exist"
+        " in our records.</Message><AWSAccessKeyId>AKIABOGUS0000000BOGUS</AWSAccessKeyId>"
+    ) in r.text
 
 
-@pytest.mark.parametrize("method", ["GET", "HEAD"])
+# What a signature that does not verify gets beside each kind of refusal: its 403 ahead of the 405s
+# and of what the listing judges after the bucket, and after the conflict, a bucket's
+# `partNumber`, the listing's own parses, ListParts' and the refusals real's CORS front end and
+# its form-upload check give (all measured 2026-09-29, over a bad secret and an unknown key).
+_TAMPERED_ROWS = [
+    ("GET", "/s3/eng-artifacts?list-type=2", 403),
+    ("HEAD", "/s3/eng-artifacts", 403),
+    ("GET", "/s3/eng-artifacts?delete", 403),
+    ("HEAD", "/s3/eng-artifacts?delete", 403),
+    ("GET", f"{_KEY}?restore", 403),
+    ("HEAD", f"{_KEY}?acl", 403),
+    ("GET", "/s3/eng-artifacts?encoding-type=bogus", 403),
+    ("PATCH", "/s3/eng-artifacts", 403),
+    ("PATCH", _KEY, 403),
+    ("POST", _KEY, 403),
+    ("PATCH", "/s3/", 403),
+    ("PUT", "/s3/", 403),
+    ("HEAD", "/s3/", 403),
+    ("PATCH", "/s3/eng-artifacts?acl", 403),
+    ("PUT", "/s3/eng-artifacts?delete", 403),
+    ("GET", "/s3/eng-artifacts?acl&versioning", 400),
+    ("HEAD", f"{_KEY}?acl&tagging", 400),
+    ("PATCH", "/s3/eng-artifacts?acl&versioning", 400),
+    ("GET", "/s3/eng-artifacts?partNumber=1", 400),
+    ("GET", "/s3/eng-artifacts?max-keys=abc", 400),
+    ("HEAD", "/s3/eng-artifacts?max-keys=abc", 400),
+    ("GET", "/s3/eng-artifacts?start-after=x", 400),
+    ("GET", "/s3/eng-artifacts?uploads&max-uploads=abc", 400),
+    ("GET", f"{_KEY}?uploadId=x&max-parts=abc", 400),
+    ("POST", "/s3/eng-artifacts", 412),
+    ("OPTIONS", "/s3/eng-artifacts", 400),
+]
+
+
 @pytest.mark.parametrize(
-    "path, conflict",
-    [
-        ("/s3/eng-artifacts?list-type=2", False),
-        ("/s3/eng-artifacts?delete", False),
-        (f"{_KEY}?restore", False),
-        ("/s3/eng-artifacts?acl&versioning", True),
-        (f"{_KEY}?acl&tagging", True),
-    ],
+    "method, path, status", _TAMPERED_ROWS, ids=[f"{m}-{p[4:]}" for m, p, _ in _TAMPERED_ROWS]
 )
-def test_s3_tampered_signature_rejected(live_server, method, path, conflict):
-    """A signature that does not verify is the 403 ahead of a selector a GET or a HEAD cannot take,
-    where real answers an unsigned request's 405 first; a conflict comes before any signature is
-    checked (both measured 2026-09-29, `backlot.routers.s3._read_refusal`). The same request
-    signed as sent is not a 403."""
+def test_s3_tampered_signature_rejected(live_server, method, path, status):
+    """Each row measured. Where the answer is the 403 it is the signature's own refusal, and the
+    same request signed as sent is not a 403 (`backlot.routers.s3._signature_refusal`)."""
     import httpx
 
     base_url, settings = live_server
     url, headers = _sign_get(base_url, path, settings.admin_token, tamper=True, method=method)
     r = httpx.request(method, url, headers=headers)
-    assert r.status_code == (400 if conflict else 403)
-    if method == "GET":
-        assert ("InvalidArgument" if conflict else "SignatureDoesNotMatch") in r.text
-    assert _signed(base_url, path, settings.admin_token, method=method).status_code != 403
+    assert r.status_code == status
+    if status == 403:
+        if method != "HEAD":
+            assert "<Code>SignatureDoesNotMatch</Code>" in r.text
+        assert _signed(base_url, path, settings.admin_token, method=method).status_code != 403
+
+
+# An unsigned request is the anonymous caller's, who can see no bucket: each row is real's answer
+# for a name nobody owns, measured 2026-09-29, and the corpus's buckets get the same one here.
+_ANONYMOUS_ROWS = [
+    ("GET", "/s3/eng-artifacts?list-type=2", 404, "NoSuchBucket"),
+    ("GET", "/s3/eng-artifacts?location", 404, "NoSuchBucket"),
+    ("GET", "/s3/eng-artifacts/runbooks/oncall.md", 404, "NoSuchBucket"),
+    ("GET", "/s3/eng-artifacts/runbooks/oncall.md?uploadId=x", 404, "NoSuchBucket"),
+    ("DELETE", "/s3/eng-artifacts", 404, "NoSuchBucket"),
+    ("GET", "/s3/eng-artifacts?list-type=2&max-keys=abc", 400, "InvalidArgument"),
+    ("GET", "/s3/eng-artifacts?start-after=x", 400, "InvalidArgument"),
+    ("PUT", "/s3/eng-artifacts", 403, "AccessDenied"),
+    ("GET", "/s3/eng-artifacts?list-type=2&X-Amz-Signature=00", 404, "NoSuchBucket"),
+]
+
+
+@pytest.mark.parametrize(
+    "method, path, status, code",
+    _ANONYMOUS_ROWS,
+    ids=[f"{r[0]}-{r[1][4:]}" for r in _ANONYMOUS_ROWS],
+)
+def test_s3_an_unsigned_request_is_an_anonymous_caller_who_sees_no_bucket(
+    live_server, method, path, status, code
+):
+    """Real's anonymous `AccessDenied` for a bucket that exists would tell an unsigned caller which
+    names the corpus holds, so every bucket gets the answer for one it cannot see, the one a user
+    with no readable object in a bucket gets (``backlot.routers.s3._auth``). The listing's parses
+    come first, as on real. CreateBucket names no bucket, and real's refusal of an anonymous one is
+    its own. The admin, signed, reads the same bucket."""
+    import httpx
+
+    base_url, settings = live_server
+    r = httpx.request(method, f"{base_url}{path}")
+    assert r.status_code == status and f"<Code>{code}</Code>" in r.text
+    if code == "NoSuchBucket":
+        assert "<BucketName>eng-artifacts</BucketName>" in r.text
+    if code == "AccessDenied":
+        assert "Anonymous users cannot invoke this API. Please authenticate." in r.text
+    signed = _signed(base_url, "/s3/eng-artifacts?list-type=2", settings.admin_token)
+    assert signed.status_code == 200
+
+
+def test_s3_an_unsigned_listbuckets_is_reals_redirect_to_the_product_page(live_server):
+    """Measured 2026-09-29: an unsigned `GET /` is a 307 to aws.amazon.com/s3/ with no body, where
+    a signed one is the listing."""
+    import httpx
+
+    base_url, settings = live_server
+    r = httpx.get(f"{base_url}/s3/")
+    assert r.status_code == 307 and r.headers["location"] == "https://aws.amazon.com/s3/"
+    assert r.content == b""
+    assert _signed(base_url, "/s3/", settings.admin_token).status_code == 200
+
+
+def test_s3_a_signature_mismatch_names_what_this_server_signed(live_server):
+    """Real names the access key, the string it signed, the signature sent and the canonical
+    request, the two strings as bytes too, in that order (measured 2026-09-29). Here they are what
+    this server signed, which for a request signed by botocore is botocore's own canonical
+    request."""
+    import httpx
+    from botocore.auth import S3SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    base_url, settings = live_server
+    token = settings.admin_token
+    access_key = synth.s3_access_key_id(token)
+    url = f"{base_url}/s3/eng-artifacts?list-type=2&prefix=run%20books"
+    req = AWSRequest(method="GET", url=url, headers={"x-amz-content-sha256": "UNSIGNED-PAYLOAD"})
+    signer = S3SigV4Auth(
+        Credentials(access_key, synth.s3_secret_access_key(token) + "x"), "s3", "us-east-1"
+    )
+    signer.add_auth(req)
+    r = httpx.get(url, headers=dict(req.headers))
+    assert r.status_code == 403
+    root = ET.fromstring(r.content)
+    assert [child.tag for child in root] == [
+        "Code",
+        "Message",
+        "AWSAccessKeyId",
+        "StringToSign",
+        "SignatureProvided",
+        "StringToSignBytes",
+        "CanonicalRequest",
+        "CanonicalRequestBytes",
+        "RequestId",
+        "HostId",
+    ]
+    members = {child.tag: child.text for child in root}
+    assert members["AWSAccessKeyId"] == access_key
+    # What botocore signed is the request as it stood before its own `Authorization` was added.
+    as_signed = copy.deepcopy(req)
+    del as_signed.headers["Authorization"]
+    assert members["CanonicalRequest"] == signer.canonical_request(as_signed)
+    assert members["StringToSign"] == signer.string_to_sign(req, members["CanonicalRequest"])
+    assert members["SignatureProvided"] == req.headers["Authorization"].rsplit("=", 1)[1]
+    for text, as_bytes in (
+        ("StringToSign", "StringToSignBytes"),
+        ("CanonicalRequest", "CanonicalRequestBytes"),
+    ):
+        assert bytes.fromhex(members[as_bytes].replace(" ", "")).decode() == members[text]
 
 
 def test_s3_key_containing_a_question_mark_verifies(live_server):
@@ -579,7 +709,8 @@ def test_s3_unsatisfiable_range_is_416(live_server):
     # The range as sent and the object's size, which is what real names this refusal with.
     members = f"<RangeRequested>bytes=99999-100000</RangeRequested><ActualObjectSize>{total}"
     assert f"</Message>{members}</ActualObjectSize><RequestId>".encode() in body
-    assert e.value.headers.get("Content-Range") == f"bytes */{total}"
+    # The size is named in the body alone: real sends no `Content-Range` beside it (2026-09-29).
+    assert e.value.headers.get("Content-Range") is None
     assert e.value.headers.get("Content-Type") == "application/xml"
 
 
@@ -986,7 +1117,6 @@ OBJECT_SUBRESOURCES = [
     "retention",
     "tagging",
     "torrent",
-    "uploadId=abc123",  # ListParts: selected by a required querystring member, not a bare key
 ]
 OBJECT_PATH = "/s3/eng-artifacts/runbooks/oncall.md"
 OBJECT_TEXT = b"Check dashboards, roll back, page on-call."
@@ -1098,9 +1228,9 @@ def test_what_does_not_exist_is_reported_before_the_subresource_except_for_list_
     err = _refused(base_url, "/s3/eng-artifacts/no/such.md?acl", token)
     assert err.code == 404 and b"NoSuchKey" in err.read()
     # ListParts is about an upload, not the object under the key: real S3 answers NoSuchUpload for
-    # a missing key rather than NoSuchKey, so Backlot refuses it before looking the key up.
+    # a missing key rather than NoSuchKey, so Backlot answers it before looking the key up.
     err = _refused(base_url, "/s3/eng-artifacts/no/such.md?uploadId=abc123", token)
-    assert err.code == 501 and b"NotImplemented" in err.read()
+    assert err.code == 404 and b"<Code>NoSuchUpload</Code>" in err.read()
     # The bucket comes before all of that: a key in a bucket that does not exist is NoSuchBucket,
     # with or without a selector, ListParts' and a key's `?uploads` included (measured 2026-09-29).
     for query in ("", "?acl", "?uploadId=abc123", "?uploads"):
@@ -1129,12 +1259,22 @@ def test_head_with_a_subresource_names_what_a_get_serves_and_a_bare_head_still_a
         (f"{OBJECT_PATH}?encryption", None),
         (f"{OBJECT_PATH}?select", None),
         (f"{OBJECT_PATH}?uploads", None),
+        # A HEAD reads selectors its path's GET does not: a bucket's selectors at a key, and two
+        # of an object's at a bucket (measured 2026-09-29).
+        (f"{OBJECT_PATH}?versioning", None),
+        (f"{OBJECT_PATH}?location", None),
+        ("/s3/no-such-bucket/a.txt?website", None),
+        ("/s3/eng-artifacts?torrent", None),
+        ("/s3/eng-artifacts?uploadId=x", None),
+        (f"{OBJECT_PATH}?partNumber=1&uploadId=x", None),
     ):
         err = _refused(base_url, path, token, method="HEAD")
         assert err.code == 405 and err.read() == b"", path
         assert err.headers.get("Content-Type") == "application/xml", path
         assert err.headers.get("Allow") == allow, path
-    for path in ("/s3/eng-artifacts", OBJECT_PATH):
+    # The bucket selectors real ignores at a key's path, `metrics` among them, leave its HEAD the
+    # object's (same date).
+    for path in ("/s3/eng-artifacts", OBJECT_PATH, f"{OBJECT_PATH}?metrics"):
         url, headers = _sign_get(base_url, path, token, method="HEAD")
         with urllib.request.urlopen(
             urllib.request.Request(url, headers=headers, method="HEAD")
@@ -1203,6 +1343,16 @@ _MEMBER_ROWS = [
         "<Method>GET</Method><ResourceType>MULTI_OBJECT_DELETE</ResourceType>",
     ),
     ("GET", f"{OBJECT_PATH}?uploads", 400, "InvalidRequest", ""),
+    ("GET", f"{OBJECT_PATH}?uploadId=abc123", 404, "NoSuchUpload", "<UploadId>abc123</UploadId>"),
+    ("GET", "/s3/eng-artifacts/no/such.md?uploadId=", 404, "NoSuchUpload", "<UploadId></UploadId>"),
+    (
+        "GET",
+        "/s3/no-such-bucket/a.txt?uploadId=x&max-parts=abc",
+        400,
+        "InvalidArgument",
+        "<ArgumentName>max-parts</ArgumentName><ArgumentValue>abc</ArgumentValue>",
+    ),
+    ("GET", "/s3/eng-artifacts?partNumber=1", 400, "InvalidRequest", ""),
     # This server's own refusals, which have no real body to copy.
     ("GET", "/s3/eng-artifacts?versioning", 501, "NotImplemented", ""),
     ("DELETE", "/s3/eng-artifacts", 501, "NotImplemented", ""),
@@ -1240,9 +1390,16 @@ _HEAD_ROWS = [
     ("/s3/eng-artifacts?acl&versioning", "admin", {}, 400, None),
     (OBJECT_PATH, "admin", {"Range": "bytes=99999-"}, 416, None),
     ("/s3/eng-artifacts", "tampered", {}, 403, None),
-    ("/s3/eng-artifacts", None, {}, 403, None),
+    ("/s3/eng-artifacts", None, {}, 404, None),
     (OBJECT_PATH, "tampered", {}, 403, None),
-    (OBJECT_PATH, None, {}, 403, None),
+    (OBJECT_PATH, None, {}, 404, None),
+    ("/s3/eng-artifacts?max-keys=abc", "admin", {}, 400, None),
+    ("/s3/no-such-bucket?list-type=2&marker=x", "admin", {}, 400, None),
+    ("/s3/eng-artifacts?encoding-type=bogus", "admin", {}, 400, None),
+    ("/s3/eng-artifacts?list-type=2&continuation-token=garbage", "admin", {}, 400, None),
+    ("/s3/no-such-bucket?encoding-type=bogus", "admin", {}, 404, None),
+    ("/s3/eng-artifacts?max-keys=-1", "admin", {}, 200, None),
+    ("/s3/eng-artifacts?partNumber=1", "admin", {}, 400, None),
     (OBJECT_PATH, "admin", {}, 200, len(OBJECT_TEXT)),
     (OBJECT_PATH, "admin", {"Range": "bytes=0-9"}, 206, 10),
 ]
@@ -1259,8 +1416,10 @@ def test_s3_a_head_is_sent_chunked_as_xml_unless_it_is_the_objects_own(
     """Measured 2026-09-29 against us-east-1 over twenty-two `HEAD`s: every answer but an object's
     200 and 206 goes out `Transfer-Encoding: chunked` with no `Content-Length`, as
     `application/xml`, a bucket's 200 among them, where those two carry the length a GET would send
-    and the object's own type. Read off a real uvicorn server, since the framing is what it writes
-    (``backlot.routers.s3._head``); the service root's is asserted above."""
+    and the object's own type. A HEAD at a bucket reads the listing's parameters as the GET does
+    and answers a refusal of them as its status alone, apart from the `max-keys` range (same date,
+    ``backlot.routers.s3.head_bucket``). Read off a real uvicorn server, since the framing is what
+    it writes (``backlot.routers.s3._head``); the service root's is asserted above."""
     import httpx
 
     base_url, settings = live_server
@@ -1280,6 +1439,8 @@ def test_s3_a_head_is_sent_chunked_as_xml_unless_it_is_the_objects_own(
     if length is None:
         assert "content-length" not in r.headers and r.headers["transfer-encoding"] == "chunked"
         assert r.headers["content-type"] == "application/xml"
+        # Nor a range: real's 416 names none, on a HEAD as on a GET (measured 2026-09-29).
+        assert "content-range" not in r.headers
     else:
         assert r.headers["content-length"] == str(length) and "transfer-encoding" not in r.headers
         assert r.headers["content-type"] == "text/markdown"
@@ -1659,13 +1820,17 @@ def test_boto3_gets_one_client_error_instead_of_an_empty_answer_or_a_retried_500
         lambda: s3.get_bucket_policy(Bucket=bucket),
         lambda: s3.get_bucket_tagging(Bucket=bucket),
         lambda: s3.get_object_tagging(Bucket=bucket, Key=key),
-        lambda: s3.list_parts(Bucket=bucket, Key=key, UploadId="abc123"),
     ):
         with pytest.raises(ClientError) as e:
             call()
         assert e.value.response["Error"]["Code"] == "NotImplemented"
         assert e.value.response["ResponseMetadata"]["HTTPStatusCode"] == 501
         assert e.value.response["ResponseMetadata"]["RetryAttempts"] == 0
+    # No upload is ever in progress, so ListParts is real's answer for an upload id it lacks.
+    with pytest.raises(s3.exceptions.NoSuchUpload) as e:
+        s3.list_parts(Bucket=bucket, Key=key, UploadId="abc123")
+    assert e.value.response["Error"]["UploadId"] == "abc123"
+    assert e.value.response["ResponseMetadata"]["RetryAttempts"] == 0
     assert s3.get_bucket_location(Bucket=bucket)["LocationConstraint"] is None  # us-east-1
     assert key in {o["Key"] for o in s3.list_objects_v2(Bucket=bucket)["Contents"]}
     assert s3.get_object(Bucket=bucket, Key=key)["Body"].read() == OBJECT_TEXT
@@ -1870,7 +2035,10 @@ def test_header_auth_rejects_skewed_date():
     req = _header_auth_request(stale)
     caller, err = auth.resolve_sigv4(req)
     assert caller is None
-    assert err == "RequestTimeTooSkewed"
+    assert err.code == "RequestTimeTooSkewed"
+    members = dict(err.members)
+    assert members["RequestTime"] == stale and members["MaxAllowedSkewMilliseconds"] == "900000"
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", members["ServerTime"])
 
 
 def test_header_auth_skew_check_precedes_signature_check():
@@ -1888,7 +2056,7 @@ def test_header_auth_skew_check_precedes_signature_check():
     )
     caller, err = auth.resolve_sigv4(_request("GET", "/s3/eng-artifacts", "list-type=2", headers))
     assert caller is None
-    assert err == "RequestTimeTooSkewed"
+    assert err.code == "RequestTimeTooSkewed"
 
 
 # A `%3F` in the key decodes to a `?` that splits Starlette's rebuilt `request.url`, so the
@@ -1910,7 +2078,9 @@ def test_presigned_expired_is_access_denied():
     req = _presigned_request(stale, expires=60)
     caller, err = auth.resolve_sigv4(req)
     assert caller is None
-    assert err == "AccessDenied"
+    assert (err.code, err.message) == ("AccessDenied", "Request has expired")
+    assert [name for name, _ in err.members] == ["X-Amz-Expires", "Expires", "ServerTime"]
+    assert dict(err.members)["X-Amz-Expires"] == "60"
 
 
 @pytest.mark.parametrize("path", SIGNED_PATHS)
@@ -1920,6 +2090,241 @@ def test_presigned_unexpired_ok(path):
     caller, err = auth.resolve_sigv4(req)
     assert err is None
     assert caller == Caller(email="ava@acme.com", is_admin=False)
+
+
+def _now(minutes: int = 0) -> str:
+    return (datetime.now(timezone.utc) + timedelta(minutes=minutes)).strftime(AMZ_DATE_FORMAT)
+
+
+def _v4(akid: str, date: str, service: str = "s3", terminal: str = "aws4_request") -> str:
+    return (
+        f"AWS4-HMAC-SHA256 Credential={akid}/{date[:8]}/us-east-1/{service}/{terminal}, "
+        "SignedHeaders=host;x-amz-date, Signature=00"
+    )
+
+
+def _query(**params) -> str:
+    return urlencode(
+        {k.replace("_", "-"): v for k, v in params.items()}, safe="-_.~", quote_via=quote
+    )
+
+
+_UNKNOWN = "AKIAIOSFODNN7EXAMPLE"
+# One fault each, and the pairs whose order was measured (2026-09-29, us-east-1): an unknown access
+# key beside a skewed or an unreadable date, and an expired presign beside a malformed credential.
+_REFUSAL_ROWS_UNIT = [
+    (
+        "bearer",
+        {"authorization": "Bearer abc"},
+        "",
+        "InvalidArgument",
+        "Unsupported Authorization Type",
+    ),
+    (
+        "sha512",
+        {"authorization": "AWS4-HMAC-SHA512 Credential=x"},
+        "",
+        "InvalidArgument",
+        "Unsupported Authorization Type",
+    ),
+    (
+        "no space",
+        {"authorization": "AWS4-HMAC-SHA256"},
+        "",
+        "InvalidArgument",
+        "Authorization header is invalid -- one and only one ' ' (space) required",
+    ),
+    (
+        "no parts",
+        {"authorization": "AWS4-HMAC-SHA256 nonsense"},
+        "",
+        "AuthorizationHeaderMalformed",
+        "The authorization header is malformed; the authorization header requires three "
+        "components: Credential, SignedHeaders, and Signature.",
+    ),
+    (
+        "scope",
+        {
+            "authorization": f"AWS4-HMAC-SHA256 Credential={AK}/garbage, SignedHeaders=host, "
+            "Signature=00"
+        },
+        "",
+        "AuthorizationHeaderMalformed",
+        "The authorization header is malformed; the Credential is mal-formed; expecting "
+        '"<YOUR-AKID>/YYYYMMDD/REGION/SERVICE/aws4_request".',
+    ),
+    (
+        "service",
+        {"x-amz-date": _now(), "authorization": _v4(AK, _now(), service="ec2")},
+        "",
+        "AuthorizationHeaderMalformed",
+        'The authorization header is malformed; incorrect service "ec2". This endpoint belongs to '
+        '"s3".',
+    ),
+    (
+        "terminal",
+        {"x-amz-date": _now(), "authorization": _v4(AK, _now(), terminal="aws5_request")},
+        "",
+        "AuthorizationHeaderMalformed",
+        'The authorization header is malformed; incorrect terminal "aws5_request". This endpoint '
+        'uses "aws4_request".',
+    ),
+    (
+        "no date",
+        {"authorization": _v4(_UNKNOWN, _now())},
+        "",
+        "AccessDenied",
+        "AWS authentication requires a valid Date or x-amz-date header",
+    ),
+    (
+        "bad date",
+        {"x-amz-date": "garbage", "authorization": _v4(_UNKNOWN, _now())},
+        "",
+        "AccessDenied",
+        "AWS authentication requires a valid Date or x-amz-date header",
+    ),
+    (
+        "scope date",
+        {"x-amz-date": _now(), "authorization": _v4(AK, "20200101")},
+        "",
+        "AuthorizationHeaderMalformed",
+        "The authorization header is malformed; Invalid credential date. Date is not the same as "
+        "X-Amz-Date.",
+    ),
+    (
+        "skew first",
+        {"x-amz-date": _now(-30), "authorization": _v4(_UNKNOWN, _now(-30))},
+        "",
+        "RequestTimeTooSkewed",
+        "The difference between the request time and the current time is too large.",
+    ),
+    (
+        "unknown key",
+        {"x-amz-date": _now(), "authorization": _v4(_UNKNOWN, _now())},
+        "",
+        "InvalidAccessKeyId",
+        "The AWS Access Key Id you provided does not exist in our records.",
+    ),
+    (
+        "query algorithm",
+        {},
+        _query(X_Amz_Algorithm="AWS4-HMAC-SHA512", X_Amz_Signature="00"),
+        "AuthorizationQueryParametersError",
+        'X-Amz-Algorithm only supports "AWS4-HMAC-SHA256 and AWS4-ECDSA-P256-SHA256"',
+    ),
+    (
+        "query parameters",
+        {},
+        _query(X_Amz_Algorithm="AWS4-HMAC-SHA256", X_Amz_Signature="00"),
+        "AuthorizationQueryParametersError",
+        "Query-string authentication version 4 requires the X-Amz-Algorithm, X-Amz-Credential, "
+        "X-Amz-Signature, X-Amz-Date, X-Amz-SignedHeaders, and X-Amz-Expires parameters.",
+    ),
+    (
+        "query date",
+        {},
+        _query(
+            X_Amz_Algorithm="AWS4-HMAC-SHA256",
+            X_Amz_Credential=f"{AK}/20260929/us-east-1/s3/aws4_request",
+            X_Amz_Date="garbage",
+            X_Amz_Expires="60",
+            X_Amz_SignedHeaders="host",
+            X_Amz_Signature="00",
+        ),
+        "AuthorizationQueryParametersError",
+        "X-Amz-Date must be in the ISO8601 Long Format \"yyyyMMdd'T'HHmmss'Z'\"",
+    ),
+    (
+        "query expires",
+        {},
+        _query(
+            X_Amz_Algorithm="AWS4-HMAC-SHA256",
+            X_Amz_Credential=f"{AK}/{_now()[:8]}/us-east-1/s3/aws4_request",
+            X_Amz_Date=_now(),
+            X_Amz_Expires="abc",
+            X_Amz_SignedHeaders="host",
+            X_Amz_Signature="00",
+        ),
+        "AuthorizationQueryParametersError",
+        "X-Amz-Expires should be a number",
+    ),
+    (
+        "expiry first",
+        {},
+        _query(
+            X_Amz_Algorithm="AWS4-HMAC-SHA256",
+            X_Amz_Credential="garbage",
+            X_Amz_Date=_now(-600),
+            X_Amz_Expires="60",
+            X_Amz_SignedHeaders="host",
+            X_Amz_Signature="00",
+        ),
+        "AccessDenied",
+        "Request has expired",
+    ),
+    (
+        "query credential",
+        {},
+        _query(
+            X_Amz_Algorithm="AWS4-HMAC-SHA256",
+            X_Amz_Credential="garbage",
+            X_Amz_Date=_now(),
+            X_Amz_Expires="60",
+            X_Amz_SignedHeaders="host",
+            X_Amz_Signature="00",
+        ),
+        "AuthorizationQueryParametersError",
+        "Error parsing the X-Amz-Credential parameter; the Credential is mal-formed; expecting "
+        '"<YOUR-AKID>/YYYYMMDD/REGION/SERVICE/aws4_request".',
+    ),
+    (
+        "query key",
+        {},
+        _query(
+            X_Amz_Algorithm="AWS4-HMAC-SHA256",
+            X_Amz_Credential=f"{_UNKNOWN}/{_now()[:8]}/us-east-1/s3/aws4_request",
+            X_Amz_Date=_now(),
+            X_Amz_Expires="60",
+            X_Amz_SignedHeaders="host",
+            X_Amz_Signature="00",
+        ),
+        "InvalidAccessKeyId",
+        "The AWS Access Key Id you provided does not exist in our records.",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "headers, query, code, message",
+    [r[1:] for r in _REFUSAL_ROWS_UNIT],
+    ids=[r[0] for r in _REFUSAL_ROWS_UNIT],
+)
+def test_a_credential_real_refuses_is_refused_with_reals_code_and_message(
+    headers, query, code, message
+):
+    """Each row is real's answer to that request, measured 2026-09-29 against us-east-1
+    (``backlot.auth.resolve_sigv4`` has the order)."""
+    caller, err = auth.resolve_sigv4(
+        _request("GET", "/s3/eng-artifacts", query, {"host": "backlot", **headers})
+    )
+    assert caller is None and (err.code, err.message) == (code, message)
+    if code == "InvalidArgument":
+        assert dict(err.members) == {
+            "ArgumentName": "Authorization",
+            "ArgumentValue": headers["authorization"],
+        }
+    if code == "InvalidAccessKeyId":
+        assert err.members == (("AWSAccessKeyId", _UNKNOWN),)
+
+
+@pytest.mark.parametrize("query", ["", "X-Amz-Signature=00", "list-type=2"])
+def test_a_request_with_no_credential_is_the_anonymous_callers(query):
+    """Real reads a request carrying no credential as an anonymous caller's, an `X-Amz-Signature`
+    without `X-Amz-Algorithm` among them (a public bucket's listing answered that one)."""
+    caller, err = auth.resolve_sigv4(
+        _request("GET", "/s3/eng-artifacts", query, {"host": "backlot"})
+    )
+    assert (caller, err) == (ANONYMOUS, None)
 
 
 # --- the two listings ------------------------------------------------------------

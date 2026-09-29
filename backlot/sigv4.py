@@ -110,12 +110,19 @@ def is_skewed(request_time: datetime, now: datetime, max_skew: int = 900) -> boo
     return abs((now - request_time).total_seconds()) > max_skew
 
 
+def string_to_sign(amz_date: str, date_stamp: str, region: str, canonical: str) -> str:
+    scope = f"{date_stamp}/{region}/s3/aws4_request"
+    return "\n".join([ALGORITHM, amz_date, scope, _sha256_hex(canonical.encode("utf-8"))])
+
+
+def sign(secret: str, date_stamp: str, region: str, to_sign: str) -> str:
+    return hmac.new(
+        _signing_key(secret, date_stamp, region), to_sign.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+
+
 def expected_signature(
     secret, method, path, query, headers, signed_headers, payload_hash, amz_date, date_stamp, region
 ) -> str:
     cr = canonical_request(method, path, query, headers, signed_headers, payload_hash)
-    scope = f"{date_stamp}/{region}/s3/aws4_request"
-    sts = "\n".join([ALGORITHM, amz_date, scope, _sha256_hex(cr.encode("utf-8"))])
-    return hmac.new(
-        _signing_key(secret, date_stamp, region), sts.encode("utf-8"), hashlib.sha256
-    ).hexdigest()
+    return sign(secret, date_stamp, region, string_to_sign(amz_date, date_stamp, region, cr))
