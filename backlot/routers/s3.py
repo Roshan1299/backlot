@@ -6,18 +6,21 @@ full AWS SigV4 (``backlot.auth.resolve_sigv4``) against a per-caller access-key/
 bearer token; the admin/service token's key sees everything, a user's key is ACL-filtered, and an
 unsigned request is the anonymous caller's, who sees no bucket (``_auth``). A method this router
 does not serve, and a GET or a HEAD naming a selector it cannot take, is refused before the bucket
-and before a missing credential, as real refuses them, but after a signature that was sent and
-does not verify (``_method_refusal``, ``_read_refusal``); a write resolves the credential and the
-bucket first.
+and whether or not a credential is sent, as real refuses them, but after a signature that was sent
+and does not verify (``_method_refusal``, ``_read_refusal``); a write resolves the credential and
+the bucket first.
 Responses are S3 XML (namespace ``http://s3.amazonaws.com/doc/2006-03-01/``) or raw object bytes;
 errors use the S3 ``<Error>`` envelope.
 
 S3 dispatches on the query string: ``?acl``, ``?versioning``, ``?tagging`` and the rest each select a
 different operation at the same path. Two of them are answered at a bucket's path, ``?location``
 (GetBucketLocation) and ``?uploads`` (ListMultipartUploads, always the empty page, since data
-enters through ``backlot import`` and no upload is ever in progress). The ones Backlot does not
-implement are refused with ``NotImplemented`` (501) rather than answered with the listing or the
-object's bytes, so a caller gets an error to handle instead of another operation's body to parse.
+enters through ``backlot import`` and no upload is ever in progress), and ``?uploadId`` at a key
+(ListParts) is ``NoSuchUpload`` for the same reason. A selector whose operations are all on another
+method is the 405 a GET gets on real (``_BUCKET_READ_REFUSED``, ``_OBJECT_READ_REFUSED``). The
+other ones Backlot does not implement are refused with ``NotImplemented`` (501) rather than
+answered with the listing or the object's bytes, so a caller gets an error to handle instead of
+another operation's body to parse.
 
 Object model: a bucket is the grouping/ACL unit (``s3_buckets``); an object is one doc
 (``s3_objects``), ``key`` is its address and ``content`` its verbatim body. "Folders" are pure
@@ -477,8 +480,8 @@ def _head_refusal(selected: list[str], served_on_get: frozenset[str]) -> Respons
     answering rather than S3: "a list of the target resource's currently supported methods" (RFC
     9110, Section 15.5.6). ``served_on_get`` is that list — the selectors this same path answers on
     a GET, which is a different set at a bucket's path and at a key's — so each of them gets
-    ``GET``, and a selector this path's GET refuses gets no header, naming a method there being as
-    false a claim as repeating real's PUT and DELETE.
+    ``GET`` and every other selector gets no header, naming a method there being as false a claim
+    as repeating real's PUT and DELETE.
 
     No header leaves Section 15.5.6's MUST unmet, and Section 10.2.1's "An empty Allow field value
     indicates that the resource allows no methods" would meet it and does survive this stack. Real
@@ -495,10 +498,9 @@ def _not_implemented(selector: str) -> Response:
 
     ``NotImplemented`` is the S3 error code for "functionality that is not implemented" (the API
     reference's Error code table), and 501 is not a status botocore retries, so a boto3 caller gets one ``ClientError`` straight away.
-    What the catch-all used to answer was worse in both directions: a bucket sub-resource got the
-    listing, which botocore parsed as an empty result (``get_bucket_versioning`` -> ``{}``), and an
-    object sub-resource got the object's bytes, which botocore could not parse as XML and reported
-    as a 500 after retrying.
+    Without it a bucket sub-resource would get the listing, which botocore parses as an empty
+    result (``get_bucket_versioning`` -> ``{}``), and an object sub-resource the object's bytes,
+    which botocore cannot parse as XML and reports as a 500 after retrying.
 
     Real S3 answers each of these operations rather than refusing it — measured against a general
     purpose bucket, ``?versioning`` is an empty ``<VersioningConfiguration>``, a bucket's
@@ -622,8 +624,8 @@ _ALLOW_OBJECT = "GET, HEAD"
 
 @router.head("/{bucket}")
 async def head_bucket(request: Request, bucket: str):
-    """HeadBucket — 200 if the caller can see this bucket, 404 if they cannot, and the signature's
-    own status (403, or 400 for a malformed header) when the request does not authenticate at all.
+    """HeadBucket — 200 if the caller can see this bucket, 404 if they cannot (an unsigned caller
+    sees none), and a refused credential's own status, 403 or 400, as its status alone.
 
     Headers alone in every case, which is why it carries no MCP tool (see ``backlot.openapi``). The
     200 carries the two real sends beside the region, the bucket's ARN and that the name is not an
@@ -1286,7 +1288,7 @@ def _parse_range(header: str, total: int):
 # is, since an upload is a write; and a preflight names every bucket path as present
 # (`_cors_preflight`).
 #
-# A missing credential is not refused before a method refusal, because real answers the method
+# An unsigned request gets each method refusal a signed one gets, because real answers the method
 # first: an unsigned `PATCH` on a bucket, on a key and at the root, an unsigned `HEAD` at the root,
 # and an unsigned `PATCH` or `POST` naming a selector that lacks it, answered the same 405 as a
 # signed one, and an unsigned `OPTIONS` the same 400 and 403. A signature that is sent and does not
@@ -1309,7 +1311,8 @@ _WRITE_IS_NOT_SERVED = (
 # set answered `NoSuchBucket` for the absent bucket, which is the write resolving it, and every
 # other method the 405 naming the type, before the bucket, and with an `Allow` that is exactly the
 # set plus `GET` where the selector has a GET form. A bucket's `restore` and a key's `delete` and
-# `encryption` were measured 2026-09-29 the same way, 23 requests, and answered by the same rule. A
+# `encryption` were measured 2026-09-29 the same way, at the absent name and the public bucket, 23
+# requests, and answered by the same rule. A
 # key's `tagging` is a different type from a bucket's, so the two paths keep their own tables. The
 # selectors here with no GET form are the ones a GET is refused for (`_BUCKET_READ_REFUSED`,
 # `_OBJECT_READ_REFUSED`); `session` and `renameObject` answered as the bare path does and are left
@@ -1388,16 +1391,18 @@ _OBJECT_READ_REFUSED = {
 # the bucket is looked up: `NoSuchBucket` for the absent bucket, this for the public one's object
 # and for a key it does not have (same date). A HEAD naming it is the 405 the others are.
 _UPLOADS_ON_A_KEY = "Key is not expected for the GET method ?uploads subresource"
-# What a GET or a HEAD at each path reads as a selector, and so what a pair of them conflicts over:
-# `?acl&delete`, `?restore&location` and a key's `?uploads&acl` are each the conflict (same date).
+# What a GET at each path reads as a selector, and so what a pair of them conflicts over (a HEAD's
+# are `_BUCKET_HEAD_SELECTORS` and `_OBJECT_HEAD_SELECTORS` below): `?acl&delete`,
+# `?restore&location` and a key's `?uploads&acl` are each the conflict (same date).
 _BUCKET_READ_SELECTORS = _BUCKET_SELECTORS | frozenset(_BUCKET_READ_REFUSED)
 _OBJECT_READ_SELECTORS = _OBJECT_SELECTORS | frozenset(_OBJECT_READ_REFUSED) | {"uploads"}
 # What a GET's 405 names for each selector it is refused for, UploadPart's pair among them.
 _BUCKET_GET_REFUSALS = {**_BUCKET_READ_REFUSED, "PART": _UPLOAD_PART[0]}
 _OBJECT_GET_REFUSALS = {**_OBJECT_READ_REFUSED, "PART": _UPLOAD_PART[0]}
 # A HEAD is refused for selectors a GET at the same path does not read: at a bucket's path two of
-# an object's, and at a key's path the bucket selectors below, each with a 405 whose `Allow` names
-# the selector's methods, before the bucket and after a signature that was sent. Measured
+# an object's, and at a key's path the bucket selectors below, each with the 405, before the bucket
+# and after a signature that was sent; real's carried an `Allow` naming the selector's methods,
+# not repeated here for the reason given above `_BUCKET_READ_REFUSED`. Measured
 # 2026-09-29: of the bucket selectors on a HEAD at a key, in a bucket nobody owns and at the public
 # bucket's object, these answered the 405 and the rest the key's own 404 or 200; of the object
 # selectors on a HEAD at a bucket, these two. A GET at a key naming one of them is the bucket's own

@@ -382,12 +382,11 @@ resolves the bucket it names, and one that does not exist, or that the caller ca
 real's own methods. A method S3 defines nothing for at all, `TRACE` among them, is the 400 real
 answers it with rather than a 405.
 
-Every call that reads or writes is SigV4-signed; see [auth.md](auth.md). An unsigned request is an
-anonymous caller's, as on real, and an anonymous caller can see no bucket, so it is `NoSuchBucket`
-wherever a signed caller that cannot see the bucket would be; real says `AccessDenied` for a bucket
-that exists, which would tell an unsigned caller which names the corpus holds. The method refusals
-above answer an unsigned request as a signed one, because real reaches the method before it
-refuses a missing credential, and so do the 405 a GET or a HEAD gets for a sub-resource, the
+A signed call is SigV4; see [auth.md](auth.md). An unsigned one is an anonymous caller's, as on
+real, and an anonymous caller can see no bucket, so it is `NoSuchBucket` wherever a signed caller
+that cannot see the bucket would be; real says `AccessDenied` for a bucket that exists, which would
+tell an unsigned caller which names the corpus holds. The method refusals above answer an unsigned
+request as a signed one, as on real, and so do the 405 a GET or a HEAD gets for a sub-resource, the
 conflict of two and the listing's own parameter refusals. A signature that is sent and does not
 verify is refused ahead of each 405, with real's members naming the string this server signed and
 the canonical request it signed it over, and after the conflict and the parameter refusals, as on

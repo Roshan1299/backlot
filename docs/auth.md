@@ -263,9 +263,8 @@ s3 = boto3.client(
 print([b["Name"] for b in s3.list_buckets()["Buckets"]])
 ```
 
-**An unsigned request is an anonymous caller's**, as on real S3, and an anonymous caller can read
-nothing: a listing or a read is `NoSuchBucket`, and `ListBuckets` is real's 307 to the product
-page. A signature that does not verify is refused with real's own code, message and members instead.
+**An unsigned request is an anonymous caller's**, as on real S3, and reads nothing; what it and a
+refused credential get is in [supported-sources.md](supported-sources.md#amazon-s3--s3).
 
 **Path addressing is not optional.** Backlot serves `/s3/{bucket}/{key}`, so virtual-hosted
 addressing — which puts the bucket in the host, `acme-artifacts.localhost:8000` — reaches nothing.

@@ -485,8 +485,8 @@ def test_s3_a_request_in_a_bucket_the_caller_cannot_see_is_nosuchbucket(live_ser
     ],
 )
 def test_s3_the_method_is_refused_before_the_credential(live_server, method, path, write):
-    """Measured: an unsigned request answers each of these as a signed one does, so real reaches
-    the method, and a selector a GET or a HEAD cannot take, before it refuses a missing credential
+    """Measured: an unsigned request answers each of these as a signed one does, so real answers
+    the method, and a selector a GET or a HEAD cannot take, whether or not a credential is sent
     (the selectors' rows 2026-09-29). A write resolves the caller and the bucket first, so the same
     path unsigned under the method that writes there names a bucket the anonymous caller cannot
     see; the service root and a conflict have no such method."""
@@ -597,11 +597,9 @@ _ANONYMOUS_ROWS = [
 def test_s3_an_unsigned_request_is_an_anonymous_caller_who_sees_no_bucket(
     live_server, method, path, status, code
 ):
-    """Real's anonymous `AccessDenied` for a bucket that exists would tell an unsigned caller which
-    names the corpus holds, so every bucket gets the answer for one it cannot see, the one a user
-    with no readable object in a bucket gets (``backlot.routers.s3._auth``). The listing's parses
-    come first, as on real. CreateBucket names no bucket, and real's refusal of an anonymous one is
-    its own. The admin, signed, reads the same bucket."""
+    """Every bucket gets the answer for one the caller cannot see (``backlot.routers.s3._auth``).
+    The listing's parses come first, as on real. CreateBucket names no bucket, and real's refusal
+    of an anonymous one is its own. The admin, signed, reads the same bucket."""
     import httpx
 
     base_url, settings = live_server
@@ -1413,13 +1411,10 @@ _HEAD_ROWS = [
 def test_s3_a_head_is_sent_chunked_as_xml_unless_it_is_the_objects_own(
     live_server, path, token, headers, status, length
 ):
-    """Measured 2026-09-29 against us-east-1 over twenty-two `HEAD`s: every answer but an object's
-    200 and 206 goes out `Transfer-Encoding: chunked` with no `Content-Length`, as
-    `application/xml`, a bucket's 200 among them, where those two carry the length a GET would send
-    and the object's own type. A HEAD at a bucket reads the listing's parameters as the GET does
-    and answers a refusal of them as its status alone, apart from the `max-keys` range (same date,
-    ``backlot.routers.s3.head_bucket``). Read off a real uvicorn server, since the framing is what
-    it writes (``backlot.routers.s3._head``); the service root's is asserted above."""
+    """Every answer but an object's 200 and 206 is framed as ``backlot.routers.s3._head`` frames
+    it, and a HEAD at a bucket reads the listing's parameters as ``backlot.routers.s3.head_bucket``
+    says. Read off a real uvicorn server, since the framing is what it writes; the service root's
+    is asserted above."""
     import httpx
 
     base_url, settings = live_server
