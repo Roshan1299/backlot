@@ -7268,8 +7268,9 @@ def test_a_lower_case_v4_scheme_is_v4_and_is_signed_as_sent(algorithm):
 
 
 # What botocore's CRT signers sent over the key this module signs with, `AK` written in where they
-# name it, header and query, at the date they name (awscrt, 2026-09-29): the derivation ``backlot.sigv4a`` makes is the one real
-# served requests signed with, and these pin it to the CRT's.
+# name it, header and query, at the date they name (awscrt, 2026-09-29): the derivation
+# ``backlot.sigv4a`` makes is the one real served requests signed with, and these pin it to the
+# CRT's.
 _CRT_HEADERS = {
     "host": "backlot",
     "x-amz-date": "20260929T164424Z",
