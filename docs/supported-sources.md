@@ -406,27 +406,37 @@ and two selectors are the conflict a GET gets. The methods real answers by writi
 write method such as `POST ?delete`, `PUT ?acl` or a key's `POST ?uploads` — are `NotImplemented`
 (501), since the corpus is served as it was imported. Every one of them but CreateBucket first
 resolves the bucket it names, and one that does not exist, or that the caller cannot see, is
-`NoSuchBucket` instead, as on real. Three are then checked as real checks them before it writes: a
+`NoSuchBucket` instead, as on real. Four are then checked as real checks them before it writes: a
 bucket's `POST ?restore`, which names no object, is real's 400; `POST ?delete`, at a bucket's path
 or a key's, is refused for its checksum headers, its `Content-MD5`, a body real's schema does not
-take, an empty key and a digest the body does not match; and a key's `PUT ?encryption` for a
-Signature Version 2 signature, its `Content-MD5`, its body, the key and the KMS key's ARN. The
-`Allow` on a 405 names what Backlot serves rather than real's own methods. A method S3 defines
-nothing for at all, `TRACE` among them, is the 400 real answers it with rather than a 405.
+take, an empty key and a digest the body does not match; a key's `PUT ?encryption` for a Signature
+Version 2 signature, its `Content-MD5`, its body, the key and the KMS key's ARN; and a key's `PUT`
+(PutObject) for its `Content-MD5`, its checksum headers, an aws-chunked payload hash with no decoded
+length (real's 411) and a digest the body does not match. A `PUT` or a `POST` whose signed
+`x-amz-content-sha256` is a digest the body does not have is refused with real's
+`XAmzContentSHA256Mismatch`, which real named on PutObject, `PUT ?tagging`, `PUT ?versioning`,
+`POST ?delete` and `PUT ?encryption`, and one naming a trailer on any operation but PutObject with
+the 400 real answered a read, a `DELETE`, `POST ?delete` and `PUT ?tagging` with. The `Allow` on a
+405 names what Backlot serves rather than real's own methods. A method S3 defines nothing for at
+all, `TRACE` among them, is the 400 real answers it with rather than a 405.
 
-A signed call is SigV4 or Signature Version 2, in the header or the query, both of which real
-verifies; see [auth.md](auth.md). The region a SigV4 credential scope names has to be `us-east-1`,
-the one this server presents, and another is real's `AuthorizationHeaderMalformed` in the header and
-`AuthorizationQueryParametersError` in the query, naming both regions. An unsigned one is an
-anonymous caller's, as on real, and an anonymous caller can see no bucket, so it is `NoSuchBucket`
-wherever a signed caller that cannot see the bucket would be; real says `AccessDenied` for a bucket
-that exists, which would tell an unsigned caller which names the corpus holds. The method refusals
-above answer an unsigned request as a signed one, as on real, and so do the 405 a GET or a HEAD gets
-for a sub-resource, the conflict of two and the parameter refusals before the bucket. A signature
-that is sent and does not verify is refused ahead of each 405, with real's members naming the string
-this server signed and, for SigV4, the canonical request it signed it over, and after the conflict
-and the parameter refusals, as on real. Each other credential refusal is real's own code and message
-too.
+A signed call is SigV4, SigV4a or Signature Version 2, in the header or the query, each of which
+real verifies; see [auth.md](auth.md). The region a SigV4 credential scope names has to be
+`us-east-1`, the one this server presents, and another is real's `AuthorizationHeaderMalformed` in
+the header and `AuthorizationQueryParametersError` in the query, naming both regions; a SigV4a
+region set has to name it too, and one that does not is real's `RegionSetMismatch`. A SigV4 or
+SigV4a header has to carry an `x-amz-content-sha256` real takes, and a header real requires to be
+signed, `Host`, `Content-MD5` or an `x-amz-*` one but `x-amz-content-sha256`, that is sent unsigned
+is real's `AccessDenied` naming it (`HeadersNotSigned`). An unsigned one is an anonymous caller's,
+as on real, and an anonymous caller can see no bucket, so it is `NoSuchBucket` wherever a signed
+caller that cannot see the bucket would be; real says `AccessDenied` for a bucket that exists, which
+would tell an unsigned caller which names the corpus holds. The method refusals above answer an
+unsigned request as a signed one, as on real, and so do the 405 a GET or a HEAD gets for a
+sub-resource, the conflict of two and the parameter refusals before the bucket. A signature that is
+sent and does not verify is refused ahead of each 405, with real's members naming the string this
+server signed and, for SigV4 and SigV4a, the canonical request it signed it over, and after the
+conflict and the parameter refusals, as on real. Each other credential refusal is real's own code
+and message too.
 
 ### Slack — `/slack/api`
 

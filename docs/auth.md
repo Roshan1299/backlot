@@ -68,7 +68,7 @@ sees least. Nothing about the request changes but the identity.
 | GitHub | `Authorization: Bearer <token>`, or the legacy `token <token>` |
 | Jira, Confluence | HTTP Basic with the token as the **password**, or a plain `Bearer` |
 | Linear | A **bare** `Authorization: <token>`, or `Bearer` |
-| Amazon S3 | AWS SigV4 or Signature Version 2, signed with the identity's key pair |
+| Amazon S3 | AWS SigV4, SigV4a or Signature Version 2, signed with the identity's key pair |
 | A Google client with a config | Exchange it at `POST /oauth2/token` — see the Google section |
 
 ### Slack — `Bearer`
@@ -270,6 +270,10 @@ refused credential get is in [supported-sources.md](supported-sources.md#amazon-
 verifies it; botocore signs that way with `Config(signature_version="s3")`, though its signature for
 a bucket's own operations is the mismatch real answers it with. The two refuse differently and each
 refuses as real does.
+
+**So is SigV4a** (`AWS4-ECDSA-P256-SHA256`), in the header and in the query, with the key botocore's
+CRT signer derives from the same secret: install `awscrt` and pass
+`Config(signature_version="s3v4a")`. The region set it signs has to name `us-east-1`.
 
 **Path addressing is not optional.** Backlot serves `/s3/{bucket}/{key}`, so virtual-hosted
 addressing — which puts the bucket in the host, `acme-artifacts.localhost:8000` — reaches nothing.

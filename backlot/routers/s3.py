@@ -2473,8 +2473,8 @@ def _content_md5(request: Request) -> tuple[str | None, bytes | None, Response |
 
 def _md5_mismatch(expected: str, digest: bytes, body: bytes) -> Response | None:
     """`BadDigest` for a `Content-MD5` ``body`` does not match, naming the digest computed in base64
-    and ``expected`` as the operation names the one sent: DeleteObjects as sent, and PutObject in
-    hex (2026-09-29)."""
+    and ``expected`` as the operation names the one sent: DeleteObjects and UpdateObjectEncryption
+    as sent, and PutObject in hex (2026-09-29)."""
     actual = hashlib.md5(body).digest()
     if actual == digest:
         return None
@@ -2490,8 +2490,8 @@ def _payload_mismatch(request: Request, body: bytes) -> Response | None:
     """`XAmzContentSHA256Mismatch` for a signed payload hash of 64 hex digits that ``body`` does not
     match without case, naming it as sent and the body's own, or ``None``. Real checked it on
     PutObject, a key's `PUT ?tagging`, a bucket's `PUT ?versioning`, DeleteObjects and
-    UpdateObjectEncryption, an empty body included, and not on a `DELETE` with a body or a GET
-    (2026-09-29); where each checks it among its other refusals is in its own function."""
+    UpdateObjectEncryption, PutObject's empty body included, and not on a `DELETE` with a body or a
+    GET (2026-09-29); where each checks it among its other refusals is in its own function."""
     sent = auth.signed_payload_hash(request)
     if sent is None or not re.fullmatch(r"[0-9a-fA-F]{64}", sent):
         return None
@@ -2778,9 +2778,10 @@ async def _refuse_write(
     names a bucket that caller cannot see.
 
     Past the bucket, a payload hash naming a trailer is refused (``_trailer_refusal``) unless the
-    write is an ``upload``, whose own check reads it; and once ``validate`` finds nothing, a `PUT`'s
-    and a `POST`'s payload hash is checked against the body (``_payload_mismatch``), which real
-    named on the writes measured after the bucket and after their other refusals.
+    write is an ``upload``, whose own check reads it; and a `PUT`'s and a `POST`'s payload hash is
+    checked against the body (``_payload_mismatch``), where real checked it after the bucket:
+    PutObject and UpdateObjectEncryption check it among their own refusals, and a write ``instead``
+    does not answer once ``validate`` finds nothing, which is where DeleteObjects has it.
     """
     caller, visible, err = _auth(request)
     if err is not None:
