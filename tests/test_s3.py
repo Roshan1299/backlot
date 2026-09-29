@@ -581,25 +581,62 @@ def test_s3_the_method_is_refused_before_the_credential(live_server, method, pat
         assert "<Code>NoSuchBucket</Code>" in refused.text
 
 
-def test_s3_unknown_access_key_rejected(live_server):
-    """Real's own message and the key it does not know, measured 2026-09-29."""
+# A credential refusal as it goes out, status, code, message and members: the headers of each row
+# built when it runs, so the date is the clock's (measured 2026-09-29).
+_WIRE_REFUSAL_ROWS = [
+    (
+        "unknown key",
+        lambda now: {"authorization": _v4("AKIABOGUS0000000BOGUS", now), "x-amz-date": now},
+        403,
+        "InvalidAccessKeyId",
+        "The AWS Access Key Id you provided does not exist in our records.",
+        "<AWSAccessKeyId>AKIABOGUS0000000BOGUS</AWSAccessKeyId>",
+    ),
+    (
+        "a date past 9999",
+        lambda now: {
+            "authorization": "AWS AKIABOGUS0000000BOGUS:abc",
+            "date": "Tue, 29 Sep 10000 16:00:00 GMT",
+        },
+        500,
+        "InternalError",
+        "We encountered an internal error. Please try again.",
+        "",
+    ),
+    (
+        "a region set without the region",
+        lambda now: {
+            "authorization": _v4a("AKIABOGUS0000000BOGUS", now),
+            "x-amz-date": now,
+            "x-amz-region-set": "us-west-2",
+        },
+        400,
+        "RegionSetMismatch",
+        "The provided X-Amz-Region-Set doesn't match against the requested S3 region.",
+        "<RequestedRegion>us-east-1</RequestedRegion><RegionSet>us-west-2</RegionSet>",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "headers, status, code, message, members",
+    [r[1:] for r in _WIRE_REFUSAL_ROWS],
+    ids=[r[0] for r in _WIRE_REFUSAL_ROWS],
+)
+def test_s3_a_credential_refusal_goes_out_with_reals_status(
+    live_server, headers, status, code, message, members
+):
     import httpx
 
     base_url, _ = live_server
     now = datetime.now(timezone.utc).strftime(AMZ_DATE_FORMAT)
     r = httpx.get(
         f"{base_url}/s3/eng-artifacts?list-type=2",
-        headers={
-            "authorization": _v4("AKIABOGUS0000000BOGUS", now),
-            "x-amz-date": now,
-            "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
-        },
+        headers={"x-amz-content-sha256": "UNSIGNED-PAYLOAD", **headers(now)},
     )
-    assert r.status_code == 403
-    assert (
-        "<Code>InvalidAccessKeyId</Code><Message>The AWS Access Key Id you provided does not exist"
-        " in our records.</Message><AWSAccessKeyId>AKIABOGUS0000000BOGUS</AWSAccessKeyId>"
-    ) in r.text
+    assert r.status_code == status
+    named = re.search(r"<Code>([^<]+)</Code><Message>([^<]*)</Message>(.*)<RequestId>", r.text)
+    assert (named[1], named[2], named[3]) == (code, message, members)
 
 
 # What a signature that does not verify gets beside each kind of refusal: its 403 ahead of the 405s
@@ -5281,13 +5318,21 @@ def _header_auth_request(
 
 
 def _presigned_request(
-    amz_date: str, expires: int, path="/s3/eng-artifacts", region="us-east-1", algorithm=V4
+    amz_date: str,
+    expires: int,
+    path="/s3/eng-artifacts",
+    region="us-east-1",
+    algorithm=V4,
+    payload_hash=None,
 ):
     """Build a presigned-query GET signed for `amz_date`/`expires` with a valid signature; a
-    SigV4a one names `*` as its region set."""
+    SigV4a one names `*` as its region set, and one sending ``payload_hash`` as its
+    `x-amz-content-sha256` signs it as the payload line."""
     date_stamp = amz_date[:8]
     signed_headers = "host"
     headers = {"host": "backlot"}
+    if payload_hash is not None:
+        headers["x-amz-content-sha256"] = payload_hash
     scope = (
         f"{date_stamp}/s3/aws4_request"
         if algorithm == V4A
@@ -5303,7 +5348,8 @@ def _presigned_request(
     if algorithm == V4A:
         params["X-Amz-Region-Set"] = "*"
     query = urlencode(params, safe="-_.~", quote_via=quote)
-    canonical = canonical_request("GET", path, query, headers, signed_headers, "UNSIGNED-PAYLOAD")
+    payload = payload_hash or "UNSIGNED-PAYLOAD"
+    canonical = canonical_request("GET", path, query, headers, signed_headers, payload)
     sig = _signature(algorithm, amz_date, scope, canonical)
     query = f"{query}&X-Amz-Signature={sig}"
     return _request("GET", path, query, headers)
@@ -5404,9 +5450,14 @@ def test_presigned_expired_is_access_denied():
 
 @pytest.mark.parametrize("path", SIGNED_PATHS)
 @pytest.mark.parametrize("algorithm", [V4, V4A])
-def test_presigned_unexpired_ok(path, algorithm):
+@pytest.mark.parametrize("payload_hash", [None, "garbage", "0" * 64])
+def test_presigned_unexpired_ok(path, algorithm, payload_hash):
+    """A presign sending an `x-amz-content-sha256` is signed over it, which real served for `garbage`
+    and 64 zeros (2026-09-29)."""
     current = datetime.now(timezone.utc).strftime(AMZ_DATE_FORMAT)
-    req = _presigned_request(current, expires=3600, path=path, algorithm=algorithm)
+    req = _presigned_request(
+        current, expires=3600, path=path, algorithm=algorithm, payload_hash=payload_hash
+    )
     caller, err = auth.resolve_sigv4(req)
     assert err is None
     assert caller == Caller(email="ava@acme.com", is_admin=False)

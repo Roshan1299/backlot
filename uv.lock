@@ -326,6 +326,7 @@ wheels = [
 name = "backlot"
 source = { editable = "." }
 dependencies = [
+    { name = "cryptography" },
     { name = "fastapi" },
     { name = "graphql-core" },
     { name = "httpx" },
@@ -435,6 +436,7 @@ requires-dist = [
     { name = "backlot", extras = ["dev", "fsspec", "llamaindex", "mcp", "mirage", "official-sdk"], marker = "extra == 'all'" },
     { name = "boto3", marker = "extra == 'llamaindex'", specifier = ">=1.40" },
     { name = "boto3", marker = "extra == 'official-sdk'", specifier = ">=1.34" },
+    { name = "cryptography", specifier = ">=3.4" },
     { name = "fastapi", specifier = ">=0.110" },
     { name = "fastmcp", marker = "extra == 'mcp'", specifier = ">=4" },
     { name = "fsspec", marker = "extra == 'fsspec'", specifier = ">=2026.6" },
