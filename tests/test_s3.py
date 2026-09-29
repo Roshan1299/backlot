@@ -31,7 +31,7 @@ from backlot.sigv4 import (
     parse_authorization,
     split_credential,
 )
-from tests._helpers import client_for, complete
+from tests._helpers import client_for, complete, tiny_corpus
 
 # ------------------------------------------------------------------------ S3 (SigV4/404/416 edges)
 
@@ -905,7 +905,7 @@ def big_bucket_client(big_bucket_settings):
         yield c
 
 
-def _s3_get(client, path, token):
+def _s3_get(client, path, token, headers=None):
     """SigV4-sign a GET (same signer as the module-level ``_sign_get``) and issue it through an
     in-process TestClient instead of a live socket."""
     from urllib.parse import parse_qsl, quote, urlencode
@@ -925,7 +925,7 @@ def _s3_get(client, path, token):
     url = f"{base_url}{path}"
     ak = synth.s3_access_key_id(token)
     sk = synth.s3_secret_access_key(token)
-    req = AWSRequest(method="GET", url=url)
+    req = AWSRequest(method="GET", url=url, headers=dict(headers or {}))
     req.headers["x-amz-content-sha256"] = "UNSIGNED-PAYLOAD"
     S3SigV4Auth(Credentials(ak, sk), "s3", "us-east-1").add_auth(req)
     return client.get(url, headers=dict(req.headers))
@@ -1035,6 +1035,36 @@ def test_s3_large_bucket_acl_scopes_listing(
     entry = "Version" if listing == "versions&" else "Contents"
     owner = ET.fromstring(scoped.text).find(f"{{{S3NS}}}{entry}/{{{S3NS}}}Owner/{{{S3NS}}}ID")
     assert (owner is not None) == (listing != "list-type=2&")
+
+
+@pytest.mark.parametrize(
+    "query, headers, status",
+    [
+        ("acl", None, 200),
+        ("tagging", None, 200),
+        ("attributes", {"x-amz-object-attributes": "ETag,ObjectSize"}, 200),
+        ("annotation", None, 200),
+        ("partNumber=1", None, 206),
+        ("partNumber=2", None, 416),
+        ("versionId=null", None, 200),
+    ],
+)
+def test_s3_an_objects_subresource_answers_only_a_caller_who_can_read_the_object(
+    big_bucket_client, big_bucket_settings, big_bucket_tokens, query, headers, status
+):
+    """`big-bucket` holds objects of two groups in one bucket. Each of these answers from the
+    object, so a caller outside its group is told the key does not exist, as its listing tells it,
+    where the admin and the object's own group get the answer, and so does that caller for an
+    object of its own group."""
+    people = f"/s3/big-bucket/logs/2026/01/02/obj-00012.json?{query}"
+    engineering = f"/s3/big-bucket/logs/2026/01/01/obj-00000.json?{query}"
+    eng, admin = big_bucket_tokens["eng-bulk@acme.com"], big_bucket_settings.admin_token
+    for token in (admin, big_bucket_tokens["people-bulk@acme.com"]):
+        assert _s3_get(big_bucket_client, people, token, headers).status_code == status
+    assert _s3_get(big_bucket_client, engineering, eng, headers).status_code == status
+    hidden = _s3_get(big_bucket_client, people, eng, headers)
+    code = "NoSuchVersion" if "versionId" in query else "NoSuchKey"
+    assert hidden.status_code == 404 and f"<Code>{code}</Code>" in hidden.text
 
 
 def test_s3_delimiter_common_prefix_not_duplicated_across_pages(
@@ -2093,6 +2123,41 @@ def test_an_objects_one_part_is_the_whole_object_as_the_206_of_its_range(live_se
             assert r.headers["content-length"] == str(len(OBJECT_TEXT))
             assert r.headers["etag"] == plain.headers["etag"]
             assert r.content == (OBJECT_TEXT if method == "GET" else b"")
+
+
+def test_an_objects_attributes_size_is_its_bytes(tmp_path):
+    """`ObjectSize` counts the object's bytes, which a key the GET sends with a `Content-Length`
+    of its own agrees with, so an object whose text is not ASCII is larger than its length in
+    characters."""
+    text = "Café — 3€"
+    record = complete(
+        source_type="s3",
+        doc_id="s3-cafe",
+        bucket="eng-artifacts",
+        group="engineering",
+        key="notes/cafe.md",
+        title="cafe.md",
+        content=text,
+        content_type="text/markdown",
+        author_email="ava@acme.com",
+        author_groups=["engineering"],
+        visibility="public",
+    )
+    tiny = tiny_corpus(tmp_path, [record])
+    # `reload=True`, as `big_bucket_client` does: a second lifespan on the app another client holds
+    # would overwrite that client's store.
+    with client_for(tiny, reload=True) as client:
+        path = "/s3/eng-artifacts/notes/cafe.md"
+        body = _s3_get(client, path, tiny.admin_token)
+        attributes = _s3_get(
+            client,
+            f"{path}?attributes",
+            tiny.admin_token,
+            {"x-amz-object-attributes": "ObjectSize"},
+        )
+    size = len(text.encode("utf-8"))
+    assert size > len(text) and body.headers["content-length"] == str(size)
+    assert f"<ObjectSize>{size}</ObjectSize>" in attributes.text
 
 
 def test_the_listing_location_and_object_still_answer_and_an_unknown_key_is_ignored(live_server):
