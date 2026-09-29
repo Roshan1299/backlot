@@ -3461,11 +3461,11 @@ def _get_raw(base_url, path, token):
 
 
 def test_list_multipart_uploads_is_the_empty_page_real_serves_byte_for_byte(live_server):
-    """#169: a browsing client sends `?uploads` after every ListObjectsV2, unprompted, and got a 501
-    where real answers 200. The body is real's for a bucket with no upload in progress, with the
-    bucket's name swapped in: the two markers and the two next-markers present and empty, MaxUploads
-    at the default, IsTruncated false, no Upload element — and no Prefix, Delimiter or EncodingType
-    when none was sent."""
+    """A browsing client sends `?uploads` after every ListObjectsV2, unprompted, and real answers it
+    with a 200. The body is real's for a bucket with no upload in progress, with the bucket's name
+    swapped in: the two markers and the two next-markers present and empty, MaxUploads at the
+    default, IsTruncated false, no Upload element — and no Prefix, Delimiter or EncodingType when
+    none was sent."""
     base_url, settings = live_server
     for query in ("?uploads", "?uploads="):  # with and without the `=`; real treats both alike
         status, headers, body = _get_raw(
@@ -3492,8 +3492,9 @@ def test_list_multipart_uploads_echoes_what_was_sent_in_reals_order(live_server)
         ("NextKeyMarker", ""),
         ("NextUploadIdMarker", ""),
     ]
-    # The two queries in #169's trace: a folder listing's `?uploads` carries the delimiter, and a
-    # prefix's carries both. Delimiter comes before Prefix on real, and both come before MaxUploads.
+    # The two queries a browsing client sends: a folder listing's `?uploads` carries the delimiter,
+    # and a prefix's carries both. Delimiter comes before Prefix on real, and both come before
+    # MaxUploads.
     assert _uploads_fields(base_url, "delimiter=%2F&uploads=", token) == fixed_head + [
         ("Delimiter", "/"),
         ("MaxUploads", "1000"),
@@ -3674,7 +3675,7 @@ def test_list_multipart_uploads_reads_the_first_of_a_repeated_parameter_as_real_
 
 
 def test_a_continuation_token_is_refused_after_the_bucket_lookup_not_before_it(live_server):
-    """#205: the refusal cannot be read as "this bucket exists", for any caller.
+    """The refusal cannot be read as "this bucket exists", for any caller.
 
     Real puts the check below the lookup — `?list-type=2&continuation-token=garbage` on a bucket
     that does not exist is NoSuchBucket rather than the 400, and an empty value goes the same way
@@ -3714,7 +3715,7 @@ def _boto3_client(live_server):
 
 
 def test_boto3_gets_one_client_error_for_a_bad_continuation_token_not_page_one(live_server):
-    """#205's own reproduction, from the client side.
+    """The same refusal, from the client side.
 
     A paging loop that stores its cursor between runs, or passes it through a URL or a queue, gets
     one `ClientError` for a mangled cursor and no page: botocore reads the 400 as that error and
@@ -3774,7 +3775,7 @@ def test_boto3_list_multipart_uploads_is_an_empty_page_not_a_client_error(live_s
 
 
 def test_boto3_list_objects_paginator_walks_the_bucket_and_keeps_marker_and_owner(live_server):
-    """#188's own reproduction, from the client side.
+    """The two listings, from the client side.
 
     Against one body for both listings `list_objects` died on the first page — botocore's V1
     paginator falls back to the last key as the next `Marker`, the server ignored it and sent the
@@ -5452,8 +5453,8 @@ def test_presigned_expired_is_access_denied():
 @pytest.mark.parametrize("algorithm", [V4, V4A])
 @pytest.mark.parametrize("payload_hash", [None, "garbage", "0" * 64])
 def test_presigned_unexpired_ok(path, algorithm, payload_hash):
-    """A presign sending an `x-amz-content-sha256` is signed over it, which real served for `garbage`
-    and 64 zeros (2026-09-29)."""
+    """A presign sending an `x-amz-content-sha256` is signed over it, which real served for
+    `garbage` and 64 zeros (2026-09-29)."""
     current = datetime.now(timezone.utc).strftime(AMZ_DATE_FORMAT)
     req = _presigned_request(
         current, expires=3600, path=path, algorithm=algorithm, payload_hash=payload_hash
