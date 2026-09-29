@@ -10,8 +10,10 @@ and reports a clean match every time — a green check that means nothing, which
 checking at all.
 
 What can be asked instead is what the server actually answers. An operation Backlot does not
-implement should be REFUSED. The failure this looks for is the third possibility: answering it with
-some other operation's body. A caller asking for a bucket's versioning configuration and receiving
+implement should be REFUSED, which it does with ``NotImplemented``; one it does implement may answer
+with an error of the vendor's own, the 404 real gives a bucket with no CORS configuration for one,
+and that is its answer rather than a refusal. The failure this looks for is the third possibility:
+answering an operation with some other operation's body. A caller asking for a bucket's versioning configuration and receiving
 an object listing under a 200 gets no error, no log line, and a parse that quietly produces
 nonsense — which is the exact failure this project exists to prevent, and it cannot be seen in a
 document.
@@ -215,15 +217,16 @@ def probe(
     for op in ops:
         if not op.query:  # the bare form IS the fallthrough; nothing to tell apart
             continue
-        answer = _shape(call(op.method, targets[op.target], op.query))
-        if answer[0] >= 400:
+        response = call(op.method, targets[op.target], op.query)
+        answer = _shape(response)
+        if answer[0] >= 400 and "<Code>NotImplemented</Code>" in response.text:
             out.append(
                 Finding(
                     "missing_operation",
                     GAP,
                     str(op),
-                    f"{op.name} is refused ({answer[0]}), which is an honest answer for an "
-                    "operation Backlot does not serve",
+                    f"{op.name} is refused ({answer[0]} NotImplemented), which is an honest "
+                    "answer for an operation Backlot does not serve",
                 )
             )
         elif answer == fallthrough[op.target]:

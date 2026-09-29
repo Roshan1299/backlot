@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
 import json
 import re
 import urllib.request
 import xml.etree.ElementTree as ET
+import zlib
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from urllib.parse import parse_qsl, quote, unquote, urlencode
@@ -95,7 +97,8 @@ _ID_ROWS = [
     ("GET", "/s3/eng-artifacts?location", 200, _S3_ID),
     ("GET", "/s3/eng-artifacts?uploads", 200, _S3_ID),
     ("GET", "/s3/no-such-bucket", 404, _S3_ID),
-    ("GET", "/s3/eng-artifacts?versioning", 501, _S3_ID),
+    ("GET", "/s3/eng-artifacts?versioning", 200, _S3_ID),
+    ("GET", "/s3/eng-artifacts/runbooks/oncall.md?tagging", 501, _S3_ID),
     ("GET", "/s3/eng-artifacts?acl&versioning", 400, _S3_ID),
     ("PATCH", "/s3/eng-artifacts", 405, _S3_ID),
     ("TRACE", "/s3/eng-artifacts", 400, _PARSE_ID),
@@ -204,10 +207,10 @@ _REFUSAL_ROWS = [
     ("/s3/", "OPTIONS", 400, "BadRequest", "Origin request header needed.", None),
     # A selector the method is not an operation of: the 405 names the selector's own type, and the
     # `Allow` is `GET` only where this server answers that selector on a GET.
-    ("/s3/eng-artifacts?acl", "PATCH", 405, "MethodNotAllowed", "<ResourceType>ACL</", None),
+    ("/s3/eng-artifacts?acl", "PATCH", 405, "MethodNotAllowed", "<ResourceType>ACL</", "GET"),
     ("/s3/eng-artifacts?location", "PUT", 405, "MethodNotAllowed", ">LOCATION</", "GET"),
     ("/s3/eng-artifacts?delete", "PUT", 405, "MethodNotAllowed", ">MULTI_OBJECT_DELETE</", None),
-    ("/s3/eng-artifacts?versioning", "DELETE", 405, "MethodNotAllowed", ">VERSIONING</", None),
+    ("/s3/eng-artifacts?versioning", "DELETE", 405, "MethodNotAllowed", ">VERSIONING</", "GET"),
     (f"{_KEY}?tagging", "POST", 405, "MethodNotAllowed", ">OBJECT_TAGGING</", None),
     (f"{_KEY}?restore", "DELETE", 405, "MethodNotAllowed", ">RESTORE</", None),
     (f"{_KEY}?partNumber=1&uploadId=u", "PATCH", 405, "MethodNotAllowed", ">PART</", None),
@@ -249,7 +252,7 @@ _REFUSAL_ROWS = [
     # A bucket's `torrent` and `uploadId`, and a bucket's selectors at a key, on the write methods.
     ("/s3/eng-artifacts?torrent", "POST", 405, "MethodNotAllowed", ">TORRENT</", None),
     ("/s3/eng-artifacts?uploadId=x", "PATCH", 405, "MethodNotAllowed", ">UPLOAD</", None),
-    (f"{_KEY}?versioning", "PATCH", 405, "MethodNotAllowed", ">VERSIONING</", None),
+    (f"{_KEY}?versioning", "PATCH", 405, "MethodNotAllowed", ">VERSIONING</", "GET"),
     (f"{_KEY}?location", "PUT", 405, "MethodNotAllowed", ">LOCATION</", "GET"),
     (f"{_KEY}?cors&acl", "PUT", 400, "InvalidArgument", "parameters: acl, cors", None),
     (
@@ -302,6 +305,17 @@ def test_s3_a_head_at_the_service_root_is_the_405_without_its_body(live_server, 
     assert _signed(base_url, path, settings.admin_token).status_code == 200
 
 
+def test_s3_every_bucket_selector_a_get_answers_is_declared():
+    """What a bucket's GET answers is what its OpenAPI declares, so the tool `backlot mcp` hands an
+    agent offers each operation the route serves (``backlot.openapi.qp``)."""
+    from backlot.main import app
+    from backlot.routers import s3 as s3_router
+
+    declared = {p["name"] for p in app.openapi()["paths"]["/s3/{bucket}"]["get"]["parameters"]}
+    assert s3_router._BUCKET_GETS <= declared
+    assert {"key-marker", "version-id-marker", "id"} <= declared
+
+
 def test_s3_every_selector_a_get_reads_has_an_answer_for_the_other_methods():
     """A selector added to what a GET reads without a row in the write tables would reach the bare
     path's refusal on `PUT`, `POST`, `DELETE` and `PATCH`, which is the answer real gives no
@@ -312,11 +326,16 @@ def test_s3_every_selector_a_get_reads_has_an_answer_for_the_other_methods():
     assert s3_router._OBJECT_READ_SELECTORS <= set(s3_router._OBJECT_PATH_WRITE_SELECTORS)
 
 
+# A DeleteObjects body real's schema takes, sent with its `Content-MD5`, so the write is what is
+# left to refuse (``backlot.routers.s3._delete_objects_refusal``).
+_DELETE_BODY = b"<Delete><Object><Key>runbooks/oncall.md</Key></Object></Delete>"
+
 _WRITE_ROWS = [
     ("/s3/eng-artifacts", "DELETE", None),
     ("/s3/eng-artifacts", "PUT", None),
     ("/s3/eng-artifacts", "PUT", b"<CreateBucketConfiguration/>"),
-    ("/s3/eng-artifacts?delete", "POST", b"<Delete/>"),
+    ("/s3/eng-artifacts?delete", "POST", _DELETE_BODY),
+    (f"{_KEY}?delete", "POST", _DELETE_BODY),
     ("/s3/eng-artifacts?acl", "PUT", None),
     ("/s3/eng-artifacts?cors", "DELETE", None),
     (_KEY, "DELETE", None),
@@ -341,7 +360,8 @@ def test_s3_a_write_is_refused_as_not_implemented(live_server, path, method, bod
     already gives an operation it does not implement rather than a status that claims the write
     happened."""
     base_url, settings = live_server
-    r = _signed(base_url, path, settings.admin_token, method=method, body=body)
+    md5 = {"Content-MD5": base64.b64encode(hashlib.md5(body).digest()).decode()} if body else None
+    r = _signed(base_url, path, settings.admin_token, method=method, body=body, extra_headers=md5)
     assert r.status_code == 501
     assert "<Code>NotImplemented</Code>" in r.text
 
@@ -438,10 +458,11 @@ def test_s3_a_write_names_its_bucket_before_the_501_and_createbucket_names_none(
 
 
 def test_s3_a_request_in_a_bucket_the_caller_cannot_see_is_nosuchbucket(live_server):
-    """A write and a read of a key both look the bucket up first, so each is scoped as a listing is:
-    `people-vault` holds one group-visible object, so an engineer is told the bucket does not exist
-    where the admin gets the write's 501 and the object itself. CreateBucket reads no bucket and a
-    method refusal comes first, so both answer the two callers alike."""
+    """A write, a read of a key and a read of the bucket's configuration all look the bucket up
+    first, so each is scoped as a listing is: `people-vault` holds one group-visible object, so an
+    engineer is told the bucket does not exist where the admin gets the write's own answer, the
+    object itself and the configuration. CreateBucket reads no bucket and a method refusal comes
+    first, so both answer the two callers alike."""
     base_url, settings = live_server
     tokens = {
         u["email"]: u["token"] for u in yaml.safe_load(settings.tokens_path.read_text())["users"]
@@ -449,7 +470,12 @@ def test_s3_a_request_in_a_bucket_the_caller_cannot_see_is_nosuchbucket(live_ser
     scoped_token = tokens["ava@acme.com"]
     for method, path, admin_status in (
         ("DELETE", "/s3/people-vault", 501),
-        ("POST", "/s3/people-vault?delete", 501),
+        ("POST", "/s3/people-vault?delete", 400),
+        ("POST", "/s3/people-vault?restore", 400),
+        ("GET", "/s3/people-vault?versioning", 200),
+        ("GET", "/s3/people-vault?acl", 200),
+        ("GET", "/s3/people-vault?versions", 200),
+        ("GET", "/s3/people-vault/comp/bands.csv?cors", 404),
         ("PUT", "/s3/people-vault/x.txt", 501),
         ("DELETE", "/s3/people-vault/x.txt?tagging", 501),
         ("GET", "/s3/people-vault/comp/bands.csv", 200),
@@ -948,12 +974,13 @@ def test_s3_large_bucket_delimiter_returns_common_prefixes(big_bucket_client, bi
     assert root.findtext(f"{{{S3NS}}}IsTruncated") == "false"
 
 
-@pytest.mark.parametrize("listing", ["", "list-type=2&"], ids=["v1", "v2"])
+@pytest.mark.parametrize("listing", ["", "list-type=2&", "versions&"], ids=["v1", "v2", "versions"])
 def test_s3_large_bucket_acl_scopes_listing(
     big_bucket_client, big_bucket_settings, big_bucket_tokens, listing
 ):
-    """Both served bodies scope the same way. The V1 one carries a per-object ``Owner`` a scoped
-    caller can read, so the ACL has to be proved on it and not only on the V2 shape."""
+    """The three served bodies scope the same way. The V1 one and ListObjectVersions carry a
+    per-object ``Owner`` a scoped caller can read, so the ACL has to be proved on them and not only
+    on the V2 shape."""
     pytest.importorskip("botocore")
 
     def keys_for(token):
@@ -962,7 +989,8 @@ def test_s3_large_bucket_acl_scopes_listing(
             f"/s3/big-bucket?{listing}prefix=logs/2026/01/&max-keys=1000",
             token,
         )
-        return {e.text for e in ET.fromstring(r.text).findall(f"{{{S3NS}}}Contents/{{{S3NS}}}Key")}
+        entry = "Version" if listing == "versions&" else "Contents"
+        return {e.text for e in ET.fromstring(r.text).findall(f"{{{S3NS}}}{entry}/{{{S3NS}}}Key")}
 
     admin_keys = keys_for(big_bucket_settings.admin_token)
     eng_keys = keys_for(big_bucket_tokens["eng-bulk@acme.com"])
@@ -979,8 +1007,9 @@ def test_s3_large_bucket_acl_scopes_listing(
         f"/s3/big-bucket?{listing}prefix=logs/2026/01/&max-keys=1",
         big_bucket_tokens["eng-bulk@acme.com"],
     )
-    owner = ET.fromstring(scoped.text).find(f"{{{S3NS}}}Contents/{{{S3NS}}}Owner/{{{S3NS}}}ID")
-    assert (owner is not None) == (listing == "")
+    entry = "Version" if listing == "versions&" else "Contents"
+    owner = ET.fromstring(scoped.text).find(f"{{{S3NS}}}{entry}/{{{S3NS}}}Owner/{{{S3NS}}}ID")
+    assert (owner is not None) == (listing != "list-type=2&")
 
 
 def test_s3_delimiter_common_prefix_not_duplicated_across_pages(
@@ -1080,42 +1109,225 @@ def test_list_objects_v2_delimiter_common_prefixes(live_server):
     assert {"runbooks/", "design/"} <= prefixes
 
 
-# ------------------------------------------------------------ sub-resources Backlot does not serve
+# ------------------------------------------------------------ sub-resources
 # S3 dispatches on the query string: `?versioning`, `?acl`, `?tagging` and the rest each select an
-# operation of their own at a bucket's or an object's path. Backlot implements two of them at a
-# bucket's path (`?location` and `?uploads`, below), refuses the rest, and used to answer every one
-# with the listing or the object's bytes under a 200. Every claim about real S3 below was measured
-# against a general purpose bucket: each selector is answered as its own operation, an unknown key
-# (`?foo=bar`, `?x-id=…`) is ignored, the match is case-sensitive, two selectors conflict, and HEAD
-# with a selector is 405.
+# operation of their own at a bucket's or an object's path. Backlot answers every one of a bucket's
+# as real answers a bucket nobody configured, and refuses an object's with 501. Every claim about
+# real S3 below was measured against a general purpose bucket: each selector is answered as its own
+# operation, an unknown key (`?foo=bar`, `?x-id=…`) is ignored, the match is case-sensitive, two
+# selectors conflict, and HEAD with a selector is 405.
 
-BUCKET_SUBRESOURCES = [
-    "abac",
-    "accelerate",
-    "acl",
-    "analytics",
-    "cors",
-    "encryption",
-    "intelligent-tiering",
-    "inventory",
-    "lifecycle",
-    "logging",
-    "metadataConfiguration",
-    "metadataTable",
-    "metrics",
-    "notification",
-    "object-lock",
-    "ownershipControls",
-    "policy",
-    "policyStatus",
-    "publicAccessBlock",
-    "replication",
-    "requestPayment",
-    "tagging",
-    "versioning",
-    "versions",
-    "website",
+# What real answered each selector's GET with on a bucket nobody configured: status, Content-Type
+# and the body as sent, request ids aside (probe37, 2026-09-29, us-east-1).
+_CONFIGURATION_ROWS = [
+    (
+        "abac",
+        200,
+        None,
+        '<?xml version="1.0" encoding="UTF-8"?>\n<AbacStatus xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Disabled</Status></AbacStatus>',
+    ),
+    (
+        "accelerate",
+        200,
+        None,
+        '<?xml version="1.0" encoding="UTF-8"?>\n<AccelerateConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>',
+    ),
+    (
+        "acl",
+        200,
+        "application/xml",
+        '<?xml version="1.0" encoding="UTF-8"?>\n<AccessControlPolicy xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Owner><ID>{owner}</ID></Owner><AccessControlList><Grant><Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="CanonicalUser"><ID>{owner}</ID></Grantee><Permission>FULL_CONTROL</Permission></Grant></AccessControlList></AccessControlPolicy>',
+    ),
+    (
+        "analytics",
+        200,
+        None,
+        '<ListBucketAnalyticsConfigurationsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><IsTruncated>false</IsTruncated></ListBucketAnalyticsConfigurationsResult>',
+    ),
+    (
+        "cors",
+        404,
+        "application/xml",
+        '<?xml version="1.0" encoding="UTF-8"?>\n<Error><Code>NoSuchCORSConfiguration</Code><Message>The CORS configuration does not exist</Message><BucketName>{bucket}</BucketName><RequestId/><HostId/></Error>',
+    ),
+    (
+        "encryption",
+        200,
+        None,
+        '<?xml version="1.0" encoding="UTF-8"?>\n<ServerSideEncryptionConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Rule><BucketKeyEnabled>false</BucketKeyEnabled><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault><BlockedEncryptionTypes><EncryptionType>SSE-C</EncryptionType></BlockedEncryptionTypes></Rule></ServerSideEncryptionConfiguration>',
+    ),
+    (
+        "intelligent-tiering",
+        200,
+        None,
+        '<ListIntelligentTieringConfigurationsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><IsTruncated>false</IsTruncated></ListIntelligentTieringConfigurationsResult>',
+    ),
+    (
+        "inventory",
+        200,
+        None,
+        '<?xml version="1.0" encoding="UTF-8"?><ListInventoryConfigurationsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><IsTruncated>false</IsTruncated></ListInventoryConfigurationsResult>',
+    ),
+    (
+        "lifecycle",
+        404,
+        "application/xml",
+        "<Error><Code>NoSuchLifecycleConfiguration</Code><Message>The lifecycle configuration does not exist</Message><BucketName>{bucket}</BucketName><RequestId/><HostId/></Error>",
+    ),
+    (
+        "location",
+        200,
+        "application/xml",
+        '<?xml version="1.0" encoding="UTF-8"?>\n<LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>',
+    ),
+    (
+        "logging",
+        200,
+        "application/xml",
+        '<?xml version="1.0" encoding="UTF-8"?>\n\n<BucketLoggingStatus xmlns="http://s3.amazonaws.com/doc/2006-03-01/">\n  <!--<LoggingEnabled><TargetBucket>myLogsBucket</TargetBucket><TargetPrefix>add/this/prefix/to/my/log/files/access_log-</TargetPrefix></LoggingEnabled>-->\n</BucketLoggingStatus>\n',
+    ),
+    (
+        "metadataConfiguration",
+        404,
+        "application/xml",
+        "<Error><Code>MetadataConfigurationNotFound</Code><Message>The metadata configuration was not found</Message><BucketName>{bucket}</BucketName><RequestId/><HostId/></Error>",
+    ),
+    (
+        "metadataTable",
+        405,
+        "application/xml",
+        "<Error><Code>V1APIsNotAllowed</Code><Message>The V1 GetBucketMetadataTableConfiguration API operation isn't available for this account. Use the corresponding V2 GetBucketMetadataConfiguration API operation instead.</Message><Method>GET</Method><RequestId/><HostId/></Error>",
+    ),
+    (
+        "metrics",
+        200,
+        None,
+        '<?xml version="1.0" encoding="UTF-8"?><ListMetricsConfigurationsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><IsTruncated>false</IsTruncated></ListMetricsConfigurationsResult>',
+    ),
+    (
+        "notification",
+        200,
+        None,
+        '<?xml version="1.0" encoding="UTF-8"?>\n<NotificationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>',
+    ),
+    (
+        "object-lock",
+        404,
+        "application/xml",
+        '<?xml version="1.0" encoding="UTF-8"?>\n<Error><Code>ObjectLockConfigurationNotFoundError</Code><Message>Object Lock configuration does not exist for this bucket</Message><BucketName>{bucket}</BucketName><RequestId/><HostId/></Error>',
+    ),
+    (
+        "ownershipControls",
+        200,
+        None,
+        '<?xml version="1.0" encoding="UTF-8"?>\n<OwnershipControls xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>',
+    ),
+    (
+        "policy",
+        404,
+        "application/xml",
+        '<?xml version="1.0" encoding="UTF-8"?>\n<Error><Code>NoSuchBucketPolicy</Code><Message>The bucket policy does not exist</Message><BucketName>{bucket}</BucketName><RequestId/><HostId/></Error>',
+    ),
+    (
+        "policyStatus",
+        404,
+        "application/xml",
+        '<?xml version="1.0" encoding="UTF-8"?>\n<Error><Code>NoSuchBucketPolicy</Code><Message>The bucket policy does not exist</Message><BucketName>{bucket}</BucketName><RequestId/><HostId/></Error>',
+    ),
+    (
+        "publicAccessBlock",
+        200,
+        None,
+        '<?xml version="1.0" encoding="UTF-8"?>\n<PublicAccessBlockConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><BlockPublicAcls>true</BlockPublicAcls><IgnorePublicAcls>true</IgnorePublicAcls><BlockPublicPolicy>true</BlockPublicPolicy><RestrictPublicBuckets>true</RestrictPublicBuckets></PublicAccessBlockConfiguration>',
+    ),
+    (
+        "replication",
+        404,
+        "application/xml",
+        '<?xml version="1.0" encoding="UTF-8"?>\n<Error><Code>ReplicationConfigurationNotFoundError</Code><Message>The replication configuration was not found</Message><BucketName>{bucket}</BucketName><RequestId/><HostId/></Error>',
+    ),
+    (
+        "requestPayment",
+        200,
+        None,
+        '<?xml version="1.0" encoding="UTF-8"?>\n<RequestPaymentConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Payer>BucketOwner</Payer></RequestPaymentConfiguration>',
+    ),
+    (
+        "tagging",
+        404,
+        "application/xml",
+        '<?xml version="1.0" encoding="UTF-8"?>\n<Error><Code>NoSuchTagSet</Code><Message>The TagSet does not exist</Message><BucketName>{bucket}</BucketName><RequestId/><HostId/></Error>',
+    ),
+    (
+        "versioning",
+        200,
+        None,
+        '<?xml version="1.0" encoding="UTF-8"?>\n<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>',
+    ),
+    (
+        "website",
+        404,
+        "application/xml",
+        '<?xml version="1.0" encoding="UTF-8"?>\n<Error><Code>NoSuchWebsiteConfiguration</Code><Message>The specified bucket does not have a website configuration</Message><BucketName>{bucket}</BucketName><RequestId/><HostId/></Error>',
+    ),
 ]
+
+
+def _without_request_ids(body: str) -> str:
+    return re.sub(r"<(RequestId|HostId)>[^<]*</\1>", r"<\1/>", body)
+
+
+@pytest.mark.parametrize(
+    "selector, status, content_type, body",
+    _CONFIGURATION_ROWS,
+    ids=[r[0] for r in _CONFIGURATION_ROWS],
+)
+def test_a_bucket_configuration_is_what_real_answers_for_a_bucket_nobody_configured(
+    live_server, selector, status, content_type, body
+):
+    """Each configuration a bucket has, at the bucket's path, byte for byte what real sent for one
+    nobody configured, the prolog and the `Content-Type` among them; and a HEAD naming it is the
+    405 whose `Allow` names the GET that answers it."""
+    base_url, settings = live_server
+    owner = _get_xml(base_url, "/s3/eng-artifacts", settings.admin_token).findtext(
+        f"{NS}Contents/{NS}Owner/{NS}ID"
+    )
+    r = _signed(base_url, f"/s3/eng-artifacts?{selector}", settings.admin_token)
+    assert r.status_code == status
+    assert r.headers.get("content-type") == content_type
+    assert _without_request_ids(r.text) == body.format(bucket="eng-artifacts", owner=owner)
+    head = _signed(base_url, f"/s3/eng-artifacts?{selector}", settings.admin_token, method="HEAD")
+    assert head.status_code == 405 and head.headers.get("allow") == "GET"
+
+
+@pytest.mark.parametrize(
+    "selector",
+    [
+        "accelerate",
+        "cors",
+        "inventory",
+        "lifecycle",
+        "location",
+        "notification",
+        "policy",
+        "replication",
+        "requestPayment",
+        "versioning",
+        "website",
+    ],
+)
+def test_a_bucket_selector_at_a_key_is_the_buckets_own_answer(live_server, selector):
+    """Real answered these at a key it has and one it does not with the bucket's own answer, byte
+    for byte, the bucket named where the answer names one (probe37, 2026-09-29)."""
+    base_url, settings = live_server
+    at_bucket = _signed(base_url, f"/s3/eng-artifacts?{selector}", settings.admin_token)
+    for path in (OBJECT_PATH, "/s3/eng-artifacts/no/such.md"):
+        at_key = _signed(base_url, f"{path}?{selector}", settings.admin_token)
+        assert at_key.status_code == at_bucket.status_code, path
+        assert at_key.headers.get("content-type") == at_bucket.headers.get("content-type"), path
+        assert _without_request_ids(at_key.text) == _without_request_ids(at_bucket.text), path
+
+
 OBJECT_SUBRESOURCES = [
     "acl",
     "annotation",
@@ -1134,22 +1346,6 @@ def _refused(base_url, path, token, method="GET") -> urllib.error.HTTPError:
     with pytest.raises(urllib.error.HTTPError) as e:
         urllib.request.urlopen(urllib.request.Request(url, headers=headers, method=method))
     return e.value
-
-
-@pytest.mark.parametrize("selector", BUCKET_SUBRESOURCES)
-def test_an_unimplemented_bucket_subresource_is_refused_not_answered_with_the_listing(
-    live_server, selector
-):
-    base_url, settings = live_server
-    err = _refused(base_url, f"/s3/eng-artifacts?{selector}", settings.admin_token)
-    body = err.read()
-    assert err.code == 501
-    assert b"<Code>NotImplemented</Code>" in body
-    assert b"ListBucketResult" not in body
-    assert err.headers.get("Content-Type") == "application/xml"
-    # The HEAD at the same path names no method, the `Allow` naming only what a GET serves.
-    head = _refused(base_url, f"/s3/eng-artifacts?{selector}", settings.admin_token, method="HEAD")
-    assert head.code == 405 and head.headers.get("Allow") is None
 
 
 @pytest.mark.parametrize("selector", OBJECT_SUBRESOURCES)
@@ -1251,8 +1447,8 @@ def test_what_does_not_exist_is_reported_before_the_subresource_except_for_list_
 def test_head_with_a_subresource_names_what_a_get_serves_and_a_bare_head_still_answers(live_server):
     base_url, settings = live_server
     token = settings.admin_token
-    # `location` and `uploads` are served on a GET and still have no HEAD form, so theirs are the
-    # two 405s that name GET; every selector the GET refuses is asserted beside its own 501 above.
+    # Every bucket selector is served on a GET and still has no HEAD form, so each of their 405s
+    # names GET (and each is asserted beside its GET above); an object's names none.
     for path, allow in (
         ("/s3/eng-artifacts?location", "GET"),
         ("/s3/eng-artifacts?uploads", "GET"),
@@ -1260,7 +1456,7 @@ def test_head_with_a_subresource_names_what_a_get_serves_and_a_bare_head_still_a
         # that does not exist answers `Allow: GET` for `?location` on real too (measured
         # 2026-09-17, ap-northeast-2).
         ("/s3/no-such-bucket?location", "GET"),
-        ("/s3/no-such-bucket?versioning", None),
+        ("/s3/no-such-bucket?versioning", "GET"),
         ("/s3/eng-artifacts/no/such.md?acl", None),
         # The selectors a GET is refused for are 405s on a HEAD too (measured 2026-09-29).
         ("/s3/eng-artifacts?delete", None),
@@ -1270,10 +1466,13 @@ def test_head_with_a_subresource_names_what_a_get_serves_and_a_bare_head_still_a
         (f"{OBJECT_PATH}?select", None),
         (f"{OBJECT_PATH}?uploads", None),
         # A bucket's selectors at a key and two of an object's at a bucket, which the GET at the
-        # same path answers after the bucket (measured 2026-09-29); `?location` is served at a key.
-        (f"{OBJECT_PATH}?versioning", None),
+        # same path answers after the bucket (measured 2026-09-29); the bucket's are served at a
+        # key, `?logging` and `?versions` apart, which the GET there refuses.
+        (f"{OBJECT_PATH}?versioning", "GET"),
         (f"{OBJECT_PATH}?location", "GET"),
-        ("/s3/no-such-bucket/a.txt?website", None),
+        ("/s3/no-such-bucket/a.txt?website", "GET"),
+        (f"{OBJECT_PATH}?logging", None),
+        (f"{OBJECT_PATH}?versions", None),
         ("/s3/eng-artifacts?torrent", None),
         ("/s3/eng-artifacts?uploadId=x", None),
         (f"{OBJECT_PATH}?partNumber=1&uploadId=x", None),
@@ -1394,9 +1593,22 @@ _MEMBER_ROWS = [
         "NoSuchBucket",
         "<BucketName>no-such-bucket</BucketName>",
     ),
-    # A bucket's selectors at a key's path are the bucket's own operations, whatever the key.
-    ("GET", "/s3/eng-artifacts/runbooks/oncall.md?versioning", 501, "NotImplemented", ""),
-    ("GET", "/s3/eng-artifacts/no/such.md?policy", 501, "NotImplemented", ""),
+    # A bucket's selectors at a key's path are the bucket's own operations, whatever the key, and
+    # name the bucket.
+    (
+        "GET",
+        "/s3/eng-artifacts/runbooks/oncall.md?cors",
+        404,
+        "NoSuchCORSConfiguration",
+        "<BucketName>eng-artifacts</BucketName>",
+    ),
+    (
+        "GET",
+        "/s3/eng-artifacts/no/such.md?policy",
+        404,
+        "NoSuchBucketPolicy",
+        "<BucketName>eng-artifacts</BucketName>",
+    ),
     ("GET", "/s3/eng-artifacts/runbooks/oncall.md?logging", 400, "NoLoggingStatusForKey", ""),
     ("GET", "/s3/eng-artifacts/runbooks/oncall.md?versions", 400, "InvalidRequest", ""),
     (
@@ -1407,7 +1619,7 @@ _MEMBER_ROWS = [
         "<BucketName>no-such-bucket</BucketName>",
     ),
     # This server's own refusals, which have no real body to copy.
-    ("GET", "/s3/eng-artifacts?versioning", 501, "NotImplemented", ""),
+    ("GET", "/s3/eng-artifacts/runbooks/oncall.md?tagging", 501, "NotImplemented", ""),
     ("DELETE", "/s3/eng-artifacts", 501, "NotImplemented", ""),
 ]
 
@@ -1429,6 +1641,538 @@ def test_s3_a_refusal_names_what_it_refused_with_the_member_real_uses_for_its_co
     assert r.status_code == status
     named = re.search(r"<Code>([^<]+)</Code><Message>[^<]*</Message>(.*)<RequestId>", r.text)
     assert (named[1], named[2]) == (code, members)
+
+
+# The four configuration lists' own parameters, as real answered them (probe37, 2026-09-29).
+_CONFIGURATION_LIST_ROWS = [
+    (
+        "analytics&id=x",
+        404,
+        '<?xml version="1.0" encoding="UTF-8"?>\n<Error><Code>NoSuchConfiguration</Code><Message>The specified configuration does not exist.</Message><RequestId/><HostId/></Error>',
+    ),
+    (
+        "analytics&id=",
+        200,
+        '<ListBucketAnalyticsConfigurationsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><IsTruncated>false</IsTruncated></ListBucketAnalyticsConfigurationsResult>',
+    ),
+    (
+        "analytics&continuation-token=garbage",
+        400,
+        '<?xml version="1.0" encoding="UTF-8"?>\n<Error><Code>MalformedContinuationToken</Code><Message>The continuation-token you provided invalid.</Message><RequestId/><HostId/></Error>',
+    ),
+    (
+        "analytics&continuation-token=",
+        200,
+        '<ListBucketAnalyticsConfigurationsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><IsTruncated>false</IsTruncated><ContinuationToken></ContinuationToken></ListBucketAnalyticsConfigurationsResult>',
+    ),
+    (
+        "analytics&id=x&continuation-token=garbage",
+        404,
+        '<?xml version="1.0" encoding="UTF-8"?>\n<Error><Code>NoSuchConfiguration</Code><Message>The specified configuration does not exist.</Message><RequestId/><HostId/></Error>',
+    ),
+    (
+        "intelligent-tiering&id=x",
+        404,
+        "<Error><Code>NoSuchConfiguration</Code><Message>The specified configuration does not exist.</Message><RequestId/><HostId/></Error>",
+    ),
+    (
+        "intelligent-tiering&id=",
+        200,
+        '<ListIntelligentTieringConfigurationsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><IsTruncated>false</IsTruncated></ListIntelligentTieringConfigurationsResult>',
+    ),
+    (
+        "intelligent-tiering&continuation-token=garbage",
+        400,
+        "<Error><Code>MalformedContinuationToken</Code><Message>The continuation-token you provided invalid.</Message><RequestId/><HostId/></Error>",
+    ),
+    (
+        "intelligent-tiering&continuation-token=",
+        200,
+        '<ListIntelligentTieringConfigurationsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><IsTruncated>false</IsTruncated><ContinuationToken></ContinuationToken></ListIntelligentTieringConfigurationsResult>',
+    ),
+    (
+        "intelligent-tiering&id=x&continuation-token=garbage",
+        404,
+        "<Error><Code>NoSuchConfiguration</Code><Message>The specified configuration does not exist.</Message><RequestId/><HostId/></Error>",
+    ),
+    (
+        "inventory&id=x",
+        404,
+        "<Error><Code>NoSuchConfiguration</Code><Message>The specified configuration does not exist.</Message><RequestId/><HostId/></Error>",
+    ),
+    (
+        "inventory&id=",
+        200,
+        '<?xml version="1.0" encoding="UTF-8"?><ListInventoryConfigurationsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><IsTruncated>false</IsTruncated></ListInventoryConfigurationsResult>',
+    ),
+    (
+        "inventory&continuation-token=garbage",
+        400,
+        "<Error><Code>MalformedContinuationToken</Code><Message>The continuation-token you provided invalid.</Message><RequestId/><HostId/></Error>",
+    ),
+    (
+        "inventory&continuation-token=",
+        200,
+        '<?xml version="1.0" encoding="UTF-8"?><ListInventoryConfigurationsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><IsTruncated>false</IsTruncated><ContinuationToken></ContinuationToken></ListInventoryConfigurationsResult>',
+    ),
+    (
+        "inventory&id=x&continuation-token=garbage",
+        404,
+        "<Error><Code>NoSuchConfiguration</Code><Message>The specified configuration does not exist.</Message><RequestId/><HostId/></Error>",
+    ),
+    (
+        "metrics&id=x",
+        404,
+        '<?xml version="1.0" encoding="UTF-8"?>\n<Error><Code>NoSuchConfiguration</Code><Message>The specified configuration does not exist.</Message><RequestId/><HostId/></Error>',
+    ),
+    (
+        "metrics&id=",
+        200,
+        '<?xml version="1.0" encoding="UTF-8"?><ListMetricsConfigurationsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><IsTruncated>false</IsTruncated></ListMetricsConfigurationsResult>',
+    ),
+    (
+        "metrics&continuation-token=garbage",
+        400,
+        '<?xml version="1.0" encoding="UTF-8"?>\n<Error><Code>MalformedContinuationToken</Code><Message>The continuation-token you provided invalid.</Message><RequestId/><HostId/></Error>',
+    ),
+    (
+        "metrics&continuation-token=",
+        200,
+        '<?xml version="1.0" encoding="UTF-8"?><ListMetricsConfigurationsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><IsTruncated>false</IsTruncated><ContinuationToken></ContinuationToken></ListMetricsConfigurationsResult>',
+    ),
+    (
+        "metrics&id=x&continuation-token=garbage",
+        404,
+        '<?xml version="1.0" encoding="UTF-8"?>\n<Error><Code>NoSuchConfiguration</Code><Message>The specified configuration does not exist.</Message><RequestId/><HostId/></Error>',
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "query, status, body", _CONFIGURATION_LIST_ROWS, ids=[r[0] for r in _CONFIGURATION_LIST_ROWS]
+)
+def test_a_configuration_list_reads_its_id_and_token_as_real_does(live_server, query, status, body):
+    """Each list empty, as on a bucket nobody configured: an `id` names a configuration there is
+    none of, a token is one it never handed out, and each is refused with the prolog real sent."""
+    base_url, settings = live_server
+    r = _signed(base_url, f"/s3/eng-artifacts?{query}", settings.admin_token)
+    assert r.status_code == status
+    assert _without_request_ids(r.text) == body
+
+
+_NO_VERSION_ID = "This operation does not accept a version-id."
+_NO_WEBSITE_VALUE = "The website parameter must not have a value"
+_BAD_VERSION = "Invalid version id specified"
+
+
+def _argued(name, value=None):
+    value = "" if value is None else f"<ArgumentValue>{value}</ArgumentValue>"
+    return f"<ArgumentName>{name}</ArgumentName>{value}"
+
+
+# A query parameter real refuses, and which of two it refuses when both are sent: the request, and
+# the status, code, message and members of real's answer (measured 2026-09-29 against us-east-1).
+_PARAMETER_ROWS = [
+    # `versionId` at a bucket's path, on each operation there.
+    ("GET", "/s3/eng-artifacts?versionId=x", 400, _NO_VERSION_ID, _argued("versionId", "x")),
+    (
+        "GET",
+        "/s3/eng-artifacts?list-type=2&versionId=x",
+        400,
+        _NO_VERSION_ID,
+        _argued("versionId", "x"),
+    ),
+    (
+        "GET",
+        "/s3/eng-artifacts?session&versionId=x",
+        400,
+        _NO_VERSION_ID,
+        _argued("versionId", "x"),
+    ),
+    (
+        "GET",
+        "/s3/eng-artifacts?versions&versionId=x",
+        400,
+        _NO_VERSION_ID,
+        _argued("versionId", "x"),
+    ),
+    (
+        "GET",
+        "/s3/eng-artifacts?uploads&versionId=x",
+        400,
+        _NO_VERSION_ID,
+        _argued("versionId", "x"),
+    ),
+    (
+        "GET",
+        "/s3/eng-artifacts?versioning&versionId=",
+        400,
+        _NO_VERSION_ID,
+        _argued("versionId", ""),
+    ),
+    (
+        "GET",
+        "/s3/eng-artifacts?versioning&versionId=null",
+        400,
+        _NO_VERSION_ID,
+        _argued("versionId", "null"),
+    ),
+    ("GET", "/s3/eng-artifacts?acl&versionId=x", 400, _BAD_VERSION, _argued("versionId", "x")),
+    (
+        "GET",
+        "/s3/no-such-bucket?versioning&versionId=x",
+        400,
+        _NO_VERSION_ID,
+        _argued("versionId", "x"),
+    ),
+    (
+        "PUT",
+        "/s3/no-such-bucket?versioning&versionId=x",
+        400,
+        _NO_VERSION_ID,
+        _argued("versionId", "x"),
+    ),
+    ("DELETE", "/s3/no-such-bucket?versionId=x", 400, _NO_VERSION_ID, _argued("versionId", "x")),
+    # What comes before it, and what after.
+    (
+        "GET",
+        "/s3/eng-artifacts?max-keys=abc&versionId=x",
+        400,
+        "Provided max-keys not an integer or within integer range",
+        _argued("max-keys", "abc"),
+    ),
+    (
+        "GET",
+        "/s3/eng-artifacts?versions&versionId=x&max-keys=abc",
+        400,
+        "Provided max-keys not an integer or within integer range",
+        _argued("max-keys", "abc"),
+    ),
+    (
+        "GET",
+        "/s3/eng-artifacts?uploads&max-uploads=abc&versionId=x",
+        400,
+        "Provided max-uploads not an integer or within integer range",
+        _argued("max-uploads", "abc"),
+    ),
+    (
+        "GET",
+        "/s3/no-such-bucket?versionId=x&start-after=a",
+        400,
+        "startAfter only supported in REST.GET.BUCKET with list-type=2",
+        _argued("start-after"),
+    ),
+    (
+        "GET",
+        "/s3/eng-artifacts?versionId=x&acl&versioning",
+        400,
+        "Conflicting query string parameters: acl, versioning",
+        _argued("ResourceType", "acl"),
+    ),
+    (
+        "GET",
+        "/s3/eng-artifacts?versionId=x&partNumber=1",
+        400,
+        "Object must have a valid key name.",
+        "",
+    ),
+    ("GET", "/s3/eng-artifacts?versionId=x&delete", 400, _NO_VERSION_ID, _argued("versionId", "x")),
+    (
+        "GET",
+        "/s3/eng-artifacts?versionId=x&website=v",
+        400,
+        _NO_VERSION_ID,
+        _argued("versionId", "x"),
+    ),
+    (
+        "GET",
+        "/s3/eng-artifacts?versionId=x&max-keys=-1",
+        400,
+        _NO_VERSION_ID,
+        _argued("versionId", "x"),
+    ),
+    (
+        "GET",
+        "/s3/eng-artifacts?versionId=x&encoding-type=bogus",
+        400,
+        _NO_VERSION_ID,
+        _argued("versionId", "x"),
+    ),
+    # A valued `website`, at a bucket's path and a key's.
+    ("GET", "/s3/no-such-bucket?website=v", 400, _NO_WEBSITE_VALUE, _argued("website", "v")),
+    ("PUT", "/s3/no-such-bucket?website=v", 400, _NO_WEBSITE_VALUE, _argued("website", "v")),
+    (
+        "GET",
+        "/s3/eng-artifacts/no/such.md?website=v",
+        400,
+        _NO_WEBSITE_VALUE,
+        _argued("website", "v"),
+    ),
+    (
+        "GET",
+        "/s3/no-such-bucket?website=v&website",
+        400,
+        _NO_WEBSITE_VALUE,
+        _argued("website", "v"),
+    ),
+    (
+        "GET",
+        "/s3/no-such-bucket?website=v&max-keys=abc",
+        400,
+        _NO_WEBSITE_VALUE,
+        _argued("website", "v"),
+    ),
+    (
+        "GET",
+        "/s3/no-such-bucket?website=v&versioning",
+        400,
+        "Conflicting query string parameters: versioning, website",
+        _argued("ResourceType", "versioning"),
+    ),
+    # `annotationName` at a key without `annotation`.
+    (
+        "GET",
+        "/s3/eng-artifacts/runbooks/oncall.md?annotationName=v",
+        400,
+        "Unexpected query string parameter",
+        _argued("ResourceType", "annotationName"),
+    ),
+    (
+        "GET",
+        "/s3/no-such-bucket/k.txt?annotationName=v",
+        400,
+        "Unexpected query string parameter",
+        _argued("ResourceType", "annotationName"),
+    ),
+    (
+        "GET",
+        "/s3/eng-artifacts/runbooks/oncall.md?annotationName=v&acl",
+        400,
+        "Conflicting query string parameters: acl, annotationName",
+        _argued("ResourceType", "acl"),
+    ),
+    (
+        "GET",
+        "/s3/eng-artifacts/runbooks/oncall.md?annotationName=v&website=v",
+        400,
+        "Conflicting query string parameters: annotationName, website",
+        _argued("ResourceType", "annotationName"),
+    ),
+    # ListObjectVersions' own, before the bucket and after it.
+    (
+        "GET",
+        "/s3/no-such-bucket?versions&max-keys=abc",
+        400,
+        "Provided max-keys not an integer or within integer range",
+        _argued("max-keys", "abc"),
+    ),
+    (
+        "GET",
+        "/s3/no-such-bucket?versions&version-id-marker=x",
+        400,
+        "A version-id marker cannot be specified without a key marker.",
+        _argued("version-id-marker", "x"),
+    ),
+    (
+        "GET",
+        "/s3/no-such-bucket?versions&key-marker=a&version-id-marker=",
+        400,
+        "A version-id marker cannot be empty.",
+        _argued("version-id-marker", ""),
+    ),
+    (
+        "GET",
+        "/s3/no-such-bucket?versions&key-marker=a&version-id-marker=x",
+        404,
+        "The specified bucket does not exist",
+        "<BucketName>no-such-bucket</BucketName>",
+    ),
+    (
+        "GET",
+        "/s3/eng-artifacts?versions&key-marker=a&version-id-marker=x",
+        400,
+        _BAD_VERSION,
+        _argued("version-id-marker", "x"),
+    ),
+    (
+        "GET",
+        "/s3/eng-artifacts?versions&key-marker=a.txt&version-id-marker=NULL",
+        400,
+        _BAD_VERSION,
+        _argued("version-id-marker", "NULL"),
+    ),
+    (
+        "GET",
+        "/s3/no-such-bucket?versions&encoding-type=bogus",
+        404,
+        "The specified bucket does not exist",
+        "<BucketName>no-such-bucket</BucketName>",
+    ),
+    (
+        "GET",
+        "/s3/eng-artifacts?versions&encoding-type=bogus",
+        400,
+        "Invalid Encoding Method specified in Request",
+        _argued("encoding-type", "bogus"),
+    ),
+    (
+        "GET",
+        "/s3/eng-artifacts?versions&encoding-type=",
+        400,
+        "Invalid Encoding Method specified in Request",
+        _argued("encoding-type", ""),
+    ),
+    (
+        "GET",
+        "/s3/no-such-bucket?versions&max-keys=-1",
+        404,
+        "The specified bucket does not exist",
+        "<BucketName>no-such-bucket</BucketName>",
+    ),
+    (
+        "GET",
+        "/s3/eng-artifacts?versions&max-keys=-1",
+        400,
+        "max-keys cannot be negative",
+        _argued("max-keys"),
+    ),
+    (
+        "GET",
+        "/s3/eng-artifacts?versions&max-keys=abc&encoding-type=bogus",
+        400,
+        "Provided max-keys not an integer or within integer range",
+        _argued("max-keys", "abc"),
+    ),
+    (
+        "GET",
+        "/s3/eng-artifacts?versions&encoding-type=bogus&version-id-marker=x",
+        400,
+        "A version-id marker cannot be specified without a key marker.",
+        _argued("version-id-marker", "x"),
+    ),
+    (
+        "GET",
+        "/s3/eng-artifacts?versions&max-keys=abc&version-id-marker=x",
+        400,
+        "Provided max-keys not an integer or within integer range",
+        _argued("max-keys", "abc"),
+    ),
+    (
+        "GET",
+        "/s3/eng-artifacts?versions&max-keys=-1&encoding-type=bogus",
+        400,
+        "Invalid Encoding Method specified in Request",
+        _argued("encoding-type", "bogus"),
+    ),
+    (
+        "GET",
+        "/s3/eng-artifacts?versions&max-keys=-1&version-id-marker=x",
+        400,
+        "A version-id marker cannot be specified without a key marker.",
+        _argued("version-id-marker", "x"),
+    ),
+    (
+        "GET",
+        "/s3/eng-artifacts?versions&key-marker=a.txt&version-id-marker=garbage&max-keys=abc",
+        400,
+        "Provided max-keys not an integer or within integer range",
+        _argued("max-keys", "abc"),
+    ),
+    (
+        "GET",
+        "/s3/eng-artifacts?versions&key-marker=a.txt&version-id-marker=garbage&encoding-type=bogus",
+        400,
+        _BAD_VERSION,
+        _argued("version-id-marker", "garbage"),
+    ),
+    (
+        "GET",
+        "/s3/eng-artifacts?versions&key-marker=a.txt&version-id-marker=&max-keys=abc",
+        400,
+        "Provided max-keys not an integer or within integer range",
+        _argued("max-keys", "abc"),
+    ),
+    (
+        "GET",
+        "/s3/eng-artifacts?versions&max-keys=abc&acl",
+        400,
+        "Conflicting query string parameters: acl, versions",
+        _argued("ResourceType", "acl"),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "method, path, status, message, members",
+    _PARAMETER_ROWS,
+    ids=[f"{r[0]}-{r[1].rsplit('/', 1)[-1]}" for r in _PARAMETER_ROWS],
+)
+def test_s3_a_parameter_real_refuses_is_refused_with_reals_message_and_members(
+    live_server, method, path, status, message, members
+):
+    base_url, settings = live_server
+    r = _signed(base_url, path, settings.admin_token, method=method)
+    assert r.status_code == status
+    named = re.search(r"<Message>([^<]*)</Message>(.*)<RequestId>", r.text)
+    assert (named[1], named[2]) == (message, members)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/s3/eng-artifacts?versionId=x",
+        "/s3/eng-artifacts?website=v",
+        "/s3/eng-artifacts/runbooks/oncall.md?website=v",
+        "/s3/eng-artifacts/runbooks/oncall.md?annotationName=v",
+        "/s3/eng-artifacts?versions&max-keys=abc",
+        "/s3/eng-artifacts?versions&version-id-marker=x",
+        "/s3/eng-artifacts?versions&key-marker=a&version-id-marker=",
+    ],
+)
+def test_s3_what_a_parameter_is_refused_for_comes_before_the_credential(live_server, path):
+    """Real gave each of these its 400 unsigned and over a bad secret as well as signed (measured
+    2026-09-29); a HEAD naming it is the 400 without its body, `?versions`' own a HEAD reads as the
+    selector's 405 first."""
+    import httpx
+
+    base_url, settings = live_server
+    signed = _signed(base_url, path, settings.admin_token)
+    tampered_url, tampered = _sign_get(base_url, path, settings.admin_token, tamper=True)
+    for other in (httpx.get(f"{base_url}{path}"), httpx.get(tampered_url, headers=tampered)):
+        assert other.status_code == signed.status_code == 400, path
+        assert _without_request_ids(other.text) == _without_request_ids(signed.text), path
+    head = _signed(base_url, path, settings.admin_token, method="HEAD")
+    assert (head.status_code, head.content) == ((405, b"") if "versions" in path else (400, b""))
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/s3/eng-artifacts?versions&key-marker=a&version-id-marker=x",
+        "/s3/eng-artifacts?versions&encoding-type=bogus",
+        "/s3/eng-artifacts?versions&max-keys=-1",
+    ],
+)
+def test_s3_what_list_object_versions_refuses_after_the_bucket_comes_after_the_credential(
+    live_server, path
+):
+    """The other three of ListObjectVersions' refusals are real's after the bucket, so a signature
+    that does not verify is refused first, and an unsigned caller, who sees no bucket here, is told
+    there is none."""
+    import httpx
+
+    base_url, settings = live_server
+    assert _signed(base_url, path, settings.admin_token).status_code == 400
+    tampered_url, tampered = _sign_get(base_url, path, settings.admin_token, tamper=True)
+    assert "<Code>SignatureDoesNotMatch</Code>" in httpx.get(tampered_url, headers=tampered).text
+    assert "<Code>NoSuchBucket</Code>" in httpx.get(f"{base_url}{path}").text
+
+
+def test_s3_an_annotation_name_at_a_bucket_is_left_to_the_listing(live_server):
+    """Real signs `annotationName` at a bucket's path and answers the listing (2026-09-29)."""
+    base_url, settings = live_server
+    root = _get_xml(base_url, "/s3/eng-artifacts?annotationName=v", settings.admin_token)
+    assert root.tag == f"{NS}ListBucketResult"
 
 
 # Every kind of answer a HEAD gets, the token it is sent with ("tampered": signed, then the
@@ -1855,27 +2599,49 @@ def test_boto3_list_objects_paginator_walks_the_bucket_and_keeps_marker_and_owne
     assert "Owner" not in s3.list_objects_v2(Bucket="eng-artifacts", MaxKeys=1)["Contents"][0]
 
 
-def test_boto3_gets_one_client_error_instead_of_an_empty_answer_or_a_retried_500(live_server):
-    """The issue's own reproduction. Before the fix `get_bucket_versioning` returned `{}` and
-    `get_bucket_policy` returned the XML listing as the policy string, because botocore parsed the
-    listing as each operation's output; `get_object_tagging` and `list_parts` surfaced as a 500
-    after botocore's retries, because botocore's `_handle_200_error` could not parse the object's bytes
-    as XML. 501 is not a status botocore retries, so each is now one ClientError, at once."""
+def test_boto3_reads_a_bucket_configuration_and_gets_one_client_error_for_an_objects(live_server):
+    """What boto3 makes of each: a bucket's configurations parse to what they parse to on a bucket
+    nobody configured, the absent ones as the error botocore models for each, and an object's
+    sub-resource, which this server does not serve, is one ClientError at once — 501 is not a status
+    botocore retries, where the object's bytes under a 200 would be a 500 after its retries."""
     s3 = _boto3_client(live_server)
     from botocore.exceptions import ClientError
 
     bucket, key = "eng-artifacts", "runbooks/oncall.md"
-    for call in (
-        lambda: s3.get_bucket_versioning(Bucket=bucket),
-        lambda: s3.get_bucket_policy(Bucket=bucket),
-        lambda: s3.get_bucket_tagging(Bucket=bucket),
-        lambda: s3.get_object_tagging(Bucket=bucket, Key=key),
+    assert "Status" not in s3.get_bucket_versioning(Bucket=bucket)
+    assert s3.get_bucket_acl(Bucket=bucket)["Grants"][0]["Permission"] == "FULL_CONTROL"
+    rule = s3.get_bucket_encryption(Bucket=bucket)["ServerSideEncryptionConfiguration"]["Rules"][0]
+    assert rule["ApplyServerSideEncryptionByDefault"]["SSEAlgorithm"] == "AES256"
+    assert s3.get_public_access_block(Bucket=bucket)["PublicAccessBlockConfiguration"] == {
+        "BlockPublicAcls": True,
+        "IgnorePublicAcls": True,
+        "BlockPublicPolicy": True,
+        "RestrictPublicBuckets": True,
+    }
+    assert s3.get_bucket_request_payment(Bucket=bucket)["Payer"] == "BucketOwner"
+    assert s3.list_bucket_inventory_configurations(Bucket=bucket)["IsTruncated"] is False
+    versions = s3.list_object_versions(Bucket=bucket)["Versions"]
+    assert {(v["Key"], v["VersionId"], v["IsLatest"]) for v in versions} == {
+        (o["Key"], "null", True) for o in s3.list_objects_v2(Bucket=bucket)["Contents"]
+    }
+    for call, code in (
+        (lambda: s3.get_bucket_policy(Bucket=bucket), "NoSuchBucketPolicy"),
+        (lambda: s3.get_bucket_tagging(Bucket=bucket), "NoSuchTagSet"),
+        (lambda: s3.get_bucket_cors(Bucket=bucket), "NoSuchCORSConfiguration"),
+        (
+            lambda: s3.get_bucket_lifecycle_configuration(Bucket=bucket),
+            "NoSuchLifecycleConfiguration",
+        ),
     ):
         with pytest.raises(ClientError) as e:
             call()
-        assert e.value.response["Error"]["Code"] == "NotImplemented"
-        assert e.value.response["ResponseMetadata"]["HTTPStatusCode"] == 501
+        assert e.value.response["Error"]["Code"] == code
         assert e.value.response["ResponseMetadata"]["RetryAttempts"] == 0
+    with pytest.raises(ClientError) as e:
+        s3.get_object_tagging(Bucket=bucket, Key=key)
+    assert e.value.response["Error"]["Code"] == "NotImplemented"
+    assert e.value.response["ResponseMetadata"]["HTTPStatusCode"] == 501
+    assert e.value.response["ResponseMetadata"]["RetryAttempts"] == 0
     # No upload is ever in progress, so ListParts is real's answer for an upload id it lacks.
     with pytest.raises(s3.exceptions.NoSuchUpload) as e:
         s3.list_parts(Bucket=bucket, Key=key, UploadId="abc123")
@@ -1884,6 +2650,759 @@ def test_boto3_gets_one_client_error_instead_of_an_empty_answer_or_a_retried_500
     assert s3.get_bucket_location(Bucket=bucket)["LocationConstraint"] is None  # us-east-1
     assert key in {o["Key"] for o in s3.list_objects_v2(Bucket=bucket)["Contents"]}
     assert s3.get_object(Bucket=bucket, Key=key)["Body"].read() == OBJECT_TEXT
+
+
+# --- what real checks of a write before it performs it -----------------------------------------
+
+
+def _md5(body: bytes) -> str:
+    return base64.b64encode(hashlib.md5(body).digest()).decode()
+
+
+def _b64(raw: bytes) -> str:
+    return base64.b64encode(raw).decode()
+
+
+_GOOD_DELETE = b"<Delete><Object><Key>backlot-no-such-key</Key></Object></Delete>"
+_MALFORMED = (
+    "The XML you provided was not well-formed or did not validate against our published schema"
+)
+_MISSING_CHECKSUM = "Missing required header for this request: Content-MD5 OR x-amz-checksum-*"
+_USER_KEY = "User key must be specified."
+_KMS = "Requests modifying object encryption configuration to SSE-KMS require a"
+_BAD_KMS_FORMAT = (
+    "Invalid KMS Key ARN format. You must provide the full KMS Key ARN to make an "
+    "UpdateObjectEncryption request"
+)
+
+
+def _encryption(arn=None, bucket_key=None, kind="SSE-KMS") -> bytes:
+    inner = "" if arn is None else f"<KMSKeyArn>{arn}</KMSKeyArn>"
+    inner += "" if bucket_key is None else f"<BucketKeyEnabled>{bucket_key}</BucketKeyEnabled>"
+    return f"<ObjectEncryption><{kind}>{inner}</{kind}></ObjectEncryption>".encode()
+
+
+# The request, and real's answer: status, code, message and members (measured 2026-09-29 on a
+# bucket this account created, the public bucket, and a name nobody owns). A row whose answer is
+# 501 is one real performed, which is the write this server does not do.
+_WRITE_CHECK_ROWS = [
+    # A bucket's `POST ?restore`.
+    ("POST", "/s3/eng-artifacts?restore", None, {}, 400, "UserKeyMustBeSpecified", _USER_KEY, ""),
+    (
+        "POST",
+        "/s3/eng-artifacts?restore",
+        b"<RestoreRequest><Days>1</Days></RestoreRequest>",
+        {},
+        400,
+        "UserKeyMustBeSpecified",
+        _USER_KEY,
+        "",
+    ),
+    (
+        "POST",
+        "/s3/no-such-bucket?restore",
+        None,
+        {},
+        404,
+        "NoSuchBucket",
+        "The specified bucket does not exist",
+        "<BucketName>no-such-bucket</BucketName>",
+    ),
+    # DeleteObjects, at a bucket's path: the headers.
+    ("POST", "/s3/eng-artifacts?delete", None, {}, 400, "InvalidRequest", _MISSING_CHECKSUM, ""),
+    (
+        "POST",
+        "/s3/eng-artifacts?delete",
+        _GOOD_DELETE,
+        {},
+        400,
+        "InvalidRequest",
+        _MISSING_CHECKSUM,
+        "",
+    ),
+    (
+        "POST",
+        "/s3/eng-artifacts?delete",
+        None,
+        {"Content-MD5": _md5(b"")},
+        400,
+        "MissingRequestBodyError",
+        "Request Body is empty",
+        "",
+    ),
+    (
+        "POST",
+        "/s3/eng-artifacts?delete",
+        None,
+        {"x-amz-checksum-crc32": "AAAAAA=="},
+        400,
+        "MissingRequestBodyError",
+        "Request Body is empty",
+        "",
+    ),
+    (
+        "POST",
+        "/s3/eng-artifacts?delete",
+        None,
+        {"Content-MD5": "garbage"},
+        400,
+        "InvalidDigest",
+        "The Content-MD5 you specified was invalid.",
+        "<Content-MD5>garbage</Content-MD5>",
+    ),
+    (
+        "POST",
+        "/s3/eng-artifacts?delete",
+        _GOOD_DELETE,
+        {"Content-MD5": _b64(b"x" * 15)},
+        400,
+        "InvalidDigest",
+        "The Content-MD5 you specified was invalid.",
+        f"<Content-MD5>{_b64(b'x' * 15)}</Content-MD5>",
+    ),
+    (
+        "POST",
+        "/s3/eng-artifacts?delete",
+        _GOOD_DELETE,
+        {"Content-MD5": ""},
+        400,
+        "InvalidDigest",
+        "The Content-MD5 you specified was invalid.",
+        "<Content-MD5></Content-MD5>",
+    ),
+    (
+        "POST",
+        "/s3/eng-artifacts?delete",
+        _GOOD_DELETE,
+        {"x-amz-checksum-crc32": "garbage"},
+        400,
+        "InvalidRequest",
+        "Value for x-amz-checksum-crc32 header is invalid.",
+        "",
+    ),
+    (
+        "POST",
+        "/s3/eng-artifacts?delete",
+        _GOOD_DELETE,
+        {"x-amz-checksum-crc32": _b64(b"xxx")},
+        400,
+        "InvalidRequest",
+        "Value for x-amz-checksum-crc32 header is invalid.",
+        "",
+    ),
+    (
+        "POST",
+        "/s3/eng-artifacts?delete",
+        _GOOD_DELETE,
+        {"x-amz-checksum-crc32": ""},
+        400,
+        "InvalidRequest",
+        "Value for x-amz-checksum-crc32 header is invalid.",
+        "",
+    ),
+    *[
+        (
+            "POST",
+            "/s3/eng-artifacts?delete",
+            _GOOD_DELETE,
+            {f"x-amz-checksum-{name}": "garbage"},
+            400,
+            "InvalidRequest",
+            f"Value for x-amz-checksum-{name} header is invalid.",
+            "",
+        )
+        for name in (
+            "crc32c",
+            "crc64nvme",
+            "sha1",
+            "sha256",
+            "sha512",
+            "md5",
+            "xxhash64",
+            "xxhash3",
+        )
+    ],
+    (
+        "POST",
+        "/s3/eng-artifacts?delete",
+        _GOOD_DELETE,
+        {"x-amz-checksum-foo": "abc"},
+        400,
+        "InvalidRequest",
+        "The algorithm type you specified in x-amz-checksum- header is invalid.",
+        "",
+    ),
+    (
+        "POST",
+        "/s3/eng-artifacts?delete",
+        None,
+        {"x-amz-checksum-foo": "x"},
+        400,
+        "InvalidRequest",
+        "The algorithm type you specified in x-amz-checksum- header is invalid.",
+        "",
+    ),
+    (
+        "POST",
+        "/s3/eng-artifacts?delete",
+        _GOOD_DELETE,
+        {"x-amz-checksum-type": "FULL_OBJECT"},
+        400,
+        "InvalidRequest",
+        _MISSING_CHECKSUM,
+        "",
+    ),
+    (
+        "POST",
+        "/s3/eng-artifacts?delete",
+        _GOOD_DELETE,
+        {"x-amz-checksum-algorithm": "CRC32"},
+        400,
+        "InvalidRequest",
+        _MISSING_CHECKSUM,
+        "",
+    ),
+    (
+        "POST",
+        "/s3/eng-artifacts?delete",
+        _GOOD_DELETE,
+        {"x-amz-sdk-checksum-algorithm": "CRC32"},
+        400,
+        "InvalidRequest",
+        "x-amz-sdk-checksum-algorithm specified, but no corresponding x-amz-checksum-* or x-amz-trailer headers were found.",
+        "",
+    ),
+    (
+        "POST",
+        "/s3/eng-artifacts?delete",
+        _GOOD_DELETE,
+        {
+            "x-amz-checksum-crc32": _b64(zlib.crc32(_GOOD_DELETE).to_bytes(4, "big")),
+            "x-amz-checksum-sha256": _b64(b"x" * 32),
+        },
+        400,
+        "InvalidRequest",
+        "Expecting a single x-amz-checksum- header. Multiple checksum Types are not allowed.",
+        "",
+    ),
+    # ... and the pairs among them.
+    (
+        "POST",
+        "/s3/eng-artifacts?delete",
+        None,
+        {"x-amz-checksum-crc32": "garbage"},
+        400,
+        "InvalidRequest",
+        "Value for x-amz-checksum-crc32 header is invalid.",
+        "",
+    ),
+    (
+        "POST",
+        "/s3/eng-artifacts?delete",
+        b"garbage",
+        {"x-amz-checksum-crc32": "garbage"},
+        400,
+        "InvalidRequest",
+        "Value for x-amz-checksum-crc32 header is invalid.",
+        "",
+    ),
+    (
+        "POST",
+        "/s3/eng-artifacts?delete",
+        _GOOD_DELETE,
+        {"x-amz-checksum-crc32": "garbage", "Content-MD5": "garbage"},
+        400,
+        "InvalidRequest",
+        "Value for x-amz-checksum-crc32 header is invalid.",
+        "",
+    ),
+    (
+        "POST",
+        "/s3/eng-artifacts?delete&acl",
+        _GOOD_DELETE,
+        {"Content-MD5": "garbage"},
+        400,
+        "InvalidArgument",
+        "Conflicting query string parameters: acl, delete",
+        "<ArgumentName>ResourceType</ArgumentName><ArgumentValue>acl</ArgumentValue>",
+    ),
+    (
+        "POST",
+        "/s3/no-such-bucket?delete",
+        _GOOD_DELETE,
+        {"Content-MD5": "garbage"},
+        404,
+        "NoSuchBucket",
+        "The specified bucket does not exist",
+        "<BucketName>no-such-bucket</BucketName>",
+    ),
+    # The body.
+    *[
+        (
+            "POST",
+            "/s3/eng-artifacts?delete",
+            body,
+            {"Content-MD5": _md5(body)},
+            400,
+            "MalformedXML",
+            _MALFORMED,
+            "",
+        )
+        for body in (
+            b"<Delete/>",
+            b"<Delete><Quiet>true</Quiet></Delete>",
+            b"<Delete><Object/></Delete>",
+            b"<Delete><Object><Key>k</Key></Object><Nope/></Delete>",
+            b"<Delete><Object><Key>k</Key><Nope/></Object></Delete>",
+            b"<Delete><Object><Key>k</Key><Key>j</Key></Object></Delete>",
+            b"<Delete><Object><Key>k</Key><Size>1</Size></Object></Delete>",
+            b"<Delete><Object><Key>k</Key><LastModifiedTime>2020-01-01T00:00:00Z</LastModifiedTime></Object></Delete>",
+            b"<Delete><Object><Key>k</Key></Object><Quiet>true</Quiet><Quiet>true</Quiet></Delete>",
+            b"<Delete>" + b"<Object><Key>x</Key></Object>" * 1001 + b"</Delete>",
+            b"garbage",
+        )
+    ],
+    (
+        "POST",
+        "/s3/eng-artifacts?delete",
+        b"garbage",
+        {"Content-MD5": _md5(b"other")},
+        400,
+        "MalformedXML",
+        _MALFORMED,
+        "",
+    ),
+    (
+        "POST",
+        "/s3/eng-artifacts?delete",
+        b"<Delete><Object><Key></Key></Object></Delete>",
+        {"Content-MD5": _md5(b"other")},
+        400,
+        "UserKeyMustBeSpecified",
+        _USER_KEY,
+        "",
+    ),
+    (
+        "POST",
+        "/s3/eng-artifacts?delete",
+        b"<Delete><Object><Key>x</Key></Object><Object><Key></Key></Object></Delete>",
+        {
+            "Content-MD5": _md5(
+                b"<Delete><Object><Key>x</Key></Object><Object><Key></Key></Object></Delete>"
+            )
+        },
+        400,
+        "UserKeyMustBeSpecified",
+        _USER_KEY,
+        "",
+    ),
+    (
+        "POST",
+        "/s3/eng-artifacts?delete",
+        _GOOD_DELETE,
+        {"Content-MD5": _md5(b"other")},
+        400,
+        "BadDigest",
+        "The Content-MD5 you specified did not match what we received.",
+        f"<CalculatedDigest>{_md5(_GOOD_DELETE)}</CalculatedDigest><ExpectedDigest>{_md5(b'other')}</ExpectedDigest>",
+    ),
+    (
+        "POST",
+        "/s3/eng-artifacts?delete",
+        _GOOD_DELETE,
+        {
+            "x-amz-checksum-crc32": _b64(zlib.crc32(_GOOD_DELETE).to_bytes(4, "big")),
+            "Content-MD5": _md5(b"o"),
+        },
+        400,
+        "BadDigest",
+        "The Content-MD5 you specified did not match what we received.",
+        f"<CalculatedDigest>{_md5(_GOOD_DELETE)}</CalculatedDigest><ExpectedDigest>{_md5(b'o')}</ExpectedDigest>",
+    ),
+    *[
+        (
+            "POST",
+            "/s3/eng-artifacts?delete",
+            _GOOD_DELETE,
+            {f"x-amz-checksum-{name}": _b64(b"x" * width)},
+            400,
+            "BadDigest",
+            f"The {name.upper()} you specified did not match the calculated checksum.",
+            "",
+        )
+        for name, width in (
+            ("crc32", 4),
+            ("crc32c", 4),
+            ("crc64nvme", 8),
+            ("sha1", 20),
+            ("sha256", 32),
+            ("sha512", 64),
+            ("md5", 16),
+        )
+    ],
+    # What real performed.
+    *[
+        (
+            "POST",
+            "/s3/eng-artifacts?delete",
+            body,
+            {"Content-MD5": _md5(body)},
+            501,
+            "NotImplemented",
+            "A method you provided writes to the corpus, which this server does not implement: POST",
+            "",
+        )
+        for body in (
+            _GOOD_DELETE,
+            b'<Delete xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Object><Key>k</Key></Object></Delete>',
+            b'<Delete xmlns="urn:x"><Object><Key>k</Key></Object></Delete>',
+            b"<Delete><Quiet>true</Quiet><Object><Key>k</Key></Object></Delete>",
+            b"<Delete><Object><Key>k</Key></Object><Quiet>maybe</Quiet></Delete>",
+            b"<Delete><Object><VersionId>null</VersionId><Key>k</Key><ETag>x</ETag></Object></Delete>",
+            b'<?xml version="1.0" encoding="UTF-8"?><Delete><Object><Key>k</Key></Object></Delete>',
+            b"<Delete>" + b"<Object><Key>k</Key></Object>" * 1000 + b"</Delete>",
+        )
+    ],
+    (
+        "POST",
+        "/s3/eng-artifacts?delete",
+        _GOOD_DELETE,
+        {
+            "x-amz-checksum-crc32": _b64(zlib.crc32(_GOOD_DELETE).to_bytes(4, "big")),
+            "x-amz-checksum-type": "FULL_OBJECT",
+        },
+        501,
+        "NotImplemented",
+        "A method you provided writes to the corpus, which this server does not implement: POST",
+        "",
+    ),
+    # A key's `POST ?delete` is the bucket's DeleteObjects, whatever the key.
+    (
+        "POST",
+        "/s3/eng-artifacts/runbooks/oncall.md?delete",
+        None,
+        {},
+        400,
+        "InvalidRequest",
+        _MISSING_CHECKSUM,
+        "",
+    ),
+    (
+        "POST",
+        "/s3/eng-artifacts/no/such.md?delete",
+        None,
+        {},
+        400,
+        "InvalidRequest",
+        _MISSING_CHECKSUM,
+        "",
+    ),
+    (
+        "POST",
+        "/s3/eng-artifacts/runbooks/oncall.md?delete",
+        b"<x/>",
+        {"Content-MD5": _md5(b"<x/>")},
+        400,
+        "MalformedXML",
+        _MALFORMED,
+        "",
+    ),
+    # A key's `PUT ?encryption`.
+    (
+        "PUT",
+        "/s3/eng-artifacts/runbooks/oncall.md?encryption",
+        None,
+        {},
+        400,
+        "MissingRequestBodyError",
+        "Request Body is empty",
+        "",
+    ),
+    (
+        "PUT",
+        "/s3/eng-artifacts/no/such.md?encryption",
+        None,
+        {},
+        400,
+        "MissingRequestBodyError",
+        "Request Body is empty",
+        "",
+    ),
+    (
+        "PUT",
+        "/s3/eng-artifacts/runbooks/oncall.md?encryption",
+        None,
+        {"Content-MD5": "garbage"},
+        400,
+        "InvalidDigest",
+        "The Content-MD5 you specified was invalid.",
+        "<Content-MD5>garbage</Content-MD5>",
+    ),
+    *[
+        (
+            "PUT",
+            "/s3/eng-artifacts/runbooks/oncall.md?encryption",
+            body,
+            {},
+            400,
+            "MalformedXML",
+            _MALFORMED,
+            "",
+        )
+        for body in (
+            b"<x/>",
+            b"garbage",
+            b"<ObjectEncryption/>",
+            b"<ObjectEncryption><Nope/></ObjectEncryption>",
+            _encryption(),
+            _encryption(kind="SSE-C"),
+            b"<ObjectEncryption><SSE-S3/><SSE-KMS><KMSKeyArn>x</KMSKeyArn></SSE-KMS></ObjectEncryption>",
+            b"<ObjectEncryption><SSE-KMS><KMSKeyArn>a</KMSKeyArn></SSE-KMS><SSE-KMS><KMSKeyArn>b</KMSKeyArn></SSE-KMS></ObjectEncryption>",
+            b"<ObjectEncryption><SSE-KMS><KMSKeyArn>a</KMSKeyArn><KMSKeyArn>a</KMSKeyArn></SSE-KMS></ObjectEncryption>",
+            b"<ObjectEncryption><SSE-S3><x/></SSE-S3></ObjectEncryption>",
+        )
+    ],
+    (
+        "PUT",
+        "/s3/eng-artifacts/no/such.md?encryption",
+        b"<ObjectEncryption/>",
+        {},
+        400,
+        "MalformedXML",
+        _MALFORMED,
+        "",
+    ),
+    (
+        "PUT",
+        "/s3/eng-artifacts/runbooks/oncall.md?encryption",
+        b"<x/>",
+        {"Content-MD5": _md5(b"o")},
+        400,
+        "MalformedXML",
+        _MALFORMED,
+        "",
+    ),
+    (
+        "PUT",
+        "/s3/eng-artifacts/runbooks/oncall.md?encryption",
+        b"<ObjectEncryption><SSE-S3/></ObjectEncryption>",
+        {"Content-MD5": _md5(b"o")},
+        400,
+        "BadDigest",
+        "The Content-MD5 you specified did not match what we received.",
+        f"<CalculatedDigest>{_md5(b'<ObjectEncryption><SSE-S3/></ObjectEncryption>')}</CalculatedDigest><ExpectedDigest>{_md5(b'o')}</ExpectedDigest>",
+    ),
+    (
+        "PUT",
+        "/s3/eng-artifacts/no/such.md?encryption",
+        b"<ObjectEncryption><SSE-S3/></ObjectEncryption>",
+        {"Content-MD5": _md5(b"o")},
+        400,
+        "BadDigest",
+        "The Content-MD5 you specified did not match what we received.",
+        f"<CalculatedDigest>{_md5(b'<ObjectEncryption><SSE-S3/></ObjectEncryption>')}</CalculatedDigest><ExpectedDigest>{_md5(b'o')}</ExpectedDigest>",
+    ),
+    (
+        "PUT",
+        "/s3/eng-artifacts/no/such.md?encryption",
+        b"<ObjectEncryption><SSE-S3/></ObjectEncryption>",
+        {},
+        404,
+        "NoSuchKey",
+        "The specified key does not exist.",
+        "<Key>eng-artifacts/no/such.md</Key>",
+    ),
+    (
+        "PUT",
+        "/s3/eng-artifacts/no/such.md?encryption",
+        _encryption("arn:aws:kms:us-east-1:111111111111:key/x"),
+        {},
+        404,
+        "NoSuchKey",
+        "The specified key does not exist.",
+        "<Key>eng-artifacts/no/such.md</Key>",
+    ),
+    (
+        "PUT",
+        "/s3/eng-artifacts/runbooks/oncall.md?encryption",
+        b"<ObjectEncryption><SSE-S3/></ObjectEncryption>",
+        {},
+        400,
+        "InvalidRequest",
+        "Target encryption type 'SSE-S3' is not supported.",
+        "",
+    ),
+    (
+        "PUT",
+        "/s3/eng-artifacts/runbooks/oncall.md?encryption",
+        _encryption(""),
+        {},
+        400,
+        "InvalidRequest",
+        f"{_KMS} target kms key arn.",
+        "",
+    ),
+    (
+        "PUT",
+        "/s3/eng-artifacts/runbooks/oncall.md?encryption",
+        _encryption("", "maybe"),
+        {},
+        400,
+        "InvalidRequest",
+        f"{_KMS} target kms key arn.",
+        "",
+    ),
+    *[
+        (
+            "PUT",
+            "/s3/eng-artifacts/runbooks/oncall.md?encryption",
+            _encryption(arn, bucket_key),
+            {},
+            400,
+            "InvalidRequest",
+            f"{_KMS} valid target kms key arn: {fault}",
+            "",
+        )
+        for arn, bucket_key, fault in (
+            ("garbage", None, "Malformed ARN - doesn't start with 'arn:'"),
+            ("garbage", "maybe", "Malformed ARN - doesn't start with 'arn:'"),
+            (
+                " arn:aws:kms:us-east-1:111111111111:key/x ",
+                None,
+                "Malformed ARN - doesn't start with 'arn:'",
+            ),
+            ("arn:", None, "Malformed ARN - no AWS partition specified"),
+            ("arn:aws:kms", None, "Malformed ARN - no service specified"),
+            ("arn:aws:kms:", None, "Malformed ARN - no AWS region partition specified"),
+            ("arn:aws:kms:us-east-1:", None, "Malformed ARN - no AWS account specified"),
+            ("arn:aws:kms:us-east-1:111:", None, "Malformed ARN - no resource specified"),
+            ("arn:aws:kms:us-east-1:111111111111:key/", None, "resource cannot be empty"),
+        )
+    ],
+    (
+        "PUT",
+        "/s3/eng-artifacts/runbooks/oncall.md?encryption",
+        _encryption("arn:aws:kms:us-east-1:111111111111:alias/x", "maybe"),
+        {},
+        400,
+        "InvalidRequest",
+        _BAD_KMS_FORMAT,
+        "",
+    ),
+    (
+        "PUT",
+        "/s3/eng-artifacts/runbooks/oncall.md?encryption",
+        _encryption("arn:aws:s3:::x"),
+        {},
+        400,
+        "InvalidRequest",
+        _BAD_KMS_FORMAT,
+        "",
+    ),
+    (
+        "PUT",
+        "/s3/eng-artifacts/runbooks/oncall.md?encryption",
+        _encryption("arn:aws:kms:us-east-1:111111111111:key/x", "maybe"),
+        {},
+        400,
+        "InvalidRequest",
+        "BucketKeyEnabled must be 'true' or 'false'. Invalid value: maybe",
+        "",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "method, path, body, headers, status, code, message, members",
+    _WRITE_CHECK_ROWS,
+    ids=[f"{i}-{r[0]}-{r[1].rsplit('?', 1)[-1]}-{r[5]}" for i, r in enumerate(_WRITE_CHECK_ROWS)],
+)
+def test_s3_a_write_is_checked_as_real_checks_it_before_the_501(
+    live_server, method, path, body, headers, status, code, message, members
+):
+    base_url, settings = live_server
+    r = _signed(
+        base_url, path, settings.admin_token, method=method, body=body, extra_headers=headers
+    )
+    assert r.status_code == status
+    named = re.search(r"<Code>([^<]+)</Code><Message>([^<]*)</Message>(.*)<RequestId>", r.text)
+    assert (named[1], named[2], named[3]) == (code, message, members)
+
+
+def test_s3_a_write_is_checked_once_the_bucket_is_one_the_caller_can_see(live_server):
+    """The checks come after the bucket, so a caller who cannot see it, and an unsigned one, is told
+    there is none whatever the body says (see ``test_s3_a_request_in_a_bucket_the_caller_cannot_see``)."""
+    import httpx
+
+    base_url, settings = live_server
+    tokens = {
+        u["email"]: u["token"] for u in yaml.safe_load(settings.tokens_path.read_text())["users"]
+    }
+    for method, path in (
+        ("POST", "/s3/people-vault?restore"),
+        ("POST", "/s3/people-vault/comp/bands.csv?delete"),
+        ("PUT", "/s3/people-vault/comp/bands.csv?encryption"),
+    ):
+        scoped = _signed(
+            base_url,
+            path,
+            tokens["ava@acme.com"],
+            method=method,
+            extra_headers={"Content-MD5": "garbage"},
+        )
+        assert (
+            scoped.status_code == 404 and "<BucketName>people-vault</BucketName>" in scoped.text
+        ), path
+        unsigned = httpx.request(method, f"{base_url}{path}", headers={"Content-MD5": "garbage"})
+        assert "<Code>NoSuchBucket</Code>" in unsigned.text, path
+        admin = _signed(
+            base_url,
+            path,
+            settings.admin_token,
+            method=method,
+            extra_headers={"Content-MD5": "garbage"},
+        )
+        assert admin.status_code == 400, path
+
+
+def test_s3_an_encryption_write_signed_with_signature_version_2_is_refused_for_it(live_server):
+    """Real refused UpdateObjectEncryption signed with V2, with a body and without, where the same
+    request signed with V4 is checked for its body (2026-09-29). Signed here by hand: botocore's V2
+    signer leaves `?encryption` out of the string it signs, and real, which signs it, refused
+    botocore's signature as a mismatch."""
+    import hmac as _hmac
+
+    import httpx
+
+    base_url, settings = live_server
+    secret = synth.s3_secret_access_key(settings.admin_token)
+    for body, content_type in ((None, ""), (b"<x/>", "application/xml")):
+        date = _http_date()
+        to_sign = f"PUT\n\n{content_type}\n{date}\n{OBJECT_PATH}?encryption"
+        sig = base64.b64encode(_hmac.new(secret.encode(), to_sign.encode(), hashlib.sha1).digest())
+        headers = {
+            "Date": date,
+            "Authorization": f"AWS {synth.s3_access_key_id(settings.admin_token)}:{sig.decode()}",
+        }
+        if content_type:
+            headers["Content-Type"] = content_type
+        r = httpx.put(f"{base_url}{OBJECT_PATH}?encryption", headers=headers, content=body)
+        assert r.status_code == 400, r.text
+        assert (
+            "<Message>Requests modifying object encryption configuration require AWS Signature "
+            "Version 4.</Message>" in r.text
+        )
+
+
+@pytest.mark.parametrize(
+    "crc, check",
+    [("_CRC32C", "e3069283"), ("_CRC64NVME", "ae8b14860a799888")],
+)
+def test_the_crcs_s3_checks_a_delete_with_are_the_standard_ones(crc, check):
+    """CRC-32C and CRC-64/NVME's published check values over `123456789`."""
+    from backlot.routers import s3 as s3_router
+
+    assert s3_router._reflected_crc(b"123456789", getattr(s3_router, crc)).hex() == check
 
 
 # --- the SigV4 verifier (backlot/sigv4.py) — S3 is its only caller ------------------------------------
@@ -2148,11 +3667,26 @@ def _now(minutes: int = 0) -> str:
     return (datetime.now(timezone.utc) + timedelta(minutes=minutes)).strftime(AMZ_DATE_FORMAT)
 
 
-def _v4(akid: str, date: str, service: str = "s3", terminal: str = "aws4_request") -> str:
+def _v4(
+    akid: str, date: str, service: str = "s3", terminal: str = "aws4_request", region="us-east-1"
+) -> str:
     return (
-        f"AWS4-HMAC-SHA256 Credential={akid}/{date[:8]}/us-east-1/{service}/{terminal}, "
+        f"AWS4-HMAC-SHA256 Credential={akid}/{date[:8]}/{region}/{service}/{terminal}, "
         "SignedHeaders=host;x-amz-date, Signature=00"
     )
+
+
+def _http_date(minutes: int = 0) -> str:
+    """A `Date` header's value, RFC 1123, ``minutes`` from now."""
+    from email.utils import formatdate
+
+    return formatdate(
+        (datetime.now(timezone.utc) + timedelta(minutes=minutes)).timestamp(), usegmt=True
+    )
+
+
+def _epoch(minutes: int = 0) -> str:
+    return str(int((datetime.now(timezone.utc) + timedelta(minutes=minutes)).timestamp()))
 
 
 def _query(**params) -> str:
@@ -2173,10 +3707,25 @@ _WEEK = (
     "X-Amz-Expires must be less than a week (in seconds); that is, the given X-Amz-Expires must "
     "be less than 604800 seconds"
 )
+_WRONG_REGION = "the region 'us-west-2' is wrong; expecting 'us-east-1'"
+_NO_REGION = "a non-empty region must be provided in the credential."
+_QUERY_CREDENTIAL = "Error parsing the X-Amz-Credential parameter; "
+_ONE_MECHANISM = (
+    "Only one auth mechanism allowed; only the X-Amz-Algorithm query parameter, Signature query "
+    "string parameter or the Authorization header should be specified"
+)
+_NO_SPACE = "Authorization header is invalid -- one and only one ' ' (space) required"
+_V2_FORMAT = "AWS authorization header is invalid.  Expected AwsAccessKeyId:signature"
+_V2_QUERY_PARAMETERS = (
+    "Query-string authentication requires the Signature, Expires and AWSAccessKeyId parameters"
+)
+_NOT_A_DATE = "Invalid date (should be seconds since epoch): "
 
 
-def _presign(date: str, expires="60", credential=None, **extra) -> str:
-    """A presign's query with every parameter present, the scope dated `date` unless given."""
+def _presign(date: str, expires="3600", credential=None, **extra) -> str:
+    """A presign's query with every parameter present, the scope dated `date` unless given. The
+    rows below are built when the module is imported, so the default lifetime is an hour, long
+    enough for a serial run to reach them unexpired; a row that is to expire says so."""
     return _query(
         X_Amz_Algorithm="AWS4-HMAC-SHA256",
         X_Amz_Credential=credential or f"{AK}/{date[:8]}/us-east-1/s3/aws4_request",
@@ -2368,7 +3917,7 @@ _REFUSAL_ROWS_UNIT = [
     (
         "expiry first",
         {},
-        _presign(_now(-600), credential="garbage"),
+        _presign(_now(-600), expires="60", credential="garbage"),
         "AccessDenied",
         "Request has expired",
     ),
@@ -2402,6 +3951,297 @@ _REFUSAL_ROWS_UNIT = [
         "InvalidAccessKeyId",
         _NO_KEY,
     ),
+    # The region, which is the one this server presents, header and query alike.
+    (
+        "region",
+        {"x-amz-date": _now(), "authorization": _v4(AK, _now(), region="us-west-2")},
+        "",
+        "AuthorizationHeaderMalformed",
+        _MALFORMED + _WRONG_REGION,
+    ),
+    (
+        "region in capitals",
+        {"x-amz-date": _now(), "authorization": _v4(AK, _now(), region="US-EAST-1")},
+        "",
+        "AuthorizationHeaderMalformed",
+        _MALFORMED + "the region 'US-EAST-1' is wrong; expecting 'us-east-1'",
+    ),
+    (
+        "region empty",
+        {"x-amz-date": _now(), "authorization": _v4(AK, _now(), region="")},
+        "",
+        "AuthorizationHeaderMalformed",
+        _MALFORMED + _NO_REGION,
+    ),
+    (
+        "region before the key",
+        {"x-amz-date": _now(), "authorization": _v4(_UNKNOWN, _now(), region="us-west-2")},
+        "",
+        "AuthorizationHeaderMalformed",
+        _MALFORMED + _WRONG_REGION,
+    ),
+    (
+        "region before the service",
+        {"x-amz-date": _now(), "authorization": _v4(AK, _now(), service="ec2", region="us-west-2")},
+        "",
+        "AuthorizationHeaderMalformed",
+        _MALFORMED + _WRONG_REGION,
+    ),
+    (
+        "region before the scope date",
+        {"x-amz-date": _now(), "authorization": _v4(AK, "20200101", region="us-west-2")},
+        "",
+        "AuthorizationHeaderMalformed",
+        _MALFORMED + _WRONG_REGION,
+    ),
+    (
+        "skew before the region",
+        {"x-amz-date": _now(-30), "authorization": _v4(AK, _now(-30), region="us-west-2")},
+        "",
+        "RequestTimeTooSkewed",
+        _SKEWED,
+    ),
+    (
+        "date before the region",
+        {"authorization": _v4(AK, _now(), region="us-west-2")},
+        "",
+        "AccessDenied",
+        _NO_DATE,
+    ),
+    (
+        "query region",
+        {},
+        _presign(_now(), credential=f"{AK}/{_now()[:8]}/us-west-2/s3/aws4_request"),
+        "AuthorizationQueryParametersError",
+        _QUERY_CREDENTIAL + _WRONG_REGION,
+    ),
+    (
+        "query region before the key",
+        {},
+        _presign(_now(), credential=f"{_UNKNOWN}/{_now()[:8]}/us-west-2/s3/aws4_request"),
+        "AuthorizationQueryParametersError",
+        _QUERY_CREDENTIAL + _WRONG_REGION,
+    ),
+    (
+        "query region before the service",
+        {},
+        _presign(_now(), credential=f"{AK}/{_now()[:8]}/us-west-2/ec2/aws4_request"),
+        "AuthorizationQueryParametersError",
+        _QUERY_CREDENTIAL + _WRONG_REGION,
+    ),
+    (
+        "query region before the scope date",
+        {},
+        _presign(_now(), credential=f"{AK}/20200101/us-west-2/s3/aws4_request"),
+        "AuthorizationQueryParametersError",
+        _QUERY_CREDENTIAL + _WRONG_REGION,
+    ),
+    (
+        "query expiry before the region",
+        {},
+        _presign(
+            _now(-120), expires="60", credential=f"{AK}/{_now(-120)[:8]}/us-west-2/s3/aws4_request"
+        ),
+        "AccessDenied",
+        "Request has expired",
+    ),
+    (
+        "query a week before the region",
+        {},
+        _presign(
+            _now(), expires="604801", credential=f"{AK}/{_now()[:8]}/us-west-2/s3/aws4_request"
+        ),
+        "AuthorizationQueryParametersError",
+        _WEEK,
+    ),
+    (
+        "query region empty",
+        {},
+        _presign(_now(), credential=f"{AK}/{_now()[:8]}//s3/aws4_request"),
+        "AuthorizationQueryParametersError",
+        _QUERY_CREDENTIAL + _NO_REGION,
+    ),
+    # Signature Version 2 in the header, one fault at a time and the pairs measured.
+    (
+        "v2 no colon",
+        {"date": _http_date(), "authorization": "AWS garbage"},
+        "",
+        "InvalidArgument",
+        _V2_FORMAT,
+    ),
+    (
+        "v2 empty signature",
+        {"date": _http_date(), "authorization": f"AWS {AK}:"},
+        "",
+        "InvalidArgument",
+        _V2_FORMAT,
+    ),
+    (
+        "v2 two colons",
+        {"date": _http_date(), "authorization": f"AWS {AK}:a:b"},
+        "",
+        "InvalidArgument",
+        _V2_FORMAT,
+    ),
+    (
+        "v2 format before the date",
+        {"authorization": "AWS garbage"},
+        "",
+        "InvalidArgument",
+        _V2_FORMAT,
+    ),
+    (
+        "v2 two spaces",
+        {"date": _http_date(), "authorization": f"AWS  {AK}:abc"},
+        "",
+        "InvalidArgument",
+        _NO_SPACE,
+    ),
+    ("v2 no date", {"authorization": f"AWS {_UNKNOWN}:abc"}, "", "AccessDenied", _NO_DATE),
+    ("v2 empty key after the date", {"authorization": "AWS :abc"}, "", "AccessDenied", _NO_DATE),
+    (
+        "v2 bad date",
+        {"date": "garbage", "authorization": f"AWS {_UNKNOWN}:abc"},
+        "",
+        "AccessDenied",
+        _NO_DATE,
+    ),
+    (
+        "v2 x-amz-date read over Date",
+        {"x-amz-date": "garbage", "date": _http_date(), "authorization": f"AWS {_UNKNOWN}:abc"},
+        "",
+        "AccessDenied",
+        _NO_DATE,
+    ),
+    (
+        "v2 skew before the key",
+        {"date": _http_date(-30), "authorization": f"AWS {_UNKNOWN}:abc"},
+        "",
+        "RequestTimeTooSkewed",
+        _SKEWED,
+    ),
+    (
+        "v2 x-amz-date skewed over Date",
+        {
+            "x-amz-date": _http_date(-30),
+            "date": _http_date(),
+            "authorization": f"AWS {_UNKNOWN}:abc",
+        },
+        "",
+        "RequestTimeTooSkewed",
+        _SKEWED,
+    ),
+    (
+        "v2 unknown key",
+        {"date": _http_date(), "authorization": f"AWS {_UNKNOWN}:abc"},
+        "",
+        "InvalidAccessKeyId",
+        _NO_KEY,
+    ),
+    (
+        "v2 beside X-Amz-Algorithm",
+        {"authorization": "AWS garbage"},
+        "X-Amz-Algorithm=x",
+        "InvalidArgument",
+        _ONE_MECHANISM,
+    ),
+    (
+        "v2 beside Signature",
+        {"date": _http_date(), "authorization": f"AWS {AK}:abc"},
+        "Signature=abc",
+        "InvalidArgument",
+        _ONE_MECHANISM,
+    ),
+    (
+        "v4 beside Signature",
+        {"authorization": "AWS4-HMAC-SHA256 x"},
+        "Signature=abc",
+        "InvalidArgument",
+        _ONE_MECHANISM,
+    ),
+    # And in the query.
+    (
+        "v2 query beside X-Amz-Algorithm",
+        {},
+        _query(
+            Signature="abc",
+            AWSAccessKeyId=AK,
+            Expires="9999999999",
+            X_Amz_Algorithm="AWS4-HMAC-SHA256",
+        ),
+        "InvalidArgument",
+        _ONE_MECHANISM,
+    ),
+    (
+        "v2 query without Expires",
+        {},
+        _query(Signature="abc", AWSAccessKeyId=_UNKNOWN),
+        "AccessDenied",
+        _V2_QUERY_PARAMETERS,
+    ),
+    (
+        "v2 query without a key",
+        {},
+        _query(Signature="abc", Expires=_epoch(60)),
+        "AccessDenied",
+        _V2_QUERY_PARAMETERS,
+    ),
+    (
+        "v2 query Expires a word",
+        {},
+        _query(Signature="abc", AWSAccessKeyId=_UNKNOWN, Expires="garbage"),
+        "AccessDenied",
+        _NOT_A_DATE + "garbage",
+    ),
+    (
+        "v2 query Expires past an int32",
+        {},
+        _query(Signature="abc", AWSAccessKeyId=_UNKNOWN, Expires="2147483648"),
+        "AccessDenied",
+        _NOT_A_DATE + "2147483648",
+    ),
+    (
+        "v2 query Expires 1e9",
+        {},
+        _query(Signature="abc", AWSAccessKeyId=_UNKNOWN, Expires="1e9"),
+        "AccessDenied",
+        _NOT_A_DATE + "1e9",
+    ),
+    (
+        "v2 query Expires with a space",
+        {},
+        _query(Signature="abc", AWSAccessKeyId=_UNKNOWN, Expires=" 1"),
+        "AccessDenied",
+        _NOT_A_DATE + " 1",
+    ),
+    (
+        "v2 query expiry before the key",
+        {},
+        _query(Signature="abc", AWSAccessKeyId=_UNKNOWN, Expires=_epoch(-2)),
+        "AccessDenied",
+        "Request has expired",
+    ),
+    (
+        "v2 query Expires -1",
+        {},
+        _query(Signature="abc", AWSAccessKeyId=_UNKNOWN, Expires="-1"),
+        "AccessDenied",
+        "Request has expired",
+    ),
+    (
+        "v2 query Expires with a leading zero",
+        {},
+        _query(Signature="abc", AWSAccessKeyId=_UNKNOWN, Expires="0" + _epoch(60)),
+        "InvalidAccessKeyId",
+        _NO_KEY,
+    ),
+    (
+        "v2 query unknown key",
+        {},
+        _query(Signature="abc", AWSAccessKeyId=_UNKNOWN, Expires=_epoch(60)),
+        "InvalidAccessKeyId",
+        _NO_KEY,
+    ),
 ]
 
 
@@ -2419,19 +4259,472 @@ def test_a_credential_real_refuses_is_refused_with_reals_code_and_message(
         _request("GET", "/s3/eng-artifacts", query, {"host": "backlot", **headers})
     )
     assert caller is None and (err.code, err.message) == (code, message)
-    if code == "InvalidArgument":
+    if code == "InvalidArgument" and "authorization" in headers:
         assert dict(err.members) == {
             "ArgumentName": "Authorization",
             "ArgumentValue": headers["authorization"],
         }
+    elif code == "InvalidArgument":
+        # The two query forms beside each other, with no header to name (2026-09-29).
+        assert err.members == (("ArgumentName", "Authorization"),)
     if code == "InvalidAccessKeyId":
         assert err.members == (("AWSAccessKeyId", _UNKNOWN),)
+    if "is wrong; expecting" in message:
+        assert err.members == (("Region", "us-east-1"),)
+    if message == "Request has expired" and "AWSAccessKeyId=" in query:
+        # A V2 query names its `Expires` as a time and the server's, and no lifetime (2026-09-29).
+        expires = datetime.fromtimestamp(int(dict(parse_qsl(query))["Expires"]), timezone.utc)
+        assert err.members[0] == ("Expires", expires.strftime("%Y-%m-%dT%H:%M:%SZ"))
+        assert [name for name, _ in err.members] == ["Expires", "ServerTime"]
     if message == "Request is not yet valid":
         # Real names the request's date in epoch milliseconds (2026-09-29).
         sent = datetime.strptime(dict(parse_qsl(query))["X-Amz-Date"], AMZ_DATE_FORMAT)
         expected_ms = str(int(sent.replace(tzinfo=timezone.utc).timestamp() * 1000))
         assert [name for name, _ in err.members] == ["X-Amz-Date", "Expires", "ServerTime"]
         assert dict(err.members)["X-Amz-Date"] == expected_ms
+
+
+# --- Signature Version 2 (backlot/sigv2.py) ----------------------------------------------------
+
+
+def _v2_request(method, path, query, headers, secret=SK, date_line=None):
+    """A V2 header request signed over the string real signs, built here by hand: ``date_line`` is
+    the line for the date (the `Date` header unless given), then the `x-amz-*` lines, then the
+    path and ``query``'s signed parameters, which the caller spells out as ``signed``."""
+    import hmac as _hmac
+
+    headers = {"host": "backlot", **headers}
+    amz = "".join(f"{k}:{v}\n" for k, v in sorted(headers.items()) if k.startswith("x-amz-"))
+    date = headers.get("date", "") if date_line is None else date_line
+    signed = headers.pop("_signed", "")
+    to_sign = (
+        f"{method}\n{headers.get('content-md5', '')}\n{headers.get('content-type', '')}\n{date}\n"
+        f"{amz}{path}{signed}"
+    )
+    sig = base64.b64encode(_hmac.new(secret.encode(), to_sign.encode(), hashlib.sha1).digest())
+    headers["authorization"] = f"AWS {AK}:{sig.decode()}"
+    return _request(method, path, query, headers), to_sign
+
+
+@pytest.mark.parametrize(
+    "headers, date_line",
+    [
+        ({"date": "Tue, 29 Sep 2026 09:00:00 GMT"}, None),
+        ({"date": "Tuesday, 29-Sep-26 09:00:00 GMT"}, None),
+        ({"date": "20260929T090000Z"}, None),
+        ({"x-amz-date": "Tue, 29 Sep 2026 09:00:00 GMT"}, ""),
+        (
+            {
+                "x-amz-date": "Tue, 29 Sep 2026 09:00:00 GMT",
+                "date": "Mon, 01 Jan 2001 00:00:00 GMT",
+            },
+            "",
+        ),
+        (
+            {
+                "date": "Tue, 29 Sep 2026 09:00:00 GMT",
+                "x-amz-meta-a": "1",
+                "content-type": "text/csv",
+            },
+            None,
+        ),
+    ],
+    ids=["rfc1123", "rfc850", "iso8601", "x-amz-date", "x-amz-date-over-date", "headers"],
+)
+def test_a_signature_version_2_header_verifies_over_the_string_real_signs(
+    monkeypatch, headers, date_line
+):
+    """The three date forms real read, each signed as sent (the `StringToSign` real returned for a
+    bad secret named each as sent, 2026-09-29); an `x-amz-date` over a `Date`, signed among the
+    `x-amz-*` lines with the date line empty; and the `Content-Type` and `x-amz-meta-*` lines real
+    signs. Real served the RFC 1123 form, both `x-amz-date` rows and the `x-amz-meta-*` one."""
+    now = datetime(2026, 9, 29, 9, 5, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        auth, "datetime", SimpleNamespace(now=lambda tz: now, fromtimestamp=datetime.fromtimestamp)
+    )
+    req, _ = _v2_request("GET", "/s3/eng-artifacts", "list-type=2", headers, date_line=date_line)
+    caller, err = auth.resolve_sigv4(req)
+    assert err is None and caller == Caller(email="ava@acme.com", is_admin=False)
+
+
+# What real named in a Signature Version 2 string to sign for `?<name>=v`, after the path, at a
+# bucket's path and a key's (probe37c: every query parameter botocore's S3 model uses and five
+# more, 2026-09-29; `website`, sent without a value, probe37i). A name real refused before signing
+# at one of the two paths has no row there.
+_V2_SIGNED_ROWS = [
+    ("bucket", "abac", "?abac"),
+    ("key", "abac", "?abac"),
+    ("bucket", "accelerate", "?accelerate"),
+    ("key", "accelerate", "?accelerate"),
+    ("bucket", "acl", "?acl"),
+    ("key", "acl", "?acl"),
+    ("bucket", "analytics", "?analytics"),
+    ("key", "analytics", "?analytics"),
+    ("bucket", "annotation", "?annotation"),
+    ("key", "annotation", "?annotation"),
+    ("bucket", "annotation-prefix", ""),
+    ("key", "annotation-prefix", ""),
+    ("bucket", "annotationName", "?annotationName"),
+    ("bucket", "attributes", "?attributes"),
+    ("key", "attributes", "?attributes"),
+    ("bucket", "bucket-region", ""),
+    ("key", "bucket-region", ""),
+    ("key", "continuation-token", ""),
+    ("bucket", "cors", "?cors"),
+    ("key", "cors", "?cors"),
+    ("bucket", "delete", "?delete"),
+    ("key", "delete", "?delete"),
+    ("bucket", "delimiter", ""),
+    ("key", "delimiter", ""),
+    ("bucket", "encoding-type", ""),
+    ("key", "encoding-type", ""),
+    ("bucket", "encryption", "?encryption"),
+    ("key", "encryption", "?encryption"),
+    ("bucket", "fetch-owner", ""),
+    ("key", "fetch-owner", ""),
+    ("bucket", "id", ""),
+    ("key", "id", ""),
+    ("bucket", "intelligent-tiering", "?intelligent-tiering"),
+    ("key", "intelligent-tiering", "?intelligent-tiering"),
+    ("bucket", "inventory", "?inventory"),
+    ("key", "inventory", "?inventory"),
+    ("bucket", "key-marker", ""),
+    ("key", "key-marker", ""),
+    ("bucket", "legal-hold", "?legal-hold"),
+    ("key", "legal-hold", "?legal-hold"),
+    ("bucket", "lifecycle", "?lifecycle"),
+    ("key", "lifecycle", "?lifecycle"),
+    ("bucket", "list-type", ""),
+    ("key", "list-type", ""),
+    ("bucket", "location", "?location"),
+    ("key", "location", "?location"),
+    ("bucket", "logging", "?logging"),
+    ("key", "logging", "?logging"),
+    ("bucket", "marker", ""),
+    ("key", "marker", ""),
+    ("bucket", "max-annotation-results", ""),
+    ("key", "max-annotation-results", ""),
+    ("bucket", "max-buckets", ""),
+    ("key", "max-buckets", ""),
+    ("bucket", "max-directory-buckets", ""),
+    ("key", "max-directory-buckets", ""),
+    ("key", "max-keys", ""),
+    ("bucket", "max-parts", ""),
+    ("key", "max-parts", ""),
+    ("bucket", "max-uploads", ""),
+    ("key", "max-uploads", ""),
+    ("bucket", "metadataAnnotationTable", "?metadataAnnotationTable"),
+    ("key", "metadataAnnotationTable", "?metadataAnnotationTable"),
+    ("bucket", "metadataConfiguration", "?metadataConfiguration"),
+    ("key", "metadataConfiguration", "?metadataConfiguration"),
+    ("bucket", "metadataInventoryTable", "?metadataInventoryTable"),
+    ("key", "metadataInventoryTable", "?metadataInventoryTable"),
+    ("bucket", "metadataJournalTable", "?metadataJournalTable"),
+    ("key", "metadataJournalTable", "?metadataJournalTable"),
+    ("bucket", "metadataTable", "?metadataTable"),
+    ("key", "metadataTable", "?metadataTable"),
+    ("bucket", "metrics", "?metrics"),
+    ("key", "metrics", "?metrics"),
+    ("bucket", "notification", "?notification"),
+    ("key", "notification", "?notification"),
+    ("bucket", "object-lock", "?object-lock"),
+    ("key", "object-lock", "?object-lock"),
+    ("bucket", "ownershipControls", "?ownershipControls"),
+    ("key", "ownershipControls", "?ownershipControls"),
+    ("bucket", "part-number-marker", ""),
+    ("key", "part-number-marker", ""),
+    ("key", "partNumber", "?partNumber=v"),
+    ("bucket", "policy", "?policy"),
+    ("key", "policy", "?policy"),
+    ("bucket", "policyStatus", "?policyStatus"),
+    ("key", "policyStatus", "?policyStatus"),
+    ("bucket", "prefix", ""),
+    ("key", "prefix", ""),
+    ("bucket", "publicAccessBlock", "?publicAccessBlock"),
+    ("key", "publicAccessBlock", "?publicAccessBlock"),
+    ("bucket", "renameObject", ""),
+    ("key", "renameObject", ""),
+    ("bucket", "replication", "?replication"),
+    ("key", "replication", "?replication"),
+    ("bucket", "requestPayment", "?requestPayment"),
+    ("key", "requestPayment", "?requestPayment"),
+    ("bucket", "response-cache-control", "?response-cache-control=v"),
+    ("key", "response-cache-control", "?response-cache-control=v"),
+    ("bucket", "response-content-disposition", "?response-content-disposition=v"),
+    ("key", "response-content-disposition", "?response-content-disposition=v"),
+    ("bucket", "response-content-encoding", "?response-content-encoding=v"),
+    ("key", "response-content-encoding", "?response-content-encoding=v"),
+    ("bucket", "response-content-language", "?response-content-language=v"),
+    ("key", "response-content-language", "?response-content-language=v"),
+    ("bucket", "response-content-type", "?response-content-type=v"),
+    ("key", "response-content-type", "?response-content-type=v"),
+    ("bucket", "response-expires", "?response-expires=v"),
+    ("key", "response-expires", "?response-expires=v"),
+    ("bucket", "restore", "?restore"),
+    ("key", "restore", "?restore"),
+    ("bucket", "retention", "?retention"),
+    ("key", "retention", "?retention"),
+    ("bucket", "select", "?select"),
+    ("key", "select", "?select"),
+    ("bucket", "select-type", "?select-type=v"),
+    ("key", "select-type", "?select-type=v"),
+    ("bucket", "session", ""),
+    ("key", "session", ""),
+    ("key", "start-after", ""),
+    ("bucket", "tagging", "?tagging"),
+    ("key", "tagging", "?tagging"),
+    ("bucket", "torrent", "?torrent"),
+    ("key", "torrent", "?torrent"),
+    ("bucket", "upload-id-marker", ""),
+    ("key", "upload-id-marker", ""),
+    ("bucket", "uploadId", "?uploadId=v"),
+    ("key", "uploadId", "?uploadId=v"),
+    ("bucket", "uploads", "?uploads"),
+    ("key", "uploads", "?uploads"),
+    ("bucket", "version-id-marker", ""),
+    ("key", "version-id-marker", ""),
+    ("key", "versionId", "?versionId=v"),
+    ("bucket", "versioning", "?versioning"),
+    ("key", "versioning", "?versioning"),
+    ("bucket", "versions", "?versions"),
+    ("key", "versions", "?versions"),
+    ("bucket", "x-id", ""),
+    ("key", "x-id", ""),
+    ("bucket", "ACL", ""),
+    ("key", "ACL", ""),
+    ("bucket", "Versioning", ""),
+    ("key", "Versioning", ""),
+    ("bucket", "x-amz-foo", ""),
+    ("key", "x-amz-foo", ""),
+    ("bucket", "X-Amz-Foo", ""),
+    ("key", "X-Amz-Foo", ""),
+    ("bucket", "website", "?website"),
+    ("key", "website", "?website"),
+]
+
+
+@pytest.mark.parametrize(
+    "where, name, signed", _V2_SIGNED_ROWS, ids=[f"{r[0]}-{r[1]}" for r in _V2_SIGNED_ROWS]
+)
+def test_signature_version_2_signs_the_query_parameters_real_signs(where, name, signed):
+    """Each row is what real's `StringToSign` named for that parameter, and a signature over it
+    verifies here where a signature over anything else is the mismatch that names it."""
+    path = "/s3/eng-artifacts" if where == "bucket" else "/s3/eng-artifacts/runbooks/oncall.md"
+    query = "website" if name == "website" else f"{quote(name)}=v"
+    headers = {"date": _http_date(), "_signed": signed}
+    if name.lower().startswith("x-amz-"):
+        headers[name.lower()] = "v"
+    req, _ = _v2_request("GET", path, query, headers)
+    caller, err = auth.resolve_sigv4(req)
+    assert err is None, (name, err and dict(err.members).get("StringToSign"))
+
+
+@pytest.mark.parametrize(
+    "query, signed, amz",
+    [
+        ("versionId=v&acl", "?acl&versionId=v", ""),
+        ("uploads&prefix=x", "?uploads", ""),
+        ("acl=", "?acl", ""),
+        (
+            "response-content-type=a%2Fb&response-expires=x",
+            "?response-content-type=a/b&response-expires=x",
+            "",
+        ),
+        ("x-amz-foo=1&acl", "?acl", "x-amz-foo:1\n"),
+        ("X-Amz-Foo=1&acl", "?acl", "x-amz-foo:1\n"),
+        ("partNumber=2&uploadId=a%20b", "?partNumber=2&uploadId=a b", ""),
+        ("tagging&tagging", "?tagging", ""),
+        ("acl=a&acl=b", "?acl", ""),
+    ],
+)
+def test_signature_version_2_sorts_names_and_decodes_values_as_real_does(query, signed, amz):
+    """Measured 2026-09-29 at a key over a bad secret: the signed parameters sorted, a value decoded
+    where one is signed, a name sent twice signed once, and an `x-amz-*` parameter signed as a
+    header, lower-cased. The mismatch names the string this server signed, which is real's, over
+    the path under the mount (``backlot.auth._verify_v2``)."""
+    path = "/s3/eng-artifacts/runbooks/oncall.md"
+    date = _http_date()
+    req, _ = _v2_request("GET", path, query, {"date": date}, secret="x" * 40)
+    caller, err = auth.resolve_sigv4(req)
+    assert caller is None and err.code == "SignatureDoesNotMatch"
+    under = path.removeprefix("/s3")
+    assert dict(err.members)["StringToSign"] == f"GET\n\n\n{date}\n{amz}{under}{signed}"
+
+
+def test_signature_version_2_signs_a_query_amz_parameter_over_a_header_of_its_name():
+    """`x-amz-foo: 2` beside `?x-amz-foo=1` was signed `x-amz-foo:1` (2026-09-29)."""
+    path, date = "/s3/eng-artifacts/runbooks/oncall.md", _http_date()
+    req, _ = _v2_request(
+        "GET", path, "x-amz-foo=1", {"date": date, "x-amz-foo": "2"}, secret="x" * 40
+    )
+    _, err = auth.resolve_sigv4(req)
+    under = path.removeprefix("/s3")
+    assert dict(err.members)["StringToSign"] == f"GET\n\n\n{date}\nx-amz-foo:1\n{under}"
+
+
+def test_a_signature_version_2_mismatch_names_what_real_names():
+    """The access key, the string signed, the signature sent and the string's bytes, in that order,
+    and no canonical request, which V2 has none of; a query's date line is its `Expires` as sent
+    (measured 2026-09-29, the header over thirty samples at a bucket's path in this order every
+    time)."""
+    date = _http_date()
+    req, _ = _v2_request(
+        "GET",
+        "/s3/eng-artifacts",
+        "versioning",
+        {"date": date, "_signed": "?versioning"},
+        secret="x" * 40,
+    )
+    _, err = auth.resolve_sigv4(req)
+    members = dict(err.members)
+    assert [name for name, _ in err.members] == [
+        "AWSAccessKeyId",
+        "StringToSign",
+        "SignatureProvided",
+        "StringToSignBytes",
+    ]
+    assert members["StringToSign"] == f"GET\n\n\n{date}\n/eng-artifacts?versioning"
+    assert members["StringToSignBytes"] == " ".join(
+        f"{b:02x}" for b in members["StringToSign"].encode()
+    )
+    expires = _epoch(60)
+    query = _query(AWSAccessKeyId=AK, Expires=expires, Signature="abc", X_Amz_Signature="00")
+    _, err = auth.resolve_sigv4(_request("GET", "/s3/eng-artifacts", query, {"host": "backlot"}))
+    assert (
+        dict(err.members)["StringToSign"]
+        == f"GET\n\n\n{expires}\nx-amz-signature:00\n/eng-artifacts"
+    )
+    assert dict(err.members)["SignatureProvided"] == "abc"
+
+
+@pytest.mark.parametrize("query", ["AWSAccessKeyId=" + AK, "Expires=9999999999&AWSAccessKeyId=x"])
+def test_a_query_without_signature_is_the_anonymous_callers(query):
+    """Real answered `?AWSAccessKeyId=` alone on a bucket its owner holds as it answers no credential
+    (2026-09-29): without a `Signature` there is no V2 query to read."""
+    assert auth.resolve_sigv4(_request("GET", "/s3/eng-artifacts", query, {"host": "backlot"})) == (
+        ANONYMOUS,
+        None,
+    )
+
+
+def test_a_lower_case_v4_scheme_is_v4_and_is_signed_as_sent():
+    """Real reads `aws4-hmac-sha256` as V4 and names it as sent on the first line of the string it
+    signs, so a signature over the upper-case line is the mismatch (2026-09-29)."""
+    amz_date = datetime.now(timezone.utc).strftime(AMZ_DATE_FORMAT)
+    req = _header_auth_request(amz_date)
+    authz = dict(req.headers)["authorization"].replace("AWS4-HMAC-SHA256", "aws4-hmac-sha256")
+    headers = {**dict(req.headers), "authorization": authz}
+    _, err = auth.resolve_sigv4(_request("GET", "/s3/eng-artifacts", "list-type=2", headers))
+    assert err.code == "SignatureDoesNotMatch"
+    assert dict(err.members)["StringToSign"].split("\n")[0] == "aws4-hmac-sha256"
+
+
+@pytest.mark.parametrize(
+    "signed_path, verifies",
+    [
+        ("/eng-artifacts/runbooks/oncall.md", True),
+        ("/s3/eng-artifacts/runbooks/oncall.md", True),
+        ("/eng-artifacts/runbooks/oncall.md/", False),
+    ],
+)
+def test_signature_version_2_signs_the_path_under_the_mount_or_the_whole_path(
+    signed_path, verifies
+):
+    """A client signs what is under `/s3` (boto3's `auth_path`) or the whole of what it sends (a
+    signer handed the URL), and either verifies; a path that is neither — boto3's bucket paths carry
+    a slash their URL does not — is the mismatch, as it is on real (2026-09-29)."""
+    import hmac as _hmac
+
+    date = _http_date()
+    to_sign = f"GET\n\n\n{date}\n{signed_path}"
+    sig = base64.b64encode(_hmac.new(SK.encode(), to_sign.encode(), hashlib.sha1).digest()).decode()
+    headers = {"host": "backlot", "date": date, "authorization": f"AWS {AK}:{sig}"}
+    caller, err = auth.resolve_sigv4(
+        _request("GET", "/s3/eng-artifacts/runbooks/oncall.md", "", headers)
+    )
+    assert (err is None) == verifies
+
+
+def test_boto3_signing_with_signature_version_2_is_served_as_real_serves_it(live_server):
+    """boto3's own V2 client, path-style: ListBuckets and an object's GET and HEAD are served, as
+    real served them, and a bucket's own operations are the mismatch real answered them with, since
+    boto3 signs the bucket with a slash its URL does not carry (2026-09-29)."""
+    boto3 = pytest.importorskip("boto3")
+    from botocore.config import Config
+    from botocore.exceptions import ClientError
+
+    base_url, settings = live_server
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=f"{base_url}/s3",
+        aws_access_key_id=synth.s3_access_key_id(settings.admin_token),
+        aws_secret_access_key=synth.s3_secret_access_key(settings.admin_token),
+        region_name="us-east-1",
+        config=Config(signature_version="s3", s3={"addressing_style": "path"}),
+    )
+    assert "eng-artifacts" in {b["Name"] for b in s3.list_buckets()["Buckets"]}
+    assert (
+        s3.get_object(Bucket="eng-artifacts", Key="runbooks/oncall.md")["Body"].read()
+        == OBJECT_TEXT
+    )
+    assert s3.head_object(Bucket="eng-artifacts", Key="runbooks/oncall.md")["ContentLength"] == len(
+        OBJECT_TEXT
+    )
+    for call in (
+        lambda: s3.list_objects_v2(Bucket="eng-artifacts"),
+        lambda: s3.get_bucket_versioning(Bucket="eng-artifacts"),
+    ):
+        with pytest.raises(ClientError) as e:
+            call()
+        assert e.value.response["Error"]["Code"] == "SignatureDoesNotMatch"
+
+
+def test_signature_version_2_is_served_as_real_serves_it(live_server):
+    """botocore's own V2 signers, header and query, against the served routes: the listings, a
+    bucket's configuration, an object and its HEAD, ListBuckets, a query ten years ahead and the
+    scheme in lower case (each served on real, 2026-09-29), and a scoped caller still scoped."""
+    import httpx
+    from botocore.auth import HmacV1Auth, HmacV1QueryAuth
+
+    base_url, settings = live_server
+    admin = Credentials(
+        synth.s3_access_key_id(settings.admin_token),
+        synth.s3_secret_access_key(settings.admin_token),
+    )
+
+    def v2(method, path, cred=admin, lower=False):
+        req = AWSRequest(method=method, url=f"{base_url}{path}")
+        HmacV1Auth(cred).add_auth(req)
+        headers = dict(req.headers)
+        if lower:
+            headers["Authorization"] = "aws" + headers["Authorization"][3:]
+        return httpx.request(method, f"{base_url}{path}", headers=headers)
+
+    def v2_query(path, expires=60):
+        req = AWSRequest(method="GET", url=f"{base_url}{path}")
+        HmacV1QueryAuth(admin, expires=expires).add_auth(req)
+        return httpx.get(req.url)
+
+    assert "<ListBucketResult" in v2("GET", "/s3/eng-artifacts").text
+    assert "<KeyCount>" in v2("GET", "/s3/eng-artifacts?list-type=2").text
+    assert "<VersioningConfiguration" in v2("GET", "/s3/eng-artifacts?versioning").text
+    assert v2("GET", OBJECT_PATH).content == OBJECT_TEXT
+    assert v2("HEAD", OBJECT_PATH).status_code == 200
+    assert "<ListAllMyBucketsResult" in v2("GET", "/s3/").text
+    assert v2("GET", "/s3/eng-artifacts", lower=True).status_code == 200
+    assert "<ListBucketResult" in v2_query("/s3/eng-artifacts").text
+    assert v2_query("/s3/eng-artifacts", expires=10 * 365 * 86400).status_code == 200
+    tokens = {
+        u["email"]: u["token"] for u in yaml.safe_load(settings.tokens_path.read_text())["users"]
+    }
+    ava = Credentials(
+        synth.s3_access_key_id(tokens["ava@acme.com"]),
+        synth.s3_secret_access_key(tokens["ava@acme.com"]),
+    )
+    assert "<Code>NoSuchBucket</Code>" in v2("GET", "/s3/people-vault/comp/bands.csv", ava).text
+    assert v2("GET", "/s3/people-vault/comp/bands.csv").status_code == 200
+    bad = v2("HEAD", "/s3/eng-artifacts", Credentials(admin.access_key, "x" * 40))
+    assert (bad.status_code, bad.content) == (403, b"")
 
 
 @pytest.mark.parametrize("query", ["", "X-Amz-Signature=00", "list-type=2"])
@@ -2456,6 +4749,200 @@ def _listing(client, query, token):
     r = _s3_get(client, f"/s3/encoded-bucket?{query}", token)
     assert r.status_code == 200, r.text
     return ET.fromstring(r.text)
+
+
+def _versions(client, query, token):
+    r = _s3_get(client, f"/s3/encoded-bucket?versions&{query}", token)
+    assert r.status_code == 200, r.text
+    assert r.headers["content-type"] == "application/xml"
+    return ET.fromstring(r.text)
+
+
+def _version_entries(root) -> list[str]:
+    """Each Version's key and each CommonPrefixes' prefix, in the order they were served."""
+    return [
+        c.findtext(f"{{{S3NS}}}Key")
+        if c.tag.endswith("Version")
+        else c.findtext(f"{{{S3NS}}}Prefix")
+        for c in root
+        if c.tag.endswith("Version") or c.tag.endswith("CommonPrefixes")
+    ]
+
+
+def test_list_object_versions_is_each_key_as_its_one_null_version(
+    big_bucket_client, big_bucket_settings
+):
+    """No bucket here is versioned, so each key is one version, `null` and the latest, carrying the
+    V1 listing's fields and `Owner`: the shape real answered on a bucket of four keys, the elements
+    in its order (2026-09-29)."""
+    token = big_bucket_settings.admin_token
+    root = _versions(big_bucket_client, "", token)
+    assert root.tag == f"{{{S3NS}}}ListVersionsResult"
+    assert _children(root) == [
+        "Name",
+        "Prefix",
+        "KeyMarker",
+        "VersionIdMarker",
+        "MaxKeys",
+        "IsTruncated",
+        *["Version"] * 6,
+    ]
+    assert [
+        root.findtext(f"{{{S3NS}}}{n}")
+        for n in ("Name", "Prefix", "KeyMarker", "VersionIdMarker", "MaxKeys", "IsTruncated")
+    ] == ["encoded-bucket", "", "", "", "1000", "false"]
+    v1 = {
+        c.findtext(f"{{{S3NS}}}Key"): c
+        for c in _listing(big_bucket_client, "", token).findall(f"{{{S3NS}}}Contents")
+    }
+    versions = root.findall(f"{{{S3NS}}}Version")
+    assert [v.findtext(f"{{{S3NS}}}Key") for v in versions] == list(v1)
+    for version in versions:
+        assert _children(version) == [
+            "Key",
+            "VersionId",
+            "IsLatest",
+            "LastModified",
+            "ETag",
+            "Size",
+            "Owner",
+            "StorageClass",
+        ]
+        assert version.findtext(f"{{{S3NS}}}VersionId") == "null"
+        assert version.findtext(f"{{{S3NS}}}IsLatest") == "true"
+        listed = v1[version.findtext(f"{{{S3NS}}}Key")]
+        for name in ("LastModified", "ETag", "Size", "StorageClass"):
+            assert version.findtext(f"{{{S3NS}}}{name}") == listed.findtext(f"{{{S3NS}}}{name}")
+        assert version.findtext(f"{{{S3NS}}}Owner/{{{S3NS}}}ID") == listed.findtext(
+            f"{{{S3NS}}}Owner/{{{S3NS}}}ID"
+        )
+        assert version.find(f"{{{S3NS}}}Owner/{{{S3NS}}}DisplayName") is None
+
+
+@pytest.mark.parametrize(
+    "extra", ["", "&delimiter=/", "&prefix=a", "&delimiter=/&encoding-type=url"]
+)
+def test_list_object_versions_pages_by_its_markers_to_the_end(
+    big_bucket_client, big_bucket_settings, extra
+):
+    """Following `NextKeyMarker` and `NextVersionIdMarker` a page at a time walks every entry once,
+    in key order, as real's four keys did: each truncated page names its last entry, a group
+    without a `NextVersionIdMarker`, each page echoes the markers it was sent, and the last one
+    names none (2026-09-29). Under `encoding-type=url` a marker comes back encoded and goes back
+    decoded."""
+    token = big_bucket_settings.admin_token
+    whole = _version_entries(_versions(big_bucket_client, extra.lstrip("&"), token))
+    walked, query, pages = [], "max-keys=1" + extra, 0
+    while True:
+        page = _versions(big_bucket_client, query, token)
+        pages += 1
+        entries = _version_entries(page)
+        assert len(entries) == 1, query
+        walked += entries
+        if page.findtext(f"{{{S3NS}}}IsTruncated") == "false":
+            assert page.find(f"{{{S3NS}}}NextKeyMarker") is None
+            break
+        next_key = page.findtext(f"{{{S3NS}}}NextKeyMarker")
+        assert next_key == entries[-1]
+        is_group = page.find(f"{{{S3NS}}}CommonPrefixes") is not None
+        assert (page.findtext(f"{{{S3NS}}}NextVersionIdMarker")) == (None if is_group else "null")
+        sent = unquote(next_key.replace("+", " ")) if "encoding-type" in extra else next_key
+        query = f"max-keys=1{extra}&key-marker={quote(sent, safe='')}"
+        if not is_group:
+            query += "&version-id-marker=null"
+        echoed = _versions(big_bucket_client, query, token)
+        assert echoed.findtext(f"{{{S3NS}}}KeyMarker") == next_key
+        assert pages < 10
+    # A page of one holds a key or a group alone, so the walk is key order, where a whole page puts
+    # its groups after its keys (see the delimiter test below).
+    assert sorted(walked) == sorted(whole) and len(walked) == len(set(walked)) > 1
+    if "encoding-type" not in extra:
+        assert walked == sorted(walked, key=str.encode)
+
+
+def test_list_object_versions_rolls_up_by_delimiter_and_encodes_under_url(
+    big_bucket_client, big_bucket_settings
+):
+    """Versions and then CommonPrefixes, each in key order; `Delimiter` present whenever one was
+    sent, an empty one included; under `encoding-type=url` every key, prefix, marker and the
+    delimiter encoded and `EncodingType` as sent (all as real answered, 2026-09-29)."""
+    token = big_bucket_settings.admin_token
+    rolled = _versions(big_bucket_client, "delimiter=/", token)
+    assert _version_entries(rolled) == [
+        "100%.csv",
+        "a b.txt",
+        "a+b.txt",
+        "zz.txt",
+        "run books/",
+        "한글/",
+    ]
+    assert rolled.findtext(f"{{{S3NS}}}Delimiter") == "/"
+    assert _versions(big_bucket_client, "", token).find(f"{{{S3NS}}}Delimiter") is None
+    assert _versions(big_bucket_client, "delimiter=", token).findtext(f"{{{S3NS}}}Delimiter") == ""
+    encoded = _versions(
+        big_bucket_client, "encoding-type=URL&delimiter=%20&key-marker=100%25.csv&prefix=", token
+    )
+    assert encoded.findtext(f"{{{S3NS}}}EncodingType") == "URL"
+    assert encoded.findtext(f"{{{S3NS}}}Delimiter") == "+"
+    assert encoded.findtext(f"{{{S3NS}}}KeyMarker") == "100%25.csv"
+    assert _version_entries(encoded) == [
+        "a%2Bb.txt",
+        "zz.txt",
+        "%ED%95%9C%EA%B8%80/x.txt",
+        "a+",
+        "run+",
+    ]
+    page = _versions(big_bucket_client, "encoding-type=url&max-keys=1&key-marker=100%25.csv", token)
+    assert page.findtext(f"{{{S3NS}}}NextKeyMarker") == "a+b.txt"
+    assert (
+        _versions(big_bucket_client, "prefix=a%20&encoding-type=url", token).findtext(
+            f"{{{S3NS}}}Prefix"
+        )
+        == "a+"
+    )
+
+
+@pytest.mark.parametrize(
+    "query, entries, max_keys, truncated",
+    [
+        ("max-keys=0", [], "0", "false"),
+        (
+            "max-keys=05",
+            ["100%.csv", "a b.txt", "a+b.txt", "run books/x.txt", "zz.txt"],
+            "5",
+            "true",
+        ),
+        ("max-keys=-0", [], "0", "false"),
+        ("max-keys=1001", None, "1001", "false"),
+        ("max-keys=", None, "1000", "false"),
+        ("key-marker=zz.txt", ["한글/x.txt"], "1000", "false"),
+        ("key-marker=zzz&prefix=", ["한글/x.txt"], "1000", "false"),
+        ("prefix=run%20", ["run books/x.txt"], "1000", "false"),
+        ("prefix=run%20&key-marker=a", ["run books/x.txt"], "1000", "false"),
+        ("prefix=run%20&key-marker=run%20books%2Fx.txt", [], "1000", "false"),
+        ("key-marker=run%20books%2F&delimiter=/", ["zz.txt", "한글/"], "1000", "false"),
+        ("key-marker=&version-id-marker=null", [], "1000", "false"),
+        (
+            "key-marker=a%20b.txt&version-id-marker=null",
+            ["a+b.txt", "run books/x.txt", "zz.txt", "한글/x.txt"],
+            "1000",
+            "false",
+        ),
+        ("start-after=zz.txt&marker=zz.txt&list-type=2", None, "1000", "false"),
+    ],
+)
+def test_list_object_versions_reads_its_bounds_as_real_does(
+    big_bucket_client, big_bucket_settings, query, entries, max_keys, truncated
+):
+    """`max-keys` as the listing parses it, echoed uncapped; `key-marker` past a key, or past the
+    group holding it under a delimiter; `version-id-marker=null` where `key-marker` alone resumes,
+    and beside an empty `key-marker` a page of nothing; the listings' own parameters ignored (each
+    measured on real's four keys, 2026-09-29, the empty `key-marker` beside the marker included)."""
+    root = _versions(big_bucket_client, query, big_bucket_settings.admin_token)
+    whole = ["100%.csv", "a b.txt", "a+b.txt", "run books/x.txt", "zz.txt", "한글/x.txt"]
+    assert _version_entries(root) == (whole if entries is None else entries)
+    assert root.findtext(f"{{{S3NS}}}MaxKeys") == max_keys
+    assert root.findtext(f"{{{S3NS}}}IsTruncated") == truncated
 
 
 def _entries(root) -> list[str]:

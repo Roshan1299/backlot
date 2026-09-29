@@ -11,13 +11,14 @@ from __future__ import annotations
 
 import base64
 import hmac
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException, Request
 
-from backlot import sigv4
+from backlot import sigv2, sigv4
 from backlot.acl import ANONYMOUS, Acl, Caller
 
 
@@ -323,15 +324,27 @@ _A_WEEK = 604800
 _NOT_YET_VALID = 900
 
 
-def _credential_fault(credential: str) -> str | None:
-    """What real names wrong with a credential scope, or ``None`` when it has the five parts."""
+def _credential_fault(credential: str) -> tuple[str, tuple[tuple[str, str], ...]] | None:
+    """What real names wrong with a credential scope, and the members it names it with, or ``None``.
+
+    In real's order: the five parts, the region, the service, the terminal. The region is the one
+    this server presents, and real answers any other the way it answered `us-west-2`, `eu-west-1`,
+    `US-EAST-1`, `zz` and `us-east-1a` on `s3.us-east-1.amazonaws.com`, naming the region sent and
+    the one expected, the latter again as `Region`, and an empty one with a message of its own and
+    no member; a region beside a service, a terminal, a scope date or an access key that is wrong
+    is refused for the region (measured 2026-09-29, in the header and in the query alike)."""
     bits = credential.split("/")
     if len(bits) != 5:
-        return _CREDENTIAL_FORMAT
+        return _CREDENTIAL_FORMAT, ()
+    if not bits[2]:
+        return "a non-empty region must be provided in the credential.", ()
+    if bits[2] != sigv4.REGION:
+        message = f"the region '{bits[2]}' is wrong; expecting '{sigv4.REGION}'"
+        return message, (("Region", sigv4.REGION),)
     if bits[3] != "s3":
-        return f'incorrect service "{bits[3]}". This endpoint belongs to "s3".'
+        return f'incorrect service "{bits[3]}". This endpoint belongs to "s3".', ()
     if bits[4] != "aws4_request":
-        return f'incorrect terminal "{bits[4]}". This endpoint uses "aws4_request".'
+        return f'incorrect terminal "{bits[4]}". This endpoint uses "aws4_request".', ()
     return None
 
 
@@ -339,66 +352,104 @@ def _hex_bytes(text: str) -> str:
     return " ".join(f"{b:02x}" for b in text.encode("utf-8"))
 
 
+_ONE_MECHANISM = (
+    "Only one auth mechanism allowed; only the X-Amz-Algorithm query parameter, "
+    "Signature query string parameter or the Authorization header should be specified"
+)
+_NO_SPACE = "Authorization header is invalid -- one and only one ' ' (space) required"
+_NO_DATE = "AWS authentication requires a valid Date or x-amz-date header"
+_NO_KEY = "The AWS Access Key Id you provided does not exist in our records."
+_MISMATCH = (
+    "The request signature we calculated does not match the signature you provided. "
+    "Check your key and signing method."
+)
+# A Signature Version 2 query's `Expires` is read as seconds since the epoch in an int32: 2147483647
+# was a date and 2147483648 not, nor `1e9` or ` 1`, where `01790000000` and `-1` were (2026-09-29).
+_INT32 = 2**31
+
+
+def signed_with_v2(request: Request) -> bool:
+    """Whether the credential a request carries is a Signature Version 2 one, header or query."""
+    scheme = request.headers.get("authorization", "").partition(" ")[0]
+    if scheme:
+        return scheme.upper() == "AWS"
+    return "Signature" in request.query_params and "X-Amz-Algorithm" not in request.query_params
+
+
+def _wire(request: Request) -> tuple[str, str]:
+    """The path and query as uvicorn received them. Both halves of what is signed come off the
+    wire, not off `request.url`: Starlette rebuilds that URL from the DECODED path, so a key
+    containing `%3F` turns into a `?` that splits it — `/q%3Fx.txt` reads back as path `/q` with
+    query `x.txt`, a query the client never signed."""
+    raw = request.scope.get("raw_path")
+    path = raw.decode("ascii") if raw else request.url.path
+    return path, request.scope.get("query_string", b"").decode("ascii")
+
+
+def _skewed(request_time: str, now: datetime) -> SigV4Refusal:
+    return SigV4Refusal(
+        "RequestTimeTooSkewed",
+        "The difference between the request time and the current time is too large.",
+        (
+            ("RequestTime", request_time),
+            ("ServerTime", now.strftime(_SERVER_TIME)),
+            ("MaxAllowedSkewMilliseconds", "900000"),
+        ),
+    )
+
+
 def resolve_sigv4(request: Request) -> tuple[Caller | None, SigV4Refusal | None]:
-    """Verify an S3 SigV4 request (header or presigned-query auth).
+    """Verify an S3 request's credential: Signature Version 4 in the header or the query, or
+    Signature Version 2 in either (``_resolve_v2_header``, ``_resolve_v2_query``).
 
     Returns ``(caller, None)`` on a valid signature, ``(ANONYMOUS, None)`` for a request carrying
     no credential at all, and ``(None, refusal)`` otherwise. Real S3 reads an unsigned request as
     an anonymous caller's rather than refusing it, and so does this: what an anonymous caller can
-    see is decided where every caller's is, and it can see nothing. A presigned request is one
-    carrying `X-Amz-Algorithm`; an `X-Amz-Signature` without it is unsigned on real (a public
-    bucket's listing answered it).
+    see is decided where every caller's is, and it can see nothing. A V4 presigned request is one
+    carrying `X-Amz-Algorithm` and a V2 one a request carrying `Signature`; an `X-Amz-Signature`
+    without the first and an `AWSAccessKeyId` without the second are unsigned on real (a public
+    bucket's listing answered the one and a bucket's own owner was refused the other as anonymous).
 
     Each refusal is real's own code, message and members, and they come in real's order:
     measured 2026-09-29 against `s3.us-east-1.amazonaws.com`, one fault at a time and, where two
-    could meet, the two together. A header beside `X-Amz-Algorithm` in the query is refused first,
-    whatever either says. For a header it is then its one space, its scheme (anything but
-    `AWS4-HMAC-SHA256` is `InvalidArgument`, "Unsupported Authorization Type", Bearer and
-    `AWS4-HMAC-SHA512` alike), a missing or unreadable `x-amz-date` (an `AccessDenied`), the clock
-    skew, its three components, the credential scope's shape, its service and its terminal, a scope
-    date that is not the request's, the access key and the signature: the date and the skew come
-    ahead of every fault in the header's body. For a query it is the algorithm, the six
+    could meet, the two together. A header beside `X-Amz-Algorithm` or `Signature` in the query is
+    refused first, whatever either says, and the two query forms beside each other. For a header it
+    is then its one space and its scheme, matched without case (anything but `AWS4-HMAC-SHA256` and
+    V2's `AWS` is `InvalidArgument`, "Unsupported Authorization Type", Bearer and `AWS4-HMAC-SHA512`
+    alike), a missing or unreadable `x-amz-date` (an `AccessDenied`), the clock skew, its three
+    components, the credential scope's shape, region, service and terminal (``_credential_fault``),
+    a scope date that is not the request's, the access key and the signature: the date and the
+    skew come ahead of every fault in the header's body. For a query it is the algorithm, the six
     parameters, the date, `X-Amz-Expires` as a number, as not negative and as a week at most, a
-    date not yet valid, the expiry, the credential scope's shape, service and terminal, its date,
-    the access key and the signature. A signature mismatch names the string this server signed and
-    the canonical request it signed it over, as bytes too, the way real names its own. The region
-    is taken from the client's own credential scope, so any region validates where real names the
-    one it expects. The canonical URI and query are the raw wire path and query string (S3 signs
-    the path verbatim)."""
+    date not yet valid, the expiry, the credential scope's shape, region, service and terminal, its
+    date, the access key and the signature. A signature mismatch names the string this server
+    signed and the canonical request it signed it over, as bytes too, the way real names its own.
+    The canonical URI and query are the raw wire path and query string (S3 signs the path
+    verbatim, see ``_wire``)."""
     hdrs = {k.lower(): v for k, v in request.headers.items()}
     qs = request.query_params
     now = datetime.now(timezone.utc)
     authz = hdrs.get("authorization", "")
     presigned = "X-Amz-Algorithm" in qs
+    v2_query = "Signature" in qs
     if authz:
         argument = (("ArgumentName", "Authorization"), ("ArgumentValue", authz))
-        if presigned:
-            message = (
-                "Only one auth mechanism allowed; only the X-Amz-Algorithm query parameter, "
-                "Signature query string parameter or the Authorization header should be specified"
-            )
-            return None, SigV4Refusal("InvalidArgument", message, argument)
-        scheme, space, _ = authz.partition(" ")
+        if presigned or v2_query:
+            return None, SigV4Refusal("InvalidArgument", _ONE_MECHANISM, argument)
+        scheme, space, rest = authz.partition(" ")
         if not space:
-            message = "Authorization header is invalid -- one and only one ' ' (space) required"
-            return None, SigV4Refusal("InvalidArgument", message, argument)
-        if scheme != sigv4.ALGORITHM:
+            return None, SigV4Refusal("InvalidArgument", _NO_SPACE, argument)
+        if scheme.upper() == "AWS":
+            return _resolve_v2_header(request, hdrs, rest, argument, now)
+        if scheme.upper() != sigv4.ALGORITHM:
             return None, SigV4Refusal("InvalidArgument", "Unsupported Authorization Type", argument)
+        algorithm = scheme
         amz_date = hdrs.get("x-amz-date", "")
         request_time = sigv4.parse_amz_date(amz_date)
         if request_time is None:
-            message = "AWS authentication requires a valid Date or x-amz-date header"
-            return None, SigV4Refusal("AccessDenied", message)
+            return None, SigV4Refusal("AccessDenied", _NO_DATE)
         if sigv4.is_skewed(request_time, now):
-            return None, SigV4Refusal(
-                "RequestTimeTooSkewed",
-                "The difference between the request time and the current time is too large.",
-                (
-                    ("RequestTime", amz_date),
-                    ("ServerTime", now.strftime(_SERVER_TIME)),
-                    ("MaxAllowedSkewMilliseconds", "900000"),
-                ),
-            )
+            return None, _skewed(amz_date, now)
         parsed = sigv4.parse_authorization(authz)
         if not parsed:
             message = (
@@ -409,13 +460,22 @@ def resolve_sigv4(request: Request) -> tuple[Caller | None, SigV4Refusal | None]
         credential = parsed["credential"]
         fault = _credential_fault(credential)
         if fault:
-            return None, SigV4Refusal("AuthorizationHeaderMalformed", _HEADER_MALFORMED + fault)
+            message, members = fault
+            return None, SigV4Refusal(
+                "AuthorizationHeaderMalformed", _HEADER_MALFORMED + message, members
+            )
         if credential.split("/")[1] != amz_date[:8]:
             message = "Invalid credential date. Date is not the same as X-Amz-Date."
             return None, SigV4Refusal("AuthorizationHeaderMalformed", _HEADER_MALFORMED + message)
         signed_headers, signature = parsed["signed_headers"], parsed["signature"]
         payload_hash = hdrs.get("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
     elif presigned:
+        if v2_query:
+            # Named without an `ArgumentValue`, there being no header to name (same date).
+            return None, SigV4Refusal(
+                "InvalidArgument", _ONE_MECHANISM, (("ArgumentName", "Authorization"),)
+            )
+        algorithm = sigv4.ALGORITHM
         if qs.get("X-Amz-Algorithm") != sigv4.ALGORITHM:
             message = 'X-Amz-Algorithm only supports "AWS4-HMAC-SHA256 and AWS4-ECDSA-P256-SHA256"'
             return None, SigV4Refusal("AuthorizationQueryParametersError", message)
@@ -469,8 +529,9 @@ def resolve_sigv4(request: Request) -> tuple[Caller | None, SigV4Refusal | None]
         credential = qs["X-Amz-Credential"]
         fault = _credential_fault(credential)
         if fault:
+            message, members = fault
             return None, SigV4Refusal(
-                "AuthorizationQueryParametersError", _QUERY_CREDENTIAL + fault
+                "AuthorizationQueryParametersError", _QUERY_CREDENTIAL + message, members
             )
         if credential.split("/")[1] != amz_date[:8]:
             message = (
@@ -481,33 +542,26 @@ def resolve_sigv4(request: Request) -> tuple[Caller | None, SigV4Refusal | None]
         signed_headers = qs["X-Amz-SignedHeaders"]
         signature = qs["X-Amz-Signature"]
         payload_hash = "UNSIGNED-PAYLOAD"
+    elif v2_query:
+        return _resolve_v2_query(request, hdrs, now)
     else:
         return ANONYMOUS, None
     access_key, date_stamp, region = credential.split("/")[:3]
     resolved = acl(request).resolve_access_key(access_key)
     if resolved is None:
-        return None, SigV4Refusal(
-            "InvalidAccessKeyId",
-            "The AWS Access Key Id you provided does not exist in our records.",
-            (("AWSAccessKeyId", access_key),),
-        )
+        return None, SigV4Refusal("InvalidAccessKeyId", _NO_KEY, (("AWSAccessKeyId", access_key),))
     caller, secret = resolved
-    # Both halves of the canonical request come off the wire, not off `request.url`: Starlette
-    # rebuilds that URL from the DECODED path, so a key containing `%3F` turns into a `?` that
-    # splits it — `/q%3Fx.txt` reads back as path `/q` with query `x.txt`, a query the client never
-    # signed. `raw_path` and `query_string` are the bytes uvicorn received.
-    raw = request.scope.get("raw_path")
-    path = raw.decode("ascii") if raw else request.url.path
-    query = request.scope.get("query_string", b"").decode("ascii")
+    path, query = _wire(request)
     canonical = sigv4.canonical_request(
         request.method, path, query, hdrs, signed_headers, payload_hash
     )
-    to_sign = sigv4.string_to_sign(amz_date, date_stamp, region, canonical)
-    if not hmac.compare_digest(sigv4.sign(secret, date_stamp, region, to_sign), signature):
+    to_sign = sigv4.string_to_sign(amz_date, date_stamp, region, canonical, algorithm)
+    if not hmac.compare_digest(
+        sigv4.sign(secret, date_stamp, region, to_sign).encode(), signature.encode()
+    ):
         return None, SigV4Refusal(
             "SignatureDoesNotMatch",
-            "The request signature we calculated does not match the signature you provided. "
-            "Check your key and signing method.",
+            _MISMATCH,
             (
                 ("AWSAccessKeyId", access_key),
                 ("StringToSign", to_sign),
@@ -515,6 +569,117 @@ def resolve_sigv4(request: Request) -> tuple[Caller | None, SigV4Refusal | None]
                 ("StringToSignBytes", _hex_bytes(to_sign)),
                 ("CanonicalRequest", canonical),
                 ("CanonicalRequestBytes", _hex_bytes(canonical)),
+            ),
+        )
+    return caller, None
+
+
+def _resolve_v2_header(
+    request: Request, hdrs: dict[str, str], rest: str, argument: tuple, now: datetime
+) -> tuple[Caller | None, SigV4Refusal | None]:
+    """`Authorization: AWS <key>:<signature>`, refused as real refuses it (measured 2026-09-29).
+
+    In real's order: a second space after the scheme, which V4's header may carry and this one may
+    not; a body that is not one key, one colon and a signature (`garbage`, `<key>:` and `<key>:a:b`
+    alike, where an empty key reads as a key); the date; the skew, naming the date as sent; the
+    access key; the signature. The date is `x-amz-date` when one is sent, readable or not, and
+    otherwise `Date`, in any of the forms ``sigv2.parse_date`` reads, and the line signed for it is
+    empty beside an `x-amz-date`, which is signed among the `x-amz-*` headers instead."""
+    if rest.startswith(" "):
+        return None, SigV4Refusal("InvalidArgument", _NO_SPACE, argument)
+    access_key, colon, signature = rest.partition(":")
+    if not colon or not signature or ":" in signature:
+        message = "AWS authorization header is invalid.  Expected AwsAccessKeyId:signature"
+        return None, SigV4Refusal("InvalidArgument", message, argument)
+    if "x-amz-date" in hdrs:
+        date, date_line = hdrs["x-amz-date"], ""
+    else:
+        date = date_line = hdrs.get("date", "")
+    request_time = sigv2.parse_date(date)
+    if request_time is None:
+        return None, SigV4Refusal("AccessDenied", _NO_DATE)
+    if sigv4.is_skewed(request_time, now):
+        return None, _skewed(date, now)
+    return _verify_v2(request, hdrs, access_key, signature, date_line)
+
+
+def _resolve_v2_query(
+    request: Request, hdrs: dict[str, str], now: datetime
+) -> tuple[Caller | None, SigV4Refusal | None]:
+    """`?AWSAccessKeyId=…&Expires=…&Signature=…`, refused as real refuses it (measured 2026-09-29).
+
+    In real's order: `Expires` or `AWSAccessKeyId` missing beside the `Signature`; an `Expires`
+    that is not a date (``_INT32``), naming it as sent; the expiry, naming it as a time; the access
+    key; the signature, over a string whose date line is `Expires` as sent. A query has no clock
+    skew: one ten years ahead was served."""
+    qs = request.query_params
+    if "Expires" not in qs or "AWSAccessKeyId" not in qs:
+        message = (
+            "Query-string authentication requires the Signature, Expires and AWSAccessKeyId "
+            "parameters"
+        )
+        return None, SigV4Refusal("AccessDenied", message)
+    raw = qs["Expires"]
+    # Leading zeros come off before the value is read, as they do for `max-keys`, so a run of them
+    # never reaches `int()`, which refuses past 4300 digits.
+    digits = raw.removeprefix("-").lstrip("0") or "0"
+    readable = re.fullmatch(r"-?[0-9]+", raw) is not None and len(digits) <= 10
+    expires = int(digits) * (-1 if raw.startswith("-") else 1) if readable else _INT32
+    if not -_INT32 <= expires < _INT32:
+        message = f"Invalid date (should be seconds since epoch): {raw}"
+        return None, SigV4Refusal("AccessDenied", message)
+    if now.timestamp() > expires:
+        return None, SigV4Refusal(
+            "AccessDenied",
+            "Request has expired",
+            (
+                ("Expires", datetime.fromtimestamp(expires, timezone.utc).strftime(_SERVER_TIME)),
+                ("ServerTime", now.strftime(_SERVER_TIME)),
+            ),
+        )
+    return _verify_v2(request, hdrs, qs["AWSAccessKeyId"], qs["Signature"], raw)
+
+
+# Where `backlot.routers.s3` is mounted, which real S3 has no counterpart of.
+_S3_MOUNT = "/s3"
+
+
+def _verify_v2(
+    request: Request, hdrs: dict[str, str], access_key: str, signature: str, date_line: str
+) -> tuple[Caller | None, SigV4Refusal | None]:
+    """The access key and then the signature, the members named as real names them for V2: the
+    string signed and its bytes, and no canonical request, V2 having none.
+
+    Real signs the path it was sent, which on real is the bucket and the key. Here that path sits
+    under ``_S3_MOUNT``, and a client signs either what is under it or all of it: boto3 signs the
+    bucket and the key it addresses (its `auth_path`) and for ListBuckets the URL's own path, and a
+    signer handed a URL signs that URL's path. So a signature over either verifies, and a mismatch
+    names the one real would sign, the path under the mount. boto3's path-style signature for a
+    bucket's own operations carries a slash after the bucket that its URL does not, and real
+    refused that as a mismatch (2026-09-29), which this is too."""
+    resolved = acl(request).resolve_access_key(access_key)
+    if resolved is None:
+        return None, SigV4Refusal("InvalidAccessKeyId", _NO_KEY, (("AWSAccessKeyId", access_key),))
+    caller, secret = resolved
+    path, query = _wire(request)
+    under = path[len(_S3_MOUNT) :] if path.startswith(_S3_MOUNT) else path
+    signed = [
+        sigv2.string_to_sign(request.method, hdrs, date_line, candidate, query)
+        for candidate in (under or "/", path)
+    ]
+    to_sign = signed[0]
+    if not any(
+        hmac.compare_digest(sigv2.sign(secret, candidate).encode(), signature.encode())
+        for candidate in signed
+    ):
+        return None, SigV4Refusal(
+            "SignatureDoesNotMatch",
+            _MISMATCH,
+            (
+                ("AWSAccessKeyId", access_key),
+                ("StringToSign", to_sign),
+                ("SignatureProvided", signature),
+                ("StringToSignBytes", _hex_bytes(to_sign)),
             ),
         )
     return caller, None

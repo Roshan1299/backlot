@@ -349,6 +349,8 @@ virtual-hosted client looks for `acme-artifacts.localhost:8000` and finds nothin
 | `ListBuckets` | An unsigned request is real's 307 to the product page |
 | `HeadBucket` | The listing's parameters are refused as the listing refuses them, apart from the `max-keys` range, as on real |
 | `GetBucketLocation` | |
+| `GetBucketVersioning`, `GetBucketAcl` and the rest of a bucket's configurations | Each as real answers a bucket nobody configured, byte for byte: the default where real has one (`?acl` the owner's `FULL_CONTROL`, `?encryption` SSE-S3, `?versioning` and `?accelerate` empty) and real's 404 where it has none (`NoSuchCORSConfiguration`, `NoSuchBucketPolicy`, `NoSuchTagSet` and the rest). The four configuration lists are empty and read `id` and `continuation-token` as real does |
+| `ListObjectVersions` | Every key as its one version, `null` and the latest, since no bucket here is versioned. `prefix`, `delimiter`, `key-marker`, `version-id-marker`, `max-keys`, `encoding-type`, paged and refused as real pages and refuses them |
 | `ListMultipartUploads` | Always the empty page, since data enters through `backlot import` and no upload is ever in progress. `prefix`, `delimiter` and `key-marker` are echoed, `max-uploads` and `encoding-type` validated and echoed, as real does |
 | `ListObjects` | The bare bucket GET, and what any `list-type` other than `2` selects. `prefix`, `delimiter`, `marker`, `max-keys`, `encoding-type`; `Marker` echoed, `NextMarker` under a delimiter, an `Owner` on every object |
 | `ListObjectsV2` | Selected by `list-type=2`. `prefix`, `delimiter`, `start-after`, `continuation-token`, `max-keys`, `encoding-type`; `KeyCount` and the continuation tokens, no `Owner` |
@@ -356,20 +358,21 @@ virtual-hosted client looks for `acme-artifacts.localhost:8000` and finds nothin
 | `HeadObject` | |
 | `ListParts` | Always `NoSuchUpload`, since no upload is ever in progress; `max-parts` and `part-number-marker` validated first, as real does |
 
-Any other sub-resource — `?versioning`, `?acl`, `?tagging` and the rest of what botocore declares at
-a bucket's or an object's path — is refused with `NotImplemented` (501), so a client gets an error
-to handle rather than the listing or the object's bytes parsed as something else. These are
-answered otherwise, as real answers them. `?session` is the listing: CreateSession is for directory
-buckets only and real S3 answers it with the listing on a general purpose bucket. A sub-resource
-whose operations are all on another method, `?delete` and a key's `?restore` and `?select` among
-them, is the 405 a GET or a HEAD naming it gets, and a key's `?uploads` on a GET is real's 400. A
-`?partNumber` at a bucket's path, which names a part of an object, is real's 400 on a GET, a HEAD,
-a `PUT`, a `POST`, a `DELETE` and a `PATCH`, and beside `?uploadId` it is UploadPart's 405. At a
-bucket's path `?torrent` is real's 405 and `?uploadId` real's 400 once the bucket is found. A
-bucket's sub-resources at a key's path are the bucket's own, whatever the key: `?location` is the
-bucket's constraint, `?logging` and `?versions` real's 400s, and the rest the 501 they are at the
-bucket. Two sub-resources at once are `InvalidArgument`, as on real S3, and an unknown query key is
-ignored, as on real S3.
+An object's sub-resources — `?acl`, `?tagging`, `?attributes` and the rest of what botocore declares
+at an object's path — are refused with `NotImplemented` (501), so a client gets an error to handle
+rather than the object's bytes parsed as something else. These are answered otherwise, as real
+answers them. `?session` is the listing: CreateSession is for directory buckets only and real S3
+answers it with the listing on a general purpose bucket. A sub-resource whose operations are all on
+another method, `?delete` and a key's `?restore` and `?select` among them, is the 405 a GET or a
+HEAD naming it gets, and a key's `?uploads` on a GET is real's 400. A `?partNumber` at a bucket's
+path, which names a part of an object, is real's 400 on a GET, a HEAD, a `PUT`, a `POST`, a
+`DELETE` and a `PATCH`, and beside `?uploadId` it is UploadPart's 405. At a bucket's path
+`?torrent` is real's 405 and `?uploadId` real's 400 once the bucket is found. A bucket's
+sub-resources at a key's path are the bucket's own, whatever the key: the bucket's answer, apart
+from `?logging` and `?versions`, which are real's 400s there. A `versionId` at a bucket's path is
+real's 400 on every operation there, a `?website` with a value real's 400 at either path, and an
+`annotationName` at a key without the `annotation` it belongs to real's 400. Two sub-resources at
+once are `InvalidArgument`, as on real S3, and an unknown query key is ignored, as on real S3.
 
 A method no operation above serves answers what real answers: the 405 that names the method and
 whether the resource is a `BUCKET`, an `OBJECT` or the `SERVICE`, the 400 an `OPTIONS` without an
@@ -380,19 +383,26 @@ and two selectors are the conflict a GET gets. The methods real answers by writi
 write method such as `POST ?delete`, `PUT ?acl` or a key's `POST ?uploads` — are `NotImplemented`
 (501), since the corpus is served as it was imported. Every one of them but CreateBucket first
 resolves the bucket it names, and one that does not exist, or that the caller cannot see, is
-`NoSuchBucket` instead, as on real. The `Allow` on a 405 names what Backlot serves rather than
-real's own methods. A method S3 defines nothing for at all, `TRACE` among them, is the 400 real
-answers it with rather than a 405.
+`NoSuchBucket` instead, as on real. Three are then checked as real checks them before it writes: a
+bucket's `POST ?restore`, which names no object, is real's 400; `POST ?delete`, at a bucket's path
+or a key's, is refused for its checksum headers, its `Content-MD5`, a body real's schema does not
+take, an empty key and a digest the body does not match; and a key's `PUT ?encryption` for a
+Signature Version 2 signature, its `Content-MD5`, its body, the key and the KMS key's ARN. The
+`Allow` on a 405 names what Backlot serves rather than real's own methods. A method S3 defines
+nothing for at all, `TRACE` among them, is the 400 real answers it with rather than a 405.
 
-A signed call is SigV4; see [auth.md](auth.md). An unsigned one is an anonymous caller's, as on
-real, and an anonymous caller can see no bucket, so it is `NoSuchBucket` wherever a signed caller
-that cannot see the bucket would be; real says `AccessDenied` for a bucket that exists, which would
-tell an unsigned caller which names the corpus holds. The method refusals above answer an unsigned
-request as a signed one, as on real, and so do the 405 a GET or a HEAD gets for a sub-resource, the
-conflict of two and the listing's own parameter refusals. A signature that is sent and does not
-verify is refused ahead of each 405, with real's members naming the string this server signed and
-the canonical request it signed it over, and after the conflict and the parameter refusals, as on
-real. Each other credential refusal is real's own code and message too.
+A signed call is SigV4 or Signature Version 2, in the header or the query, both of which real
+verifies; see [auth.md](auth.md). The region a SigV4 credential scope names has to be `us-east-1`,
+the one this server presents, and another is real's `AuthorizationHeaderMalformed` naming it. An
+unsigned one is an anonymous caller's, as on real, and an anonymous caller can see no bucket, so it
+is `NoSuchBucket` wherever a signed caller that cannot see the bucket would be; real says
+`AccessDenied` for a bucket that exists, which would tell an unsigned caller which names the corpus
+holds. The method refusals above answer an unsigned request as a signed one, as on real, and so do
+the 405 a GET or a HEAD gets for a sub-resource, the conflict of two and the parameter refusals
+before the bucket. A signature that is sent and does not verify is refused ahead of each 405, with
+real's members naming the string this server signed and, for SigV4, the canonical request it signed
+it over, and after the conflict and the parameter refusals, as on real. Each other credential
+refusal is real's own code and message too.
 
 ### Slack — `/slack/api`
 

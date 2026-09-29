@@ -955,6 +955,30 @@ def test_an_operation_answered_with_another_operations_body_is_breaking(monkeypa
     )
 
 
+def test_an_error_of_the_vendors_own_is_an_answer_and_not_a_missing_operation(monkeypatch):
+    """A 404 naming a vendor code is what an implemented operation answers where there is nothing
+    configured, as real's `NoSuchCORSConfiguration` is; only `NotImplemented` is a refusal. The
+    control is the same status with that code."""
+    listing = '<?xml version="1.0"?><ListBucketResult><Name>b</Name></ListBucketResult>'
+
+    def fake(method, url, headers=None, timeout=None):
+        if "tagging" in url:
+            return httpx.Response(404, text="<Error><Code>NotImplemented</Code></Error>")
+        if "acl" in url:
+            return httpx.Response(404, text="<Error><Code>NoSuchCORSConfiguration</Code></Error>")
+        return httpx.Response(200, text=listing)
+
+    monkeypatch.setattr(s3_probe.httpx, "request", fake)
+    found = {
+        f.path.split(":")[0]: f
+        for f in s3_probe.probe(
+            "http://x", "ak", "sk", s3_probe.operations(S3_MODEL), bucket="b", key="k"
+        )
+    }
+    assert "GetBucketAcl" not in found
+    assert found["GetObjectTagging"].kind == "missing_operation"
+
+
 def test_two_bodies_under_one_root_element_are_told_apart_by_their_children(monkeypatch):
     """#188: both listings are `200 <ListBucketResult>`, so status and root alone cannot tell
     ListObjectsV2 from the body a bare bucket GET answers with — which is why V2 had to be

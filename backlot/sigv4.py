@@ -1,8 +1,9 @@
 """AWS Signature Version 4 verification for the S3 router — standard library only.
 
-Real S3 clients (boto3, aioboto3/mirage, the AWS CLI the awslabs MCP server drives) always
-SigV4-sign their requests. This module rebuilds the canonical request → string-to-sign →
-signature so the server can authenticate them without adding botocore as a runtime dependency.
+The S3 clients this project is exercised with (boto3, aioboto3/mirage, the AWS CLI the awslabs MCP
+server drives) SigV4-sign their requests by default. This module rebuilds the canonical request →
+string-to-sign → signature so the server can authenticate them without adding botocore as a runtime
+dependency; ``backlot.sigv2`` does the same for Signature Version 2.
 
 Only read-only GET/HEAD is served, so the payload hash is taken verbatim from the client's
 ``x-amz-content-sha256`` header (empty body / UNSIGNED-PAYLOAD) — no body hashing here. S3's
@@ -19,6 +20,9 @@ from urllib.parse import parse_qsl, quote
 
 ALGORITHM = "AWS4-HMAC-SHA256"
 AMZ_DATE_FORMAT = "%Y%m%dT%H%M%SZ"
+# The one region this server presents, in `x-amz-bucket-region` and the empty `LocationConstraint`,
+# and the one a credential scope has to name.
+REGION = "us-east-1"
 
 
 def _sha256_hex(data: bytes) -> str:
@@ -37,8 +41,11 @@ def _signing_key(secret: str, date_stamp: str, region: str, service: str = "s3")
 
 
 def parse_authorization(header: str | None) -> dict | None:
-    """Parse a SigV4 ``Authorization`` header into its three fields, or None if malformed."""
-    if not header or not header.startswith(ALGORITHM):
+    """Parse a SigV4 ``Authorization`` header into its three fields, or None if malformed.
+
+    The scheme is matched without case, as real matches it: `aws4-hmac-sha256` and
+    `Aws4-Hmac-Sha256` are both read as this scheme and signed as sent (see ``string_to_sign``)."""
+    if not header or header[: len(ALGORITHM)].upper() != ALGORITHM:
         return None
     parts: dict[str, str] = {}
     for kv in header[len(ALGORITHM) :].strip().split(","):
@@ -110,9 +117,14 @@ def is_skewed(request_time: datetime, now: datetime, max_skew: int = 900) -> boo
     return abs((now - request_time).total_seconds()) > max_skew
 
 
-def string_to_sign(amz_date: str, date_stamp: str, region: str, canonical: str) -> str:
+def string_to_sign(
+    amz_date: str, date_stamp: str, region: str, canonical: str, algorithm: str = ALGORITHM
+) -> str:
+    """``algorithm`` is the scheme as the header spells it: real signs `aws4-hmac-sha256` as it came,
+    so that header verifies against a signature computed over that line and no other (the first
+    line of the `StringToSign` it returned for the two spellings above, 2026-09-29)."""
     scope = f"{date_stamp}/{region}/s3/aws4_request"
-    return "\n".join([ALGORITHM, amz_date, scope, _sha256_hex(canonical.encode("utf-8"))])
+    return "\n".join([algorithm, amz_date, scope, _sha256_hex(canonical.encode("utf-8"))])
 
 
 def sign(secret: str, date_stamp: str, region: str, to_sign: str) -> str:
