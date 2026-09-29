@@ -346,7 +346,7 @@ virtual-hosted client looks for `acme-artifacts.localhost:8000` and finds nothin
 
 | Operation | Notes |
 |---|---|
-| `ListBuckets` | An unsigned request is real's 307 to the product page |
+| `ListBuckets` | `max-buckets`, `prefix`, `continuation-token` and `bucket-region`, paged and refused as real pages and refuses them, with each bucket's region beside its ARN once one is sent. An unsigned request is real's 307 to the product page |
 | `HeadBucket` | The listing's parameters are refused as the listing refuses them, apart from the `max-keys` range, as on real |
 | `GetBucketLocation` | |
 | `GetBucketVersioning`, `GetBucketAcl` and the rest of a bucket's configurations | Each as real answers a bucket nobody configured, byte for byte: the default where real has one (`?acl` the owner's `FULL_CONTROL`, `?encryption` SSE-S3, `?versioning` and `?accelerate` empty) and real's 404 where it has none (`NoSuchCORSConfiguration`, `NoSuchBucketPolicy`, `NoSuchTagSet` and the rest). The four configuration lists are empty and read `id` and `continuation-token` as real does |
@@ -354,24 +354,23 @@ virtual-hosted client looks for `acme-artifacts.localhost:8000` and finds nothin
 | `ListMultipartUploads` | Always the empty page, since data enters through `backlot import` and no upload is ever in progress. `prefix`, `delimiter` and `key-marker` are echoed, `max-uploads` and `encoding-type` validated and echoed, as real does |
 | `ListObjects` | The bare bucket GET, and what any `list-type` other than `2` selects. `prefix`, `delimiter`, `marker`, `max-keys`, `encoding-type`; `Marker` echoed, `NextMarker` under a delimiter, an `Owner` on every object |
 | `ListObjectsV2` | Selected by `list-type=2`. `prefix`, `delimiter`, `start-after`, `continuation-token`, `max-keys`, `encoding-type`; `KeyCount` and the continuation tokens, no `Owner` |
-| `GetObject` | `Range`. A key in a bucket that does not exist, or that the caller cannot see, is `NoSuchBucket`, as on real |
+| `GetObject` | `Range`; `partNumber`, where part `1` is the whole object as the 206 of its range, a higher part real's 416 and a number outside 1 to 10000 or one beside a `Range` real's 400; and `versionId=null`, the one version each key has, where any other `versionId` is real's 400. A key in a bucket that does not exist, or that the caller cannot see, is `NoSuchBucket`, as on real |
 | `HeadObject` | |
+| `GetObjectAcl`, `GetObjectTagging`, `GetObjectAttributes` and the rest of an object's sub-resources | Each as real answers an object with no tags, annotations or checksum in a bucket without Object Lock, byte for byte: `?acl` the owner's `FULL_CONTROL`, `?tagging` an empty `TagSet`, `?attributes` the ETag, storage class and size asked for, `?annotation` no annotations and `NoSuchAnnotation` for one named, `?legal-hold` and `?retention` real's 400 for a bucket without Object Lock, and `?torrent` real's 405 |
 | `ListParts` | Always `NoSuchUpload`, since no upload is ever in progress; `max-parts` and `part-number-marker` validated first, as real does |
 
-An object's sub-resources — `?acl`, `?tagging`, `?attributes` and the rest of what botocore declares
-at an object's path — are refused with `NotImplemented` (501), so a client gets an error to handle
-rather than the object's bytes parsed as something else. These are answered otherwise, as real
-answers them. `?session` is the listing: CreateSession is for directory buckets only and real S3
-answers it with the listing on a general purpose bucket. A sub-resource whose operations are all on
-another method, `?delete` and a key's `?restore` and `?select` among them, is the 405 a GET or a
-HEAD naming it gets, and a key's `?uploads` on a GET is real's 400. A `?partNumber` at a bucket's
-path, which names a part of an object, is real's 400 on a GET, a HEAD, a `PUT`, a `POST`, a
-`DELETE` and a `PATCH`, and beside `?uploadId` it is UploadPart's 405. At a bucket's path
-`?torrent` is real's 405 and `?uploadId` real's 400 once the bucket is found. A bucket's
-sub-resources at a key's path are the bucket's own, whatever the key: the bucket's answer, apart
-from `?logging` and `?versions`, which are real's 400s there. A `versionId` at a bucket's path is
-real's 400 on every operation there, a `?website` with a value real's 400 at either path, and an
-`annotationName` at a key without the `annotation` it belongs to real's 400. Two sub-resources at
+The other sub-resources are answered as real answers them. `?session` is the listing: CreateSession
+is for directory buckets only and real S3 answers it with the listing on a general purpose bucket. A
+sub-resource whose operations are all on another method, `?delete` and a key's `?restore` and
+`?select` among them, is the 405 a GET or a HEAD naming it gets, and a key's `?uploads` on a GET is
+real's 400. A `?partNumber` at a bucket's path, which names a part of an object, is real's 400 on a
+GET, a HEAD, a `PUT`, a `POST`, a `DELETE` and a `PATCH`, and beside `?uploadId` it is UploadPart's
+405. At a bucket's path `?torrent` is real's 405 and `?uploadId` real's 400 once the bucket is
+found. A bucket's sub-resources at a key's path are the bucket's own, whatever the key: the bucket's
+answer, apart from `?logging` and `?versions`, which are real's 400s there. A `versionId` at a
+bucket's path is real's 400 on every operation there, a `?website` with a value real's 400 at either
+path, and an `annotationName` at a key without the `annotation` it belongs to real's 400, which most
+of real's front ends answer a GET with and a few answer as if it were absent. Two sub-resources at
 once are `InvalidArgument`, as on real S3, and an unknown query key is ignored, as on real S3.
 
 A method no operation above serves answers what real answers: the 405 that names the method and

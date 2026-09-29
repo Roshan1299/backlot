@@ -308,10 +308,11 @@ The tests are the record here (`tests/test_github.py`, the rate-limit test), not
 
 The `Allow` on S3's HEAD refusals is a third. A `HEAD` carrying a sub-resource selector is 405 on
 both sides, and real names the methods that sub-resource takes where Backlot names only `GET`, for
-the two selectors its own `GET` serves (`backlot.routers.s3._head_refusal`). The `s3` probe reads no
-response header, so the difference is invisible to the diff and a hand-written acknowledgement would
-come back as "acknowledged but no longer diverging" on the next run. `tests/test_s3.py` is the
-record, in the two parametrized sub-resource tests and the HEAD one beside them.
+the selectors its own `GET` at that path answers (`backlot.routers.s3._head_refusal`). The `s3`
+probe reads no response header, so the difference is invisible to the diff and a hand-written
+acknowledgement would come back as "acknowledged but no longer diverging" on the next run.
+`tests/test_s3.py` is the record, in the two parametrized sub-resource tests and the HEAD one after
+them.
 
 Confluence is not yet fully covered: its reads now live in a v2 document whose paths are shaped
 differently from the v1 ones Backlot serves, so the eight reads Atlassian has removed from the v1

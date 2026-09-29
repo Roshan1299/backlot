@@ -13,10 +13,10 @@ What can be asked instead is what the server actually answers. An operation Back
 implement should be REFUSED, which it does with ``NotImplemented``; one it does implement may answer
 with an error of the vendor's own, the 404 real gives a bucket with no CORS configuration for one,
 and that is its answer rather than a refusal. The failure this looks for is the third possibility:
-answering an operation with some other operation's body. A caller asking for a bucket's versioning configuration and receiving
-an object listing under a 200 gets no error, no log line, and a parse that quietly produces
-nonsense — which is the exact failure this project exists to prevent, and it cannot be seen in a
-document.
+answering an operation with some other operation's body. A caller asking for a bucket's versioning
+configuration and receiving an object listing under a 200 gets no error, no log line, and a parse
+that quietly produces nonsense — which is the exact failure this project exists to prevent, and it
+cannot be seen in a document.
 
 An operation is judged indistinguishable when its response has the same status, the same XML root
 element AND the same set of child elements as the same path carrying no query at all. The child

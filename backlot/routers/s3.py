@@ -21,9 +21,10 @@ progress, and ``?uploadId`` at a key (ListParts) is ``NoSuchUpload`` for the sam
 selector whose operations are all on another method is the 405 a GET gets on real
 (``_BUCKET_READ_REFUSED``, ``_OBJECT_READ_REFUSED``), and a few more are refused at one path the
 way real refuses them there (``_BUCKET_OBJECT_SELECTORS``, ``_KEY_BUCKET_REFUSALS``). An object's
-own selectors are refused with ``NotImplemented`` (501) rather than answered with the object's
-bytes, so a caller gets an error to handle instead of another operation's body to parse; so are
-the writes, after what real checks of three of them first (``_WRITE_CHECKS``).
+own are answered as real answers an object with no tags, no annotations and no checksum in a
+bucket without Object Lock (``_object_subresource``), ``?torrent`` being the 405 real gives its
+GET. The writes are refused with ``NotImplemented`` (501), after what real checks of three of them
+first (``_WRITE_CHECKS``).
 
 Object model: a bucket is the grouping/ACL unit (``s3_buckets``); an object is one doc
 (``s3_objects``), ``key`` is its address and ``content`` its verbatim body. "Folders" are pure
@@ -43,7 +44,7 @@ from xml.sax.saxutils import escape
 import xxhash
 from fastapi import APIRouter, Request, Response
 
-from backlot import auth, store, synth
+from backlot import auth, sigv4, store, synth
 from backlot.openapi import qp
 
 router = APIRouter(prefix="/s3", tags=["s3"])
@@ -240,6 +241,10 @@ _ERR_STATUS = {
     "MalformedXML": 400,
     "InvalidDigest": 400,
     "BadDigest": 400,
+    "NoSuchVersion": 404,
+    "InvalidPartNumber": 416,
+    "NoSuchAnnotation": 404,
+    "UserAnnotationNameMustBeSpecified": 400,
     # "A header you provided implies functionality that is not implemented. HTTP Status Code: 501"
     # — S3 API reference, the Error data type's code table.
     "NotImplemented": 501,
@@ -349,8 +354,18 @@ _KEY_BUCKET_REFUSALS = {
         "There is no such thing as the ?versions sub-resource for a key",
     ),
 }
-# The selectors `object_get` answers rather than refusing, which the `Allow` at a key names.
-_OBJECT_GETS = _KEY_BUCKET_SELECTORS - _KEY_BUCKET_REFUSALS.keys()
+# The selectors `object_get` answers rather than refusing, which the `Allow` at a key names: the
+# bucket's it answers there, the object's own, `?torrent` apart (``_object_subresource``), and
+# ListParts' `?uploadId`.
+_OBJECT_GETS = (_KEY_BUCKET_SELECTORS - _KEY_BUCKET_REFUSALS.keys()) | {
+    "acl",
+    "annotation",
+    "attributes",
+    "legal-hold",
+    "retention",
+    "tagging",
+    "uploadId",
+}
 
 # What real answers each of a bucket's configurations with on a bucket nobody configured, which is
 # every bucket here: measured 2026-09-29 on a bucket this account created in us-east-1 that day,
@@ -733,10 +748,19 @@ def _key_selected(q) -> list[str]:
     `annotation` names the operation it belongs to: alone, real refused it at a key with "Unexpected
     query string parameter" under `ResourceType` on a GET and with the 400 on a HEAD, and beside
     another selector it is the conflict (`acl, annotationName`), before the credential and the
-    bucket (measured 2026-09-29). At a bucket's path it is left to the listing, as real leaves it."""
+    bucket (measured 2026-09-29). Not every front end of real's refuses it on a GET: asked one
+    address at a time, 81 of 92 addresses of `s3.us-east-1.amazonaws.com` refused it on every
+    request and the other 11 answered every one with the object, as if it were absent, and 90 HEADs
+    spread over whichever address each reached were all the 400 (same date). The refusal is what
+    most of them give and what a HEAD gets. At a bucket's path it is left to the listing, as real
+    leaves it. `partNumber` beside a selector other than `uploadId` is the conflict too
+    (`?partNumber=1&tagging` is "partNumber, tagging", same date); alone it is GetObject's
+    (``_part_refusal``), and beside `uploadId` UploadPart."""
     selected = _selected(q, _OBJECT_READ_SELECTORS)
     if "annotationName" in q and "annotation" not in q:
         selected = sorted([*selected, "annotationName"])
+    if "partNumber" in q and selected and selected != ["uploadId"]:
+        selected = sorted([*selected, "partNumber"])
     return selected
 
 
@@ -764,27 +788,6 @@ def _head_refusal(selected: list[str], served_on_get: frozenset[str]) -> Respons
     return _head(405, {"Allow": "GET"} if selected[0] in served_on_get else None)
 
 
-def _not_implemented(selector: str) -> Response:
-    """Refuse an operation Backlot does not implement, an object's sub-resource, instead of
-    answering it with the object's bytes.
-
-    ``NotImplemented`` is the S3 error code for "functionality that is not implemented" (the API
-    reference's Error code table), and 501 is not a status botocore retries, so a boto3 caller gets
-    one ``ClientError`` straight away. Without it an object sub-resource would get the object's
-    bytes, which botocore cannot parse as XML and reports as a 500 after retrying.
-
-    Real S3 answers each of these operations rather than refusing it — an object's ``?tagging`` is
-    an empty ``<Tagging>`` and its ``?acl`` the owner's grant (measured 2026-09-29 on an object in a
-    bucket this account created) — so every refusal here is a gap the S3 baseline records, with the
-    answer real S3 gives written beside it.
-    """
-    return _error(
-        "NotImplemented",
-        "A query string parameter you provided selects an operation that is not implemented: "
-        + selector,
-    )
-
-
 def _auth(request: Request):
     """``(caller, visible_ids, None)``, or ``(None, None, refusal)`` for a credential real refuses.
 
@@ -801,13 +804,14 @@ def _auth(request: Request):
 
 
 def _owner_id(request: Request) -> str:
-    """A stable canonical-user-style id for the org that owns every bucket here."""
-    return synth._digest("s3-owner:" + request.app.state.acl.org_name)[:16]
+    """A stable canonical user id for the org that owns every bucket here, in real's shape: 64
+    lower-case hex digits, which real's own owner id was (2026-09-29)."""
+    return synth._digest("s3-owner:" + request.app.state.acl.org_name)
 
 
 def _owner_xml(request: Request) -> str:
-    org = request.app.state.acl.org_name
-    return f"<Owner><ID>{_owner_id(request)}</ID><DisplayName>{escape(org)}</DisplayName></Owner>"
+    """The owner as ListBuckets names it, the id and no `DisplayName` (same date)."""
+    return f"<Owner><ID>{_owner_id(request)}</ID></Owner>"
 
 
 def _bucket_visible(conn, bucket: str, visible) -> bool:
@@ -859,31 +863,107 @@ def _decode_token(token: str) -> tuple[str, str] | None:
 @router.get("")
 @router.get("/")
 async def list_buckets(request: Request):
-    """ListBuckets — every bucket the caller can see.
+    """ListBuckets — every bucket the caller can see, in name order.
 
     A bucket is visible when any object in it is, so a caller with no readable object in a bucket
     does not learn the bucket exists. An unsigned request is real's 307 to the product page, with no
-    body (measured 2026-09-29), where it answers a signed one with the listing."""
+    body, where it answers a signed one with the listing.
+
+    Each bucket is its name, its creation date and its ARN, and with any of ListBuckets' own
+    parameters sent (``_LIST_BUCKETS_PARAMETERS``), an empty one too, its region as well, between
+    the date and the ARN; after the buckets come the prefix, when one was sent, an empty one
+    included, and a continuation token, when the page is truncated, which resumes after the page's
+    last name. An empty page is `<Buckets/>`. `max-buckets`, `prefix` and `bucket-region` are each
+    read where they are first sent. `max-buckets` is parsed as `max-keys` is and has to be 1 to
+    10000, a value outside that named as parsed (`-01` as `-1`), and `bucket-region` has to be
+    us-east-1, compared without case: another region (``_AWS_REGIONS``) is refused as one this
+    endpoint does not serve, and any other value, a region with a space beside it among them, as no
+    region, named as sent. Those two come before the credential, unsigned and over a bad secret
+    alike, and `max-buckets` first; a `continuation-token` that does not decode after it, an
+    unsigned request being the 307 then (all measured 2026-09-29 on this account's buckets in
+    us-east-1)."""
+    q = request.query_params
+    paged = any(name in q for name in _LIST_BUCKETS_PARAMETERS)
+    max_buckets = _MAX_BUCKETS
+    if "max-buckets" in q:
+        max_buckets, err = _int32_param(q, "max-buckets", _MAX_BUCKETS)
+        if err:
+            return err
+        if not 1 <= max_buckets <= _MAX_BUCKETS:
+            return _argument_error(
+                f"Argument max-buckets must be an integer between 1 and {_MAX_BUCKETS}",
+                "max-buckets",
+                str(max_buckets),
+            )
+    region = _first(q, "bucket-region", None)
+    if region is not None and region.lower() != sigv4.REGION:
+        message = (
+            "Requests with bucket-region specified must be made to the corresponding regional "
+            "endpoint"
+            if region.lower() in _AWS_REGIONS
+            else f"Argument value {region} is not a valid AWS Region"
+        )
+        return _error("InvalidArgument", message, extra=_argument_name("bucket-region"))
     caller, visible, err = _auth(request)
     if err:
         return err
     if caller.is_anonymous:
         return Response(status_code=307, headers={"Location": _ANONYMOUS_LIST_BUCKETS})
+    after = None
+    token = _first(q, "continuation-token", None)
+    if token:
+        decoded = _decode_token(token)
+        if decoded is None or decoded[0] != "after":
+            return _error(
+                "InvalidArgument",
+                "The continuation token provided is incorrect",
+                extra=_argument_name("continuation-token"),
+            )
+        after = decoded[1]
+    prefix = _first(q, "prefix", None)
     conn = auth.conn(request)
-    buckets = [
+    names = sorted(
         b["name"]
         for b in store.list_containers(conn, "s3")
-        if _bucket_visible(conn, b["name"], visible)
-    ]
+        if b["name"].startswith(prefix or "")
+        and (after is None or b["name"] > after)
+        and _bucket_visible(conn, b["name"], visible)
+    )
+    page, truncated = names[:max_buckets], len(names) > max_buckets
+    region_xml = f"<BucketRegion>{sigv4.REGION}</BucketRegion>" if paged else ""
     items = "".join(
         f"<Bucket><Name>{escape(b)}</Name>"
-        f"<CreationDate>{synth.s3_iso(synth.epoch('s3-bucket:' + b))}</CreationDate></Bucket>"
-        for b in buckets
+        f"<CreationDate>{synth.s3_iso(synth.epoch('s3-bucket:' + b))}</CreationDate>"
+        f"{region_xml}<BucketArn>arn:aws:s3:::{escape(b)}</BucketArn></Bucket>"
+        for b in page
     )
+    tail = f"<Prefix>{escape(prefix)}</Prefix>" if prefix is not None else ""
+    if truncated:
+        tail += f"<ContinuationToken>{_encode_key_token(page[-1])}</ContinuationToken>"
+    buckets = f"<Buckets>{items}</Buckets>" if items else "<Buckets/>"
     return _xml(
-        f'<ListAllMyBucketsResult xmlns="{NS}">{_owner_xml(request)}'
-        f"<Buckets>{items}</Buckets></ListAllMyBucketsResult>"
+        f'<ListAllMyBucketsResult xmlns="{NS}">{_owner_xml(request)}{buckets}{tail}'
+        "</ListAllMyBucketsResult>"
     )
+
+
+# ListBuckets' own parameters, any of which turns on the paged form of its answer (same date).
+_LIST_BUCKETS_PARAMETERS = ("max-buckets", "prefix", "continuation-token", "bucket-region")
+_MAX_BUCKETS = 10000
+# The regions `bucket-region` takes as regions: every region botocore 1.40.61's endpoint partitions
+# name, 46 of them. Real served us-east-1 and refused each of the other 45 as needing its own
+# endpoint, where `us-east-9`, `eu-west-9`, `global`, `local`, `us-east-1a` and an empty value were
+# refused as no region at all, and so were `us-east-1` with a space before or after it or a tab
+# after it and `us-west-2` with a space before it or a tab after it (2026-09-29).
+_AWS_REGIONS = frozenset(
+    """af-south-1 ap-east-1 ap-east-2 ap-northeast-1 ap-northeast-2 ap-northeast-3 ap-south-1
+    ap-south-2 ap-southeast-1 ap-southeast-2 ap-southeast-3 ap-southeast-4 ap-southeast-5
+    ap-southeast-6 ap-southeast-7 ca-central-1 ca-west-1 cn-north-1 cn-northwest-1 eu-central-1
+    eu-central-2 eu-isoe-west-1 eu-north-1 eu-south-1 eu-south-2 eu-west-1 eu-west-2 eu-west-3
+    eusc-de-east-1 il-central-1 me-central-1 me-south-1 mx-central-1 sa-east-1 us-east-1 us-east-2
+    us-gov-east-1 us-gov-west-1 us-iso-east-1 us-iso-west-1 us-isob-east-1 us-isob-west-1
+    us-isof-east-1 us-isof-south-1 us-west-1 us-west-2""".split()
+)
 
 
 # What this server serves at each path, which is what its `Allow` names — real names its own
@@ -1327,7 +1407,7 @@ def _url_encode(value: str) -> str:
 
 
 def _int32_param(q, name: str, default: int) -> tuple[int, Response | None]:
-    """``max-uploads`` and ``max-keys``, parsed the way real S3 parses both (measured).
+    """An integer query parameter, parsed the way real S3 parses ``max-keys`` (measured).
 
     Absent or empty is the default; a run of digits, with or without a leading ``-``, is read for
     its value, leading zeros and all (``05`` and ``00000000005`` are both 5, twenty zeros and a 5 is
@@ -1338,12 +1418,16 @@ def _int32_param(q, name: str, default: int) -> tuple[int, Response | None]:
     ``-2147483649``) — is refused here, before the lookup, with "Provided <name> not an integer or
     within integer range". Not ``int()``, which accepts `` 5`` and ``+5`` and has no ceiling.
 
-    The two parameters take the same parser because real parses them the same way, which was
+    Each parameter takes the same parser because real parses them the same way, which was
     measured on each separately: the listing refuses ``max-keys=abc``, ``max-keys= 5``,
     ``max-keys=2147483648`` and ``max-keys=-2147483649`` with this message and serves ``max-keys=``,
     ``max-keys=05`` and ``max-keys=-0``, as ListMultipartUploads does for its own (2026-09-11 and
-    2026-09-14). Where they differ is the range refusal, which spells the name differently — see
-    ``_range_refusal``.
+    2026-09-14); ListParts refuses ``max-parts=abc``, ListBuckets ``max-buckets=abc``,
+    ``max-buckets= 1`` and ``max-buckets=1 `` and serves ``max-buckets=05``, and
+    ListObjectAnnotations refuses ``max-annotation-results=abc`` and serves
+    ``max-annotation-results=005`` (2026-09-29). Where they differ is the range each is held to
+    and how its refusal names the value — see ``_range_refusal``, ``list_buckets`` and
+    ``_object_parse``.
     """
     raw = _first(q, name)
     if raw == "":
@@ -1482,9 +1566,9 @@ def _list_object_versions(request: Request, conn, bucket: str, visible, max_keys
 
     What is refused before the bucket is in ``_versions_parse``. After it, in this order: a
     ``version-id-marker`` that is not `null` ("Invalid version id specified", `NULL` included), an
-    ``encoding-type`` that is not ``url`` compared without case, a ``max-keys`` below zero ("max-keys
-    cannot be negative", with no ``ArgumentValue``). Under ``encoding-type=url`` every key and
-    group, ``Prefix``, ``Delimiter``, ``KeyMarker`` and ``NextKeyMarker`` come back encoded.
+    ``encoding-type`` that is not ``url`` compared without case, a ``max-keys`` below zero
+    ("max-keys cannot be negative", with no ``ArgumentValue``). Under ``encoding-type=url`` every
+    key and group, ``Prefix``, ``Delimiter``, ``KeyMarker`` and ``NextKeyMarker`` come back encoded.
     """
     q = request.query_params
     marker = _first(q, "version-id-marker", None)
@@ -1572,18 +1656,24 @@ def _bucket_configuration(request: Request, bucket: str, selector: str) -> Respo
     if selector == "logging":
         return _xml(_LOGGING, prolog=_DECLARATION + "\n\n")
     if selector == "acl":
-        owner = _owner_id(request)
-        grantee = (
-            '<Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
-            f'xsi:type="CanonicalUser"><ID>{owner}</ID></Grantee>'
-        )
-        return _xml(
-            f'<AccessControlPolicy xmlns="{NS}"><Owner><ID>{owner}</ID></Owner>'
-            f"<AccessControlList><Grant>{grantee}<Permission>FULL_CONTROL</Permission></Grant>"
-            "</AccessControlList></AccessControlPolicy>"
-        )
+        return _xml(_access_control_policy(request))
     body, media_type = _ANSWERED[selector]
     return _xml(body, media_type=media_type)
+
+
+def _access_control_policy(request: Request) -> str:
+    """The owner's `FULL_CONTROL` and nothing else, which real answered a bucket's `?acl` and an
+    object's with on a bucket whose objects its owner owns (`BucketOwnerEnforced`, 2026-09-29)."""
+    owner = _owner_id(request)
+    grantee = (
+        '<Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+        f'xsi:type="CanonicalUser"><ID>{owner}</ID></Grantee>'
+    )
+    return (
+        f'<AccessControlPolicy xmlns="{NS}"><Owner><ID>{owner}</ID></Owner>'
+        f"<AccessControlList><Grant>{grantee}<Permission>FULL_CONTROL</Permission></Grant>"
+        "</AccessControlList></AccessControlPolicy>"
+    )
 
 
 def _configuration_list(q, selector: str) -> Response:
@@ -1631,6 +1721,7 @@ async def object_get(request: Request, bucket: str, key: str):
     first = _website_refusal(q)
     if selected == ["annotationName"]:
         first = _argument_error("Unexpected query string parameter", "ResourceType", selected[0])
+    first = first or _object_parse(request, selected, head)
     # `_OBJECT_GETS`, not `_BUCKET_GETS`: a key's path serves the bucket's selectors in
     # `_KEY_BUCKET_SELECTORS` alone on a GET, so its HEAD refusal names no method for the others.
     refused = _read_refusal(request, selected, _OBJECT_GET_REFUSALS, _OBJECT_GETS, first)
@@ -1668,16 +1759,59 @@ async def object_get(request: Request, bucket: str, key: str):
             "have been aborted or completed.",
             f"<UploadId>{escape(_first(q, 'uploadId'))}</UploadId>",
         )
+    if selected == ["torrent"]:
+        return _method_refusal(request, _OBJECT_WRITE_SELECTORS["torrent"][0])
+    version = _first(q, "versionId", None)
+    if version is not None and version != "null":
+        return _head(400) if head else _argument_error(_BAD_VERSION, "versionId", version)
+    part, number = _first(q, "partNumber", None), None
+    if part is not None:
+        refused = _part_refusal(request, part)
+        if refused is not None:
+            return _head(refused.status_code) if head else refused
+        number = int(part.lstrip("0"))
+    if selected in (["legal-hold"], ["retention"]):
+        return _error("InvalidRequest", "Bucket is missing Object Lock Configuration")
+    if selected == ["attributes"] and "x-amz-object-attributes" not in request.headers:
+        return _error("InvalidRequest", _NO_ATTRIBUTES, prolog="")
+    if selected == ["annotation"] and _first(q, "annotationName", None) == "":
+        return _error(
+            "UserAnnotationNameMustBeSpecified", "You must specify a user annotation name."
+        )
     row = _object_row(conn, bucket, key, visible)
     if row is None:
-        return _head(404) if head else _no_such_key(key)
+        if head:
+            return _head(404)
+        # A key's `?tagging` names what is missing with its bucket, the rest the key alone, and
+        # `?attributes` sends no declaration; `versionId=null` of a key there is none of is the
+        # version that is missing (measured 2026-09-29).
+        missing = escape(f"{bucket}/{key}" if selected == ["tagging"] else key)
+        prolog = "" if selected == ["attributes"] else _DECLARATION + "\n"
+        if version is not None:
+            return _error(
+                "NoSuchVersion",
+                "The specified version does not exist.",
+                f"<Key>{missing}</Key><VersionId>null</VersionId>",
+                prolog=prolog,
+            )
+        return _error(
+            "NoSuchKey", "The specified key does not exist.", f"<Key>{missing}</Key>", prolog=prolog
+        )
     if selected:
-        # The key exists, so the sub-resource is what is being refused — real S3 checks the key
-        # first too: `GET /{missing}?acl` is NoSuchKey (same measurement).
-        return _not_implemented(selected[0])
+        return _object_subresource(request, bucket, key, row, selected[0])
 
     data = row["content"].encode("utf-8")
     total = len(data)
+    if number is not None and number > 1:
+        # Every object here is one part. The part is named as parsed, `02` as `2` (2026-09-29).
+        if head:
+            return _head(416)
+        return _error(
+            "InvalidPartNumber",
+            "The requested partnumber is not satisfiable",
+            f"<PartNumberRequested>{number}</PartNumberRequested>"
+            "<ActualPartCount>1</ActualPartCount>",
+        )
     ts = row["updated_ts"] or row["created_ts"]
     headers = {
         "ETag": synth.s3_etag(row["key"], row["content"]),
@@ -1709,11 +1843,149 @@ async def object_get(request: Request, bucket: str, key: str):
         status = 206
         headers["Content-Range"] = f"bytes {start}-{end}/{total}"
 
+    if number is not None:
+        # The one part is the whole object, sent as the 206 of its range (2026-09-29).
+        status = 206
+        headers["Content-Range"] = f"bytes 0-{total - 1}/{total}"
+
     length = end - start + 1
     headers["Content-Length"] = str(length)
     if head:
         return Response(status_code=status, headers=headers)
     return Response(content=data[start : end + 1], status_code=status, headers=headers)
+
+
+_BAD_VERSION = "Invalid version id specified"
+_MAX_PARTS = 10000
+_NO_ATTRIBUTES = (
+    "The x-amz-object-attributes header specifying the attributes to be retrieved is either "
+    "missing or empty"
+)
+# The names `x-amz-object-attributes` takes, in the order GetObjectAttributes answers them whatever
+# order they were asked in (2026-09-29).
+_OBJECT_ATTRIBUTES = ("ETag", "Checksum", "ObjectParts", "StorageClass", "ObjectSize")
+_MAX_ANNOTATIONS = 1000
+
+
+def _part_refusal(request: Request, part: str) -> Response | None:
+    """GetObject's `partNumber`, which real refuses after the credential and the bucket and before
+    the key, a HEAD as its status alone: beside a `Range` header, an empty or unreadable one
+    included, and then anything but a run of digits whose value is 1 to 10000, leading zeros and
+    all, named as sent (`00`, ` 1`, `1.0`, an empty value); a `versionId` it cannot read comes
+    first (measured 2026-09-29 on an object this account wrote)."""
+    if "range" in request.headers:
+        return _error(
+            "InvalidRequest", "Cannot specify both Range header and partNumber query parameter"
+        )
+    digits = part.lstrip("0")
+    if (
+        not re.fullmatch(r"[0-9]+", part)
+        or not digits
+        or len(digits) > 5
+        or int(digits) > _MAX_PARTS
+    ):
+        return _argument_error(
+            f"Part number must be an integer between 1 and {_MAX_PARTS}, inclusive",
+            "partNumber",
+            part,
+        )
+    return None
+
+
+def _object_parse(request: Request, selected: list[str], head: bool) -> Response | None:
+    """What a GET at a key refuses before the credential and the bucket, as real refused it,
+    unsigned, over a bad secret and in a bucket nobody owns (measured 2026-09-29): an empty
+    `versionId`, "Version id cannot be the empty string"; a `versionId` beside `?torrent`, which
+    takes none; an `x-amz-object-attributes` naming an attribute there is none of, the names
+    matched with their case and read between commas, an empty one skipped; and on a GET
+    ListObjectAnnotations' `max-annotation-results`, parsed as `max-keys` is and then held to 1 to
+    1000, naming it as sent. A HEAD is refused each of the others as its status alone, where
+    `?annotation&max-annotation-results=abc` is the selector's 405 (same date)."""
+    q = request.query_params
+    version = _first(q, "versionId", None)
+    if version == "":
+        return _argument_error("Version id cannot be the empty string", "versionId", "")
+    if selected == ["torrent"] and version is not None:
+        return _argument_error(_NO_VERSION_ID, "versionId", version)
+    sent = request.headers.get("x-amz-object-attributes")
+    if selected == ["attributes"] and sent is not None:
+        names = [name.strip() for name in sent.split(",") if name.strip()]
+        if not names or set(names) - set(_OBJECT_ATTRIBUTES):
+            return _argument_error(
+                "Invalid attribute name specified.", "x-amz-object-attributes", sent
+            )
+    if not head and selected == ["annotation"] and _first(q, "annotationName", None) is None:
+        count, err = _int32_param(q, "max-annotation-results", _MAX_ANNOTATIONS)
+        if err:
+            return err
+        if not 1 <= count <= _MAX_ANNOTATIONS:
+            return _argument_error(
+                f"Argument max-annotation-results must be an integer between 1 and "
+                f"{_MAX_ANNOTATIONS}",
+                "max-annotation-results",
+                _first(q, "max-annotation-results"),
+            )
+    return None
+
+
+def _object_subresource(request: Request, bucket: str, key: str, row, selector: str) -> Response:
+    """An object's own sub-resource, as real answered it for an object with no tags, no
+    annotations and no checksum on a bucket with no Object Lock (2026-09-29, on this account's
+    object and the public bucket's): `?acl` the owner's grant, `?tagging` an empty `TagSet`,
+    `?attributes` the attributes asked for that the object has, in real's order, its ETag unquoted
+    and its `Last-Modified` beside it (no `Checksum`, which the public bucket's object had none of,
+    and no `ObjectParts`, which a single part is none of), and `?annotation` the empty list or, with
+    an `annotationName`, `NoSuchAnnotation`. Those after `?acl` carry no `Content-Type`, as real's
+    did."""
+    q = request.query_params
+    if selector == "acl":
+        return _xml(_access_control_policy(request))
+    if selector == "tagging":
+        return _xml(f'<Tagging xmlns="{NS}"><TagSet/></Tagging>', media_type=None)
+    if selector == "attributes":
+        asked = {name.strip() for name in request.headers["x-amz-object-attributes"].split(",")}
+        values = {
+            "ETag": synth.s3_etag(row["key"], row["content"]).strip('"'),
+            "StorageClass": row["subtype"] or "STANDARD",
+            "ObjectSize": str(len(row["content"].encode())),
+        }
+        inner = "".join(
+            f"<{name}>{escape(values[name])}</{name}>"
+            for name in _OBJECT_ATTRIBUTES
+            if name in asked and name in values
+        )
+        root = "GetObjectAttributesResponse"
+        body = f'<{root} xmlns="{NS}">{inner}</{root}>' if inner else f'<{root} xmlns="{NS}"/>'
+        ts = row["updated_ts"] or row["created_ts"]
+        return _xml(body, media_type=None, headers={"Last-Modified": synth.s3_http_date(ts)})
+    name = _first(q, "annotationName", None)
+    if name is not None:
+        return _error(
+            "NoSuchAnnotation",
+            "The specified annotation does not exist.",
+            f"<AnnotationName>{escape(name)}</AnnotationName>",
+        )
+    if "continuation-token" in q:
+        # After the key, where the count's refusals come before the bucket (same date): there are
+        # never any annotations, so no token names a page of them, an empty one included.
+        return _error(
+            "InvalidArgument",
+            "The continuation token provided is incorrect",
+            extra=_argument_name("continuation-token"),
+        )
+    echo = ""
+    prefix = _first(q, "annotation-prefix", None)
+    if prefix is not None:
+        echo += f"<AnnotationPrefix>{escape(prefix)}</AnnotationPrefix>"
+    if "max-annotation-results" in q:
+        count, _ = _int32_param(q, "max-annotation-results", _MAX_ANNOTATIONS)
+        echo += f"<MaxAnnotationResults>{count}</MaxAnnotationResults>"
+    root = "ListObjectAnnotationsOutput"
+    return _xml(
+        f'<{root} xmlns="{NS}"><Annotations/><Bucket>{escape(bucket)}</Bucket>'
+        f"<Key>{escape(key)}</Key>{echo}<AnnotationCount>0</AnnotationCount></{root}>",
+        media_type=None,
+    )
 
 
 def _parse_range(header: str, total: int):
@@ -1765,11 +2037,11 @@ def _parse_range(header: str, total: int):
 # The methods real answers by doing the write are the ones this server does not serve, so they
 # answer `NotImplemented` (501), the code this router already gives an operation it does not
 # implement, once what real checks of three of them first finds nothing to refuse
-# (``_WRITE_CHECKS``). The rest are real's own answers. Three more deliberate differences, each stated where
-# it is made: the `Allow` names what Backlot serves rather than what real serves, which is what the
-# sub-resource 405 already does; a multipart `POST` on a bucket is refused as a non-multipart one
-# is, since an upload is a write; and a preflight names every bucket path as present
-# (`_cors_preflight`).
+# (``_WRITE_CHECKS``). The rest are real's own answers. Three more deliberate differences, each
+# stated where it is made: the `Allow` names what Backlot serves rather than what real serves, which
+# is what the sub-resource 405 already does; a multipart `POST` on a bucket is refused as a
+# non-multipart one is, since an upload is a write; and a preflight names every bucket path as
+# present (`_cors_preflight`).
 #
 # An unsigned request gets each method refusal a signed one gets, because real answers the method
 # first: an unsigned `PATCH` on a bucket, on a key and at the root, an unsigned `HEAD` at the root,
@@ -1795,8 +2067,10 @@ _WRITE_IS_NOT_SERVED = (
 # other method the 405 naming the type, before the bucket, and with an `Allow` that is exactly the
 # set plus `GET` where the selector has a GET form. A bucket's `restore` and a key's `delete` and
 # `encryption` were measured 2026-09-29 the same way, at the absent name and the public bucket, 23
-# requests, and answered by the same rule. A key's `tagging` is a different type from a bucket's, so
-# the two paths keep their own tables. The selectors here with no GET form, a bucket's `torrent` and
+# requests, and answered by the same rule, and so were a bucket's three `metadata*Table` selectors,
+# which only a `PUT` takes, on each method at the absent name and on a GET and a HEAD at a bucket
+# this account created (same date). A key's `tagging` is a different type from a bucket's, so the
+# two paths keep their own tables. The selectors here with no GET form, a bucket's `torrent` and
 # `uploadId` apart, are the ones a GET is refused for (`_BUCKET_READ_REFUSED`,
 # `_OBJECT_READ_REFUSED`); `session` and `renameObject` answered as the bare path does and are left
 # out.
@@ -1813,7 +2087,13 @@ _BUCKET_WRITE_SELECTORS: dict[str, tuple[str, frozenset[str]]] = {
     "lifecycle": ("LIFECYCLE", frozenset({"DELETE", "PUT"})),
     "location": ("LOCATION", frozenset()),
     "logging": ("LOGGING_STATUS", frozenset({"PUT"})),
+    "metadataAnnotationTable": (
+        "BUCKET_METADATA_ANNOTATION_TABLE_CONFIGURATION",
+        frozenset({"PUT"}),
+    ),
     "metadataConfiguration": ("BUCKET_METADATA_CONFIGURATION", frozenset({"DELETE", "POST"})),
+    "metadataInventoryTable": ("BUCKET_METADATA_INVENTORY_TABLE_CONFIGURATION", frozenset({"PUT"})),
+    "metadataJournalTable": ("BUCKET_METADATA_JOURNAL_TABLE_CONFIGURATION", frozenset({"PUT"})),
     "metadataTable": ("BUCKET_METADATA_TABLE_CONFIGURATION", frozenset({"DELETE", "POST"})),
     "metrics": ("METRICS", frozenset({"DELETE", "PUT"})),
     "notification": ("NOTIFICATION", frozenset({"PUT"})),
@@ -1858,13 +2138,15 @@ _UPLOAD_PART = ("PART", frozenset({"PUT"}))
 # bucket is looked up: those whose operations are all on the methods above, which is every selector
 # of a write table outside `_BUCKET_SELECTORS` and `_OBJECT_SELECTORS`, a key's `uploads` and a
 # bucket's `torrent` and `uploadId` apart.
-# Measured 2026-09-29 against `s3.us-east-1.amazonaws.com`: the selectors of both tables and
-# `partNumber`, `renameObject`, `select-type` and `session`, 40 in all, each on a GET and a HEAD at
-# a bucket nobody owns and at a key in it, 160 requests. These are the ones a GET answered with a
-# 405, which named the type and carried an `Allow` of the write methods, and a HEAD answered each
-# with the 405 and the same `Allow`; the public bucket `noaa-ghcn-pds` and one of its objects
-# answered them the same. The `Allow` is not repeated, since this server serves no method at these
-# selectors, which is the line `_head_refusal` draws.
+# Measured 2026-09-29 against `s3.us-east-1.amazonaws.com`: the selectors of both tables but the
+# three `metadata*Table` ones, and `partNumber`, `renameObject`, `select-type` and `session`, 40 in
+# all, each on a GET and a HEAD at a bucket nobody owns and at a key in it, 160 requests. These are
+# the ones a GET answered with a 405, which named the type and carried an `Allow` of the write
+# methods, and a HEAD answered each with the 405 and the same `Allow`; the public bucket
+# `noaa-ghcn-pds` and one of its objects answered them the same, and so did a bucket's three
+# `metadata*Table` selectors in a later sweep of every selector at both paths (same date). The
+# `Allow` is not repeated, since this server serves no method at these selectors, which is the line
+# `_head_refusal` draws.
 _BUCKET_READ_REFUSED = {
     selector: resource_type
     for selector, (resource_type, _) in _BUCKET_WRITE_SELECTORS.items()
@@ -1935,11 +2217,11 @@ def _cors_preflight(request: Request, message: str) -> Response:
 # Three writes real refuses on what the request carries before doing anything, and this server can
 # answer them the same way before its 501: a bucket's `POST ?restore`, which names no object, a
 # `POST ?delete` at a bucket's path or a key's, DeleteObjects on the bucket either way, and a key's
-# `PUT ?encryption`, UpdateObjectEncryption. Measured 2026-09-29 against `s3.us-east-1.amazonaws.com`
-# on a bucket this account created for it, the public bucket `noaa-ghcn-pds`, another account's
-# bucket and a name nobody owns, the refusals one at a time and two at once. Each comes after the
-# credential and the bucket, as the rest of a write's answer does (``_refuse_write``). What a valid
-# request would then do is the write, which is the 501.
+# `PUT ?encryption`, UpdateObjectEncryption. Measured 2026-09-29 against
+# `s3.us-east-1.amazonaws.com` on a bucket this account created for it, the public bucket
+# `noaa-ghcn-pds`, another account's bucket and a name nobody owns, the refusals one at a time and
+# two at once. Each comes after the credential and the bucket, as the rest of a write's answer does
+# (``_refuse_write``). What a valid request would then do is the write, which is the 501.
 _MALFORMED_XML = (
     "The XML you provided was not well-formed or did not validate against our published schema"
 )
@@ -1948,8 +2230,8 @@ _USER_KEY = "User key must be specified."
 # The `x-amz-checksum-*` algorithms real takes, and the width of each one's value in bytes: a name
 # not here is "The algorithm type you specified in x-amz-checksum- header is invalid.", a value that
 # is not base64 of that width (a word for every one of them, three bytes for `crc32`) "Value for
-# x-amz-checksum-<name> header is invalid.", and `type` and `algorithm` are not algorithms, a request
-# carrying only them lacking the header. Two of them at once are refused as well.
+# x-amz-checksum-<name> header is invalid.", and `type` and `algorithm` are not algorithms, a
+# request carrying only them lacking the header. Two of them at once are refused as well.
 _CHECKSUM_WIDTHS = {
     "crc32": 4,
     "crc32c": 4,
@@ -1976,9 +2258,9 @@ def _reflected_crc_table(poly: int) -> list[int]:
 
 
 # CRC-32C and CRC-64/NVME, each reflected with every bit set before and after, as S3 computes them
-# (``tests/test_s3.py`` checks both against their standard check values). Real took the value of each
-# checksum ``_checksum`` computes, the two here among them, for a DeleteObjects body sent to the
-# public bucket (2026-09-29).
+# (``tests/test_s3.py`` checks both against their standard check values). Real took the value of
+# each checksum ``_checksum`` computes, the two here among them, for a DeleteObjects body sent to
+# the public bucket (2026-09-29).
 _CRC32C = (_reflected_crc_table(0x82F63B78), 32)
 _CRC64NVME = (_reflected_crc_table(0x9A6C9329AC4BC9B5), 64)
 

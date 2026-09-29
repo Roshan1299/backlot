@@ -11,62 +11,6 @@
       "path": "CreateSession: GET /{bucket}?session",
       "detail": "CreateSession is answered 200 <ListBucketResult>, which is what the same path answers with no operation selected: Backlot neither implements it nor refuses it, so a caller parses another operation's body",
       "note": "Not a fallthrough Backlot chose: CreateSession exists for directory buckets only, and real S3 answers `GET /{bucket}?session` on a general purpose bucket with the ListBucketResult too, and `?session&versioning` as GetBucketVersioning with no conflict (measured in us-east-1 and ap-northeast-2), so the listing is the faithful answer and `session` is deliberately not a selector Backlot refuses."
-    },
-    {
-      "kind": "missing_operation",
-      "severity": "gap",
-      "path": "GetObjectAcl: GET /{object}?acl",
-      "detail": "GetObjectAcl is refused (501 NotImplemented), which is an honest answer for an operation Backlot does not serve",
-      "note": "Refused with NotImplemented (501) rather than answered with the object's bytes. Real S3 answers 200 <AccessControlPolicy> with the object owner (measured in us-east-1 and ap-northeast-2 against a general purpose bucket with none of this configured)."
-    },
-    {
-      "kind": "missing_operation",
-      "severity": "gap",
-      "path": "GetObjectAnnotation: GET /{object}?annotation",
-      "detail": "GetObjectAnnotation is refused (501 NotImplemented), which is an honest answer for an operation Backlot does not serve",
-      "note": "Refused with NotImplemented (501) rather than answered with the object's bytes. Real S3 answers 200 <ListObjectAnnotationsOutput> with empty Annotations; the bare `?annotation` the probe sends is the List form (measured in us-east-1 and ap-northeast-2 against a general purpose bucket with none of this configured)."
-    },
-    {
-      "kind": "missing_operation",
-      "severity": "gap",
-      "path": "GetObjectAttributes: GET /{object}?attributes",
-      "detail": "GetObjectAttributes is refused (501 NotImplemented), which is an honest answer for an operation Backlot does not serve",
-      "note": "Refused with NotImplemented (501) rather than answered with the object's bytes. Real S3 answers 400 InvalidRequest, \"The x-amz-object-attributes header specifying the attributes to be retrieved is either missing or empty\" (measured in us-east-1 and ap-northeast-2 against a general purpose bucket with none of this configured)."
-    },
-    {
-      "kind": "missing_operation",
-      "severity": "gap",
-      "path": "GetObjectLegalHold: GET /{object}?legal-hold",
-      "detail": "GetObjectLegalHold is refused (501 NotImplemented), which is an honest answer for an operation Backlot does not serve",
-      "note": "Refused with NotImplemented (501) rather than answered with the object's bytes. Real S3 answers 400 InvalidRequest, \"Bucket is missing Object Lock Configuration\" (measured in us-east-1 and ap-northeast-2 against a general purpose bucket with none of this configured)."
-    },
-    {
-      "kind": "missing_operation",
-      "severity": "gap",
-      "path": "GetObjectRetention: GET /{object}?retention",
-      "detail": "GetObjectRetention is refused (501 NotImplemented), which is an honest answer for an operation Backlot does not serve",
-      "note": "Refused with NotImplemented (501) rather than answered with the object's bytes. Real S3 answers 400 InvalidRequest, \"Bucket is missing Object Lock Configuration\" (measured in us-east-1 and ap-northeast-2 against a general purpose bucket with none of this configured)."
-    },
-    {
-      "kind": "missing_operation",
-      "severity": "gap",
-      "path": "GetObjectTagging: GET /{object}?tagging",
-      "detail": "GetObjectTagging is refused (501 NotImplemented), which is an honest answer for an operation Backlot does not serve",
-      "note": "Refused with NotImplemented (501) rather than answered with the object's bytes. Real S3 answers 200 <Tagging> with an empty TagSet (measured in us-east-1 and ap-northeast-2 against a general purpose bucket with none of this configured)."
-    },
-    {
-      "kind": "missing_operation",
-      "severity": "gap",
-      "path": "GetObjectTorrent: GET /{object}?torrent",
-      "detail": "GetObjectTorrent is refused (501 NotImplemented), which is an honest answer for an operation Backlot does not serve",
-      "note": "Refused with NotImplemented (501) rather than answered with the object's bytes. Real S3 answers 405, with an error code that differs by region: MethodNotAllowed in us-east-1, RequestTorrentNotSupportedInRegion in ap-northeast-2 (measured against a general purpose bucket in each)."
-    },
-    {
-      "kind": "missing_operation",
-      "severity": "gap",
-      "path": "ListObjectAnnotations: GET /{object}?annotation",
-      "detail": "ListObjectAnnotations is refused (501 NotImplemented), which is an honest answer for an operation Backlot does not serve",
-      "note": "Refused with NotImplemented (501) rather than answered with the object's bytes. Real S3 answers 200 <ListObjectAnnotationsOutput> with empty Annotations (measured in us-east-1 and ap-northeast-2 against a general purpose bucket with none of this configured)."
     }
   ]
 }

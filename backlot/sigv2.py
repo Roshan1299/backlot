@@ -2,11 +2,11 @@
 
 Real S3 still verifies it, in the header (``Authorization: AWS <key>:<signature>``) and in the query
 (``AWSAccessKeyId``, ``Expires`` and ``Signature``): botocore's ``HmacV1Auth`` and
-``HmacV1QueryAuth`` were served a listing, a bucket's ``?versioning``, an object and ListBuckets on a
-bucket created that day in us-east-1, and a listing of the public bucket ``noaa-ghcn-pds`` (measured
-2026-09-29). The signature is base64 HMAC-SHA1 over a string of the method, ``Content-MD5``,
-``Content-Type``, the date, the ``x-amz-*`` headers and the resource, each spelled here the way real
-spells them in the ``StringToSign`` it returns on a mismatch.
+``HmacV1QueryAuth`` were served a listing, a bucket's ``?versioning``, an object and ListBuckets on
+a bucket created that day in us-east-1, and a listing of the public bucket ``noaa-ghcn-pds``
+(measured 2026-09-29). The signature is base64 HMAC-SHA1 over a string of the method,
+``Content-MD5``, ``Content-Type``, the date, the ``x-amz-*`` headers and the resource, each spelled
+here the way real spells them in the ``StringToSign`` it returns on a mismatch.
 """
 
 from __future__ import annotations
