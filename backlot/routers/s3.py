@@ -720,16 +720,18 @@ def _read_refusal(
 _NO_VERSION_ID = "This operation does not accept a version-id."
 
 
-def _version_id_refusal(q, selected: list[str]) -> Response | None:
+def _version_id_refusal(q, selected: list[str], method: str = "GET") -> Response | None:
     """A `versionId` at a bucket's path, which names a version of an object and no operation there
     takes one: real refused it on every GET at a bucket's path — both listings, each of the bucket's
-    selectors and `?session` — and on a `PUT` and a `DELETE`, naming the value as sent, an empty
-    one and `null` alike, where `?acl` calls it an invalid id instead; before the credential and
-    the bucket, and after the conflict, a bucket's `partNumber` and the listings' parses, so that
-    `?delete&versionId=x` is this 400 and not the 405 (measured 2026-09-29)."""
+    selectors and `?session` — and on a `DELETE` and a selector's `PUT` (`?versioning`, `?tagging`),
+    naming the value as sent, an empty one and `null` alike, where a GET's `?acl` calls it an
+    invalid id instead; before the credential and the bucket, and after the conflict, a bucket's
+    `partNumber` and the listings' parses, so that `?delete&versionId=x` is this 400 and not the 405
+    (measured 2026-09-29 and 2026-09-30). The writes that read it after the bucket are
+    ``_VERSION_AFTER_THE_BUCKET``'s."""
     if "versionId" not in q:
         return None
-    message = "Invalid version id specified" if selected == ["acl"] else _NO_VERSION_ID
+    message = _BAD_VERSION if selected == ["acl"] and method in ("GET", "HEAD") else _NO_VERSION_ID
     return _argument_error(message, "versionId", _first(q, "versionId"))
 
 
@@ -1710,7 +1712,12 @@ async def object_get(request: Request, bucket: str, key: str):
     bucket is looked up before the key, as real looks them up: a key in a bucket that does not exist
     is NoSuchBucket, with ``?acl`` and ``?uploadId`` as without them (measured 2026-09-29), and so
     is one in a bucket the caller cannot see. An object the caller cannot read is NoSuchKey, not
-    AccessDenied, so a listing and a read agree about what exists."""
+    AccessDenied, so a listing and a read agree about what exists.
+
+    In checksum mode (``_checksum_mode``) an answer holding the whole object carries its CRC-64/NVME
+    (``_crc64nvme``) and a range short of it none, and another mode is real's 400: after the
+    `versionId`, the part's refusals and a range or a part the object does not have, and on a GET,
+    not a HEAD, ahead of a key the bucket does not hold. A sub-resource reads no mode. Real's front ends disagree on a bad `versionId` beside a bad mode or a bad part: 11 of 16 requests of each pair refused the version first (all measured 2026-09-30)."""
     head = request.method == "HEAD"
     q = request.query_params
     selected = _key_selected(q)
@@ -1772,7 +1779,9 @@ async def object_get(request: Request, bucket: str, key: str):
         number = int(part.lstrip("0"))
     if selected in (["legal-hold"], ["retention"]):
         return _error("InvalidRequest", "Bucket is missing Object Lock Configuration")
-    if selected == ["attributes"] and "x-amz-object-attributes" not in request.headers:
+    if selected == ["attributes"] and not _attribute_names(
+        request.headers.get("x-amz-object-attributes")
+    ):
         return _error("InvalidRequest", _NO_ATTRIBUTES, prolog="")
     if selected == ["annotation"] and _first(q, "annotationName", None) == "":
         return _error(
@@ -1782,6 +1791,8 @@ async def object_get(request: Request, bucket: str, key: str):
     if row is None:
         if head:
             return _head(404)
+        if not selected and _checksum_mode(request) is None:
+            return _error("InvalidRequest", _BAD_CHECKSUM_MODE)
         # A key's `?tagging` names what is missing with its bucket, the rest the key alone, and
         # `?attributes` sends no declaration; `versionId=null` of a key there is none of is the
         # version that is missing (measured 2026-09-29).
@@ -1847,6 +1858,12 @@ async def object_get(request: Request, bucket: str, key: str):
         # The one part is the whole object, sent as the 206 of its range (2026-09-29).
         status = 206
         headers["Content-Range"] = f"bytes 0-{total - 1}/{total}"
+    mode = _checksum_mode(request)
+    if mode is None:
+        return _head(400) if head else _error("InvalidRequest", _BAD_CHECKSUM_MODE)
+    if mode and (start, end) == (0, total - 1):
+        headers["x-amz-checksum-crc64nvme"] = _crc64nvme(data)
+        headers["x-amz-checksum-type"] = "FULL_OBJECT"
 
     length = end - start + 1
     headers["Content-Length"] = str(length)
@@ -1856,6 +1873,7 @@ async def object_get(request: Request, bucket: str, key: str):
 
 
 _BAD_VERSION = "Invalid version id specified"
+_BAD_CHECKSUM_MODE = "Value for x-amz-checksum-mode header is invalid."
 _MAX_PARTS = 10000
 _NO_ATTRIBUTES = (
     "The x-amz-object-attributes header specifying the attributes to be retrieved is either "
@@ -1864,6 +1882,10 @@ _NO_ATTRIBUTES = (
 # The names `x-amz-object-attributes` takes, in the order GetObjectAttributes answers them whatever
 # order they were asked in (2026-09-29).
 _OBJECT_ATTRIBUTES = ("ETag", "Checksum", "ObjectParts", "StorageClass", "ObjectSize")
+# A key's selectors whose operation takes no `versionId`: real refused one beside each of them,
+# `null` included, before the bucket and the credential, where `?acl`, `?tagging`, `?attributes`
+# and `?legal-hold` read it as a version after them (2026-09-29 and 2026-09-30).
+_KEY_VERSIONLESS = _KEY_BUCKET_SELECTORS | {"torrent", "uploadId", "uploads"}
 _MAX_ANNOTATIONS = 1000
 
 
@@ -1894,26 +1916,27 @@ def _part_refusal(request: Request, part: str) -> Response | None:
 
 def _object_parse(request: Request, selected: list[str], head: bool) -> Response | None:
     """What a GET at a key refuses before the credential and the bucket, as real refused it,
-    unsigned, over a bad secret and in a bucket nobody owns (measured 2026-09-29): an empty
-    `versionId`, "Version id cannot be the empty string"; a `versionId` beside `?torrent`, which
-    takes none; an `x-amz-object-attributes` naming an attribute there is none of, the names
-    matched with their case and read between commas, an empty one skipped; and on a GET
+    unsigned, over a bad secret and in a bucket nobody owns (measured 2026-09-29 and 2026-09-30):
+    a `versionId`, `null` included, beside a selector whose operation takes none
+    (``_KEY_VERSIONLESS``), "This operation does not accept a version-id."; an empty `versionId`,
+    "Version id cannot be the empty string"; an `x-amz-object-attributes` naming an attribute there
+    is none of, read as ``_attribute_names`` reads it and naming the first such name; and on a GET
     ListObjectAnnotations' `max-annotation-results`, parsed as `max-keys` is and then held to 1 to
     1000, naming it as sent. A HEAD is refused each of the others as its status alone, where
-    `?annotation&max-annotation-results=abc` is the selector's 405 (same date)."""
+    `?annotation&max-annotation-results=abc` is the selector's 405."""
     q = request.query_params
     version = _first(q, "versionId", None)
+    if version is not None and selected and selected[0] in _KEY_VERSIONLESS:
+        return _argument_error(_NO_VERSION_ID, "versionId", version)
     if version == "":
         return _argument_error("Version id cannot be the empty string", "versionId", "")
-    if selected == ["torrent"] and version is not None:
-        return _argument_error(_NO_VERSION_ID, "versionId", version)
     sent = request.headers.get("x-amz-object-attributes")
     if selected == ["attributes"] and sent is not None:
-        names = [name.strip() for name in sent.split(",") if name.strip()]
-        if not names or set(names) - set(_OBJECT_ATTRIBUTES):
-            return _argument_error(
-                "Invalid attribute name specified.", "x-amz-object-attributes", sent
-            )
+        for name in _attribute_names(sent):
+            if name not in _OBJECT_ATTRIBUTES:
+                return _argument_error(
+                    "Invalid attribute name specified.", "x-amz-object-attributes", name
+                )
     if not head and selected == ["annotation"] and _first(q, "annotationName", None) is None:
         count, err = _int32_param(q, "max-annotation-results", _MAX_ANNOTATIONS)
         if err:
@@ -1928,31 +1951,68 @@ def _object_parse(request: Request, selected: list[str], head: bool) -> Response
     return None
 
 
+def _attribute_names(sent: str | None) -> list[str]:
+    """`x-amz-object-attributes` as real reads it: split at each comma, the empty pieces at the end
+    dropped and the rest trimmed, so that `ETag,` and `ETag,,` are `ETag` and `,` is no name at
+    all, the missing header's 400 after the bucket, where `,ETag`, `ETag,,ObjectSize` and
+    `ETag, ,ObjectSize` name an empty one and an empty header is one empty name (measured
+    2026-09-29 and 2026-09-30)."""
+    if sent is None:
+        return []
+    if sent == "":
+        return [""]
+    pieces = sent.split(",")
+    while pieces and pieces[-1] == "":
+        pieces.pop()
+    return [piece.strip() for piece in pieces]
+
+
+def _checksum_mode(request: Request) -> bool | None:
+    """Whether a GET or a HEAD of an object asks for its checksum: `x-amz-checksum-mode: ENABLED`,
+    compared without case, is `True`, no header `False`, and any other value, an empty one
+    included, `None`, which real refused (measured 2026-09-30)."""
+    sent = request.headers.get("x-amz-checksum-mode")
+    if sent is None:
+        return False
+    return True if sent.strip().lower() == "enabled" else None
+
+
+def _crc64nvme(data: bytes) -> str:
+    """The CRC-64/NVME real reports for an object written with no checksum of its own, as the
+    `Checksum` of `?attributes` and the `x-amz-checksum-crc64nvme` of a GET or a HEAD in checksum
+    mode, `FULL_OBJECT` its type (measured 2026-09-30: real's value for the bundled corpus's
+    CHANGELOG.md was this one)."""
+    return base64.b64encode(_checksum("crc64nvme", data)).decode()
+
+
 def _object_subresource(request: Request, bucket: str, key: str, row, selector: str) -> Response:
-    """An object's own sub-resource, as real answered it for an object with no tags, no
-    annotations and no checksum on a bucket with no Object Lock (2026-09-29, on this account's
-    object and the public bucket's): `?acl` the owner's grant, `?tagging` an empty `TagSet`,
-    `?attributes` the attributes asked for that the object has, in real's order, its ETag unquoted
-    and its `Last-Modified` beside it (no `Checksum`, which the public bucket's object had none of,
-    and no `ObjectParts`, which a single part is none of), and `?annotation` the empty list or, with
-    an `annotationName`, `NoSuchAnnotation`. Those after `?acl` carry no `Content-Type`, as real's
-    did."""
+    """An object's own sub-resource, as real answered it for an object written with no tags and no
+    checksum header in a bucket with no Object Lock (2026-09-29 and 2026-09-30, on this account's
+    objects): `?acl` the owner's grant, `?tagging` an empty `TagSet`, `?attributes` the attributes
+    asked for that the object has, in real's order, its ETag unquoted, its `Checksum` the
+    CRC-64/NVME real computed for an object sent without one (``_crc64nvme``) and its
+    `Last-Modified` beside it (no `ObjectParts`, which a single part is none of), and `?annotation`
+    the empty list or, with an `annotationName`, `NoSuchAnnotation`. Those after `?acl` carry no
+    `Content-Type`, as real's did."""
     q = request.query_params
     if selector == "acl":
         return _xml(_access_control_policy(request))
     if selector == "tagging":
         return _xml(f'<Tagging xmlns="{NS}"><TagSet/></Tagging>', media_type=None)
     if selector == "attributes":
-        asked = {name.strip() for name in request.headers["x-amz-object-attributes"].split(",")}
-        values = {
-            "ETag": synth.s3_etag(row["key"], row["content"]).strip('"'),
-            "StorageClass": row["subtype"] or "STANDARD",
-            "ObjectSize": str(len(row["content"].encode())),
+        asked = set(_attribute_names(request.headers.get("x-amz-object-attributes")))
+        data = row["content"].encode("utf-8")
+        elements = {
+            "ETag": escape(synth.s3_etag(row["key"], row["content"]).strip('"')),
+            "Checksum": f"<ChecksumCRC64NVME>{_crc64nvme(data)}</ChecksumCRC64NVME>"
+            "<ChecksumType>FULL_OBJECT</ChecksumType>",
+            "StorageClass": escape(row["subtype"] or "STANDARD"),
+            "ObjectSize": str(len(data)),
         }
         inner = "".join(
-            f"<{name}>{escape(values[name])}</{name}>"
+            f"<{name}>{elements[name]}</{name}>"
             for name in _OBJECT_ATTRIBUTES
-            if name in asked and name in values
+            if name in asked and name in elements
         )
         root = "GetObjectAttributesResponse"
         body = f'<{root} xmlns="{NS}">{inner}</{root}>' if inner else f'<{root} xmlns="{NS}"/>'
@@ -2413,12 +2473,15 @@ async def _delete_objects_refusal(
         checksum = (name, _decoded(value, _CHECKSUM_WIDTHS[name]))
         if checksum[1] is None:
             return _error("InvalidRequest", f"Value for x-amz-checksum-{name} header is invalid.")
-    if "x-amz-sdk-checksum-algorithm" in headers and checksum is None:
+    algorithm = headers.get("x-amz-sdk-checksum-algorithm")
+    if algorithm is not None and checksum is None:
         return _error(
             "InvalidRequest",
             "x-amz-sdk-checksum-algorithm specified, but no corresponding x-amz-checksum-* or "
             "x-amz-trailer headers were found.",
         )
+    if algorithm is not None and algorithm.lower() != checksum[0]:
+        return _error("InvalidRequest", "Value for x-amz-sdk-checksum-algorithm header is invalid.")
     sent, digest, refusal = _content_md5(request)
     if refusal is not None:
         return refusal
@@ -2500,11 +2563,13 @@ def _arn_fault(arn: str) -> str | None:
 
 
 def _is_kms_key(arn: str) -> bool:
-    """A `kms` ARN naming a `key/<id>`: an `alias/` and another service's ARN were "Invalid KMS Key
-    ARN format", where the partition and the region were not read (`aws-cn` and `us-west-2` were
-    both taken on to the account)."""
+    """A `kms` ARN naming a `key/<id>`, the id letters, digits and hyphens: `key/abc` and a key's
+    UUID were taken on to the account, where `key:abc`, `key/abc/def`, `key/abc:def`, `key/a b`,
+    `keys/abc`, an `alias/` and another service's ARN were "Invalid KMS Key ARN format"; the
+    partition and the region were not read (`aws-cn` and `us-west-2` were both taken on to the
+    account; measured 2026-09-29 and 2026-09-30)."""
     parts = arn.split(":", 5)
-    return parts[2] == "kms" and re.fullmatch(r"key[/:].+", parts[5], re.S) is not None
+    return parts[2] == "kms" and re.fullmatch(r"key/[A-Za-z0-9-]+", parts[5]) is not None
 
 
 async def _object_encryption_refusal(
@@ -2669,6 +2734,14 @@ async def service_method_refusal(request: Request) -> Response:
     return _method_refusal(request, "SERVICE", {"Allow": "GET"})
 
 
+# A bucket's writes that read a `versionId` as a version after the bucket rather than refusing it
+# before: real answered `PUT ?acl&versionId=x` and `POST ?restore&versionId=x` with `NoSuchBucket`
+# for a name nobody owns and "Invalid version id specified" on the public bucket, where `DELETE
+# ?acl`, `PUT ?versioning`, `DELETE ?cors`, `PUT ?tagging` and a bare `DELETE` refused it before the
+# bucket, and a bare `POST ?versionId=x` was the 412 (2026-09-30).
+_VERSION_AFTER_THE_BUCKET = frozenset({("PUT", "acl"), ("POST", "restore")})
+
+
 @router.api_route(
     "/{bucket}", methods=["PUT", "POST", "DELETE", "PATCH", "OPTIONS"], include_in_schema=False
 )
@@ -2682,10 +2755,18 @@ async def bucket_method_refusal(request: Request, bucket: str) -> Response:
         return _cors_preflight(request, _CORS_DISABLED)
     q = request.query_params
     selected = _bucket_selected(q, frozenset(_BUCKET_WRITE_SELECTORS))
+    late = len(selected) == 1 and (method, selected[0]) in _VERSION_AFTER_THE_BUCKET
     if len(selected) <= 1 and selected != ["partNumber"]:
-        refused = _version_id_refusal(q, selected) or _website_refusal(q)
+        skip = late or (method == "POST" and not selected)
+        refused = (None if skip else _version_id_refusal(q, selected, method)) or _website_refusal(
+            q
+        )
         if refused is not None:
             return refused
+    if late and "versionId" in q:
+        # Resolved as a write, and then refused as an id real cannot read.
+        instead = _argument_error(_BAD_VERSION, "versionId", _first(q, "versionId"))
+        return await _refuse_write(request, bucket, method, instead=instead)
     if selected == ["uploadId"] and method in _BUCKET_WRITE_SELECTORS["uploadId"][1]:
         # Resolved as a write, and then real's own 400 for the bucket that exists.
         instead = _error("InvalidRequest", _KEY_REQUIRED_FOR_UPLOAD)
@@ -2723,6 +2804,9 @@ async def object_method_refusal(request: Request, bucket: str, key: str) -> Resp
     selected = _selected(q, frozenset(_OBJECT_PATH_WRITE_SELECTORS))
     if selected == ["uploadId"] and "partNumber" in q:
         selected = ["PART"]
+    refused = _website_refusal(q)
+    if refused is not None:
+        return refused
     by_selector = await _selector_refusal(
         request,
         bucket,

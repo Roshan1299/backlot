@@ -646,6 +646,8 @@ _ANONYMOUS_ROWS = [
     ("GET", "/s3/eng-artifacts?start-after=x", 400, "InvalidArgument"),
     ("PUT", "/s3/eng-artifacts", 403, "AccessDenied"),
     ("GET", "/s3/eng-artifacts?list-type=2&X-Amz-Signature=00", 404, "NoSuchBucket"),
+    # ListBuckets, which real answers with a 307 to the product page and no body.
+    ("GET", "/s3/", 307, None),
 ]
 
 
@@ -659,30 +661,24 @@ def test_s3_an_unsigned_request_is_an_anonymous_caller_who_sees_no_bucket(
 ):
     """Every bucket gets the answer for one the caller cannot see (``backlot.routers.s3._auth``).
     The listing's parses come first, as on real. CreateBucket names no bucket, and real's refusal
-    of an anonymous one is its own. The admin, signed, reads the same bucket."""
+    of an anonymous one is its own, and ListBuckets is real's 307 to the product page. The admin,
+    signed, reads the same bucket and the same list."""
     import httpx
 
     base_url, settings = live_server
     r = httpx.request(method, f"{base_url}{path}")
-    assert r.status_code == status and f"<Code>{code}</Code>" in r.text
+    assert r.status_code == status
+    if code is None:
+        assert r.headers["location"] == "https://aws.amazon.com/s3/" and r.content == b""
+        assert _signed(base_url, path, settings.admin_token).status_code == 200
+        return
+    assert f"<Code>{code}</Code>" in r.text
     if code == "NoSuchBucket":
         assert "<BucketName>eng-artifacts</BucketName>" in r.text
     if code == "AccessDenied":
         assert "Anonymous users cannot invoke this API. Please authenticate." in r.text
     signed = _signed(base_url, "/s3/eng-artifacts?list-type=2", settings.admin_token)
     assert signed.status_code == 200
-
-
-def test_s3_an_unsigned_listbuckets_is_reals_redirect_to_the_product_page(live_server):
-    """Measured 2026-09-29: an unsigned `GET /` is a 307 to aws.amazon.com/s3/ with no body, where
-    a signed one is the listing."""
-    import httpx
-
-    base_url, settings = live_server
-    r = httpx.get(f"{base_url}/s3/")
-    assert r.status_code == 307 and r.headers["location"] == "https://aws.amazon.com/s3/"
-    assert r.content == b""
-    assert _signed(base_url, "/s3/", settings.admin_token).status_code == 200
 
 
 def test_s3_a_signature_mismatch_names_what_this_server_signed(live_server):
@@ -906,7 +902,11 @@ def big_bucket_client(big_bucket_settings):
 
 
 def _s3_get(client, path, token, headers=None):
-    """SigV4-sign a GET (same signer as the module-level ``_sign_get``) and issue it through an
+    return _s3_send(client, "GET", path, token, headers)
+
+
+def _s3_send(client, method, path, token, headers=None, body=None):
+    """SigV4-sign a request (same signer as the module-level ``_sign_get``) and issue it through an
     in-process TestClient instead of a live socket."""
     from urllib.parse import parse_qsl, quote, urlencode
 
@@ -925,10 +925,10 @@ def _s3_get(client, path, token, headers=None):
     url = f"{base_url}{path}"
     ak = synth.s3_access_key_id(token)
     sk = synth.s3_secret_access_key(token)
-    req = AWSRequest(method="GET", url=url, headers=dict(headers or {}))
+    req = AWSRequest(method=method, url=url, headers=dict(headers or {}))
     req.headers["x-amz-content-sha256"] = "UNSIGNED-PAYLOAD"
     S3SigV4Auth(Credentials(ak, sk), "s3", "us-east-1").add_auth(req)
-    return client.get(url, headers=dict(req.headers))
+    return client.request(method, url, headers=dict(req.headers), content=body)
 
 
 S3NS = "http://s3.amazonaws.com/doc/2006-03-01/"
@@ -1038,31 +1038,34 @@ def test_s3_large_bucket_acl_scopes_listing(
 
 
 @pytest.mark.parametrize(
-    "query, headers, status",
+    "method, query, headers, body, status",
     [
-        ("acl", None, 200),
-        ("tagging", None, 200),
-        ("attributes", {"x-amz-object-attributes": "ETag,ObjectSize"}, 200),
-        ("annotation", None, 200),
-        ("partNumber=1", None, 206),
-        ("partNumber=2", None, 416),
-        ("versionId=null", None, 200),
+        ("GET", "acl", None, None, 200),
+        ("GET", "tagging", None, None, 200),
+        ("GET", "attributes", {"x-amz-object-attributes": "ETag,ObjectSize"}, None, 200),
+        ("GET", "annotation", None, None, 200),
+        ("GET", "partNumber=1", None, None, 206),
+        ("GET", "partNumber=2", None, None, 416),
+        ("GET", "versionId=null", None, None, 200),
+        ("GET", "", {"x-amz-checksum-mode": "ENABLED"}, None, 200),
+        ("PUT", "encryption", None, b"<ObjectEncryption><SSE-S3/></ObjectEncryption>", 400),
     ],
 )
 def test_s3_an_objects_subresource_answers_only_a_caller_who_can_read_the_object(
-    big_bucket_client, big_bucket_settings, big_bucket_tokens, query, headers, status
+    big_bucket_client, big_bucket_settings, big_bucket_tokens, method, query, headers, body, status
 ):
     """`big-bucket` holds objects of two groups in one bucket. Each of these answers from the
-    object, so a caller outside its group is told the key does not exist, as its listing tells it,
-    where the admin and the object's own group get the answer, and so does that caller for an
-    object of its own group."""
+    object, UpdateObjectEncryption's checks among them, so a caller outside its group is told the
+    key does not exist, as its listing tells it, where the admin and the object's own group get
+    the answer, and so does that caller for an object of its own group."""
     people = f"/s3/big-bucket/logs/2026/01/02/obj-00012.json?{query}"
     engineering = f"/s3/big-bucket/logs/2026/01/01/obj-00000.json?{query}"
     eng, admin = big_bucket_tokens["eng-bulk@acme.com"], big_bucket_settings.admin_token
+    client = big_bucket_client
     for token in (admin, big_bucket_tokens["people-bulk@acme.com"]):
-        assert _s3_get(big_bucket_client, people, token, headers).status_code == status
-    assert _s3_get(big_bucket_client, engineering, eng, headers).status_code == status
-    hidden = _s3_get(big_bucket_client, people, eng, headers)
+        assert _s3_send(client, method, people, token, headers, body).status_code == status
+    assert _s3_send(client, method, engineering, eng, headers, body).status_code == status
+    hidden = _s3_send(client, method, people, eng, headers, body)
     code = "NoSuchVersion" if "versionId" in query else "NoSuchKey"
     assert hidden.status_code == 404 and f"<Code>{code}</Code>" in hidden.text
 
@@ -1234,6 +1237,8 @@ _BUCKET_ENDPOINT = (
     "Requests with bucket-region specified must be made to the corresponding regional endpoint"
 )
 _BUCKET_REGION = "<ArgumentName>bucket-region</ArgumentName>"
+_BUCKET_TOKEN = "The continuation token provided is incorrect"
+_TOKEN_ARGUMENT = "<ArgumentName>continuation-token</ArgumentName>"
 
 
 def _max_buckets(value):
@@ -1241,118 +1246,115 @@ def _max_buckets(value):
 
 
 # ListBuckets' refusals as real answered them signed (2026-09-29, us-east-1): the query, the message
-# and the members after it, and whether real was also sent the request unsigned and over a bad
-# secret, answering both the same (same date).
+# and the members after it (None: the listing), and the status real answered the request with
+# unsigned and over a bad secret, where it was sent so (same date).
 _LIST_BUCKETS_REFUSAL_ROWS = [
-    ("max-buckets=abc", _BUCKET_PARSE, _max_buckets("abc"), True),
-    ("max-buckets=%201", _BUCKET_PARSE, _max_buckets(" 1"), False),
-    ("max-buckets=1%20", _BUCKET_PARSE, _max_buckets("1 "), False),
-    ("max-buckets=abc&max-buckets=1", _BUCKET_PARSE, _max_buckets("abc"), False),
-    ("max-buckets=abc&continuation-token=garbage", _BUCKET_PARSE, _max_buckets("abc"), False),
-    ("max-buckets=0", _BUCKET_RANGE, _max_buckets("0"), True),
-    ("max-buckets=-01", _BUCKET_RANGE, _max_buckets("-1"), False),
-    ("max-buckets=010001", _BUCKET_RANGE, _max_buckets("10001"), False),
-    ("max-buckets=0&bucket-region=zz", _BUCKET_RANGE, _max_buckets("0"), False),
-    ("bucket-region=zz", "Argument value zz is not a valid AWS Region", _BUCKET_REGION, True),
-    ("bucket-region=", "Argument value  is not a valid AWS Region", _BUCKET_REGION, False),
+    ("max-buckets=abc", _BUCKET_PARSE, _max_buckets("abc"), 400, 400),
+    ("max-buckets=%201", _BUCKET_PARSE, _max_buckets(" 1"), None, None),
+    ("max-buckets=1%20", _BUCKET_PARSE, _max_buckets("1 "), None, None),
+    ("max-buckets=abc&max-buckets=1", _BUCKET_PARSE, _max_buckets("abc"), None, None),
+    ("max-buckets=abc&continuation-token=garbage", _BUCKET_PARSE, _max_buckets("abc"), None, None),
+    ("max-buckets=0", _BUCKET_RANGE, _max_buckets("0"), 400, 400),
+    ("max-buckets=-01", _BUCKET_RANGE, _max_buckets("-1"), None, None),
+    ("max-buckets=010001", _BUCKET_RANGE, _max_buckets("10001"), None, None),
+    ("max-buckets=0&bucket-region=zz", _BUCKET_RANGE, _max_buckets("0"), None, None),
+    ("bucket-region=zz", "Argument value zz is not a valid AWS Region", _BUCKET_REGION, 400, 400),
+    ("bucket-region=", "Argument value  is not a valid AWS Region", _BUCKET_REGION, None, None),
     (
         "bucket-region=Z%26Z",
         "Argument value Z&amp;Z is not a valid AWS Region",
         _BUCKET_REGION,
-        False,
+        None,
+        None,
     ),
     (
         "bucket-region=us-east-1%20",
         "Argument value us-east-1  is not a valid AWS Region",
         _BUCKET_REGION,
-        False,
+        None,
+        None,
     ),
     (
         "bucket-region=%20us-east-1",
         "Argument value  us-east-1 is not a valid AWS Region",
         _BUCKET_REGION,
-        False,
+        None,
+        None,
     ),
     (
         "bucket-region=us-east-1%09",
         "Argument value us-east-1\t is not a valid AWS Region",
         _BUCKET_REGION,
-        False,
+        None,
+        None,
     ),
     (
         "bucket-region=zz&bucket-region=us-east-1",
         "Argument value zz is not a valid AWS Region",
         _BUCKET_REGION,
-        False,
+        None,
+        None,
     ),
     (
         "continuation-token=garbage&bucket-region=zz",
         "Argument value zz is not a valid AWS Region",
         _BUCKET_REGION,
-        False,
+        None,
+        None,
     ),
     (
         "prefix=&bucket-region=zz",
         "Argument value zz is not a valid AWS Region",
         _BUCKET_REGION,
-        False,
+        None,
+        None,
     ),
-    ("bucket-region=ap-northeast-2", _BUCKET_ENDPOINT, _BUCKET_REGION, True),
-    ("bucket-region=US-WEST-2", _BUCKET_ENDPOINT, _BUCKET_REGION, False),
-    ("bucket-region=eu-west-1", _BUCKET_ENDPOINT, _BUCKET_REGION, False),
+    ("bucket-region=ap-northeast-2", _BUCKET_ENDPOINT, _BUCKET_REGION, 400, 400),
+    ("bucket-region=US-WEST-2", _BUCKET_ENDPOINT, _BUCKET_REGION, None, None),
+    ("bucket-region=eu-west-1", _BUCKET_ENDPOINT, _BUCKET_REGION, None, None),
+    # A continuation token, read after the credential: unsigned the 307 and over a bad secret the
+    # 403, as a `prefix` gets them in the last row; a listing's group token is none of ListBuckets'.
+    ("continuation-token=garbage", _BUCKET_TOKEN, _TOKEN_ARGUMENT, 307, 403),
+    ("continuation-token=Zzp4", _BUCKET_TOKEN, _TOKEN_ARGUMENT, 307, 403),
+    ("prefix=x", None, None, 307, 403),
 ]
 
 
 @pytest.mark.parametrize(
-    "query, message, members, unsigned_too",
+    "query, message, members, unsigned, tampered",
     _LIST_BUCKETS_REFUSAL_ROWS,
     ids=[r[0] for r in _LIST_BUCKETS_REFUSAL_ROWS],
 )
-def test_list_buckets_refuses_its_parameters_as_real_does_before_the_credential(
-    live_server, query, message, members, unsigned_too
+def test_list_buckets_refuses_its_parameters_where_real_does(
+    live_server, query, message, members, unsigned, tampered
 ):
-    """Each byte for byte; those real was sent unsigned and over a bad secret too are the same 400
-    both ways, where a `prefix` beside them would be the 307 and the 403."""
+    """Each refusal byte for byte signed; `max-buckets` and `bucket-region` the same 400 unsigned
+    and over a bad secret, before the credential, where a `continuation-token` is the 307 and the
+    403 a `prefix` gets, after it."""
     import httpx
 
     base_url, settings = live_server
     path = f"/s3/?{query}"
-    body = (
-        _DECL + f"<Error><Code>InvalidArgument</Code><Message>{message}</Message>{members}"
-        "<RequestId/><HostId/></Error>"
-    )
-    answers = [_signed(base_url, path, settings.admin_token)]
-    if unsigned_too:
+    signed = _signed(base_url, path, settings.admin_token)
+    arms = [(signed, 200 if message is None else 400)]
+    if unsigned is not None:
         url, headers = _sign_get(base_url, path, settings.admin_token, tamper=True)
-        answers += [httpx.get(f"{base_url}{path}"), httpx.get(url, headers=headers)]
-    for r in answers:
-        assert r.status_code == 400
-        assert r.headers["content-type"] == "application/xml"
-        assert _without_request_ids(r.text) == body
-
-
-def test_list_buckets_reads_a_continuation_token_after_the_credential(live_server):
-    """A token that does not decode is real's 400 signed, and unsigned and over a bad secret the 307
-    and the 403 a `prefix` gets, which is where real reads it (measured 2026-09-29)."""
-    import httpx
-
-    base_url, settings = live_server
-    refused = _signed(base_url, "/s3/?continuation-token=garbage", settings.admin_token)
-    assert refused.status_code == 400
-    assert _without_request_ids(refused.text) == (
-        _DECL + "<Error><Code>InvalidArgument</Code><Message>The continuation token provided is "
-        "incorrect</Message><ArgumentName>continuation-token</ArgumentName><RequestId/><HostId/>"
-        "</Error>"
-    )
-    assert _signed(base_url, "/s3/?prefix=x", settings.admin_token).status_code == 200
-    for query in ("continuation-token=garbage", "prefix=x"):
-        path = f"/s3/?{query}"
-        unsigned = httpx.get(f"{base_url}{path}")
-        assert unsigned.status_code == 307 and unsigned.content == b"", query
-        url, headers = _sign_get(base_url, path, settings.admin_token, tamper=True)
-        tampered = httpx.get(url, headers=headers)
-        assert tampered.status_code == 403, query
-        assert "<Code>SignatureDoesNotMatch</Code>" in tampered.text, query
+        arms += [
+            (httpx.get(f"{base_url}{path}"), unsigned),
+            (httpx.get(url, headers=headers), tampered),
+        ]
+    for r, status in arms:
+        assert r.status_code == status
+        if status == 400:
+            assert r.headers["content-type"] == "application/xml"
+            assert _without_request_ids(r.text) == (
+                _DECL + f"<Error><Code>InvalidArgument</Code><Message>{message}</Message>"
+                f"{members}<RequestId/><HostId/></Error>"
+            )
+        elif status == 307:
+            assert r.content == b""
+        elif status == 403:
+            assert "<Code>SignatureDoesNotMatch</Code>" in r.text
 
 
 def test_list_objects_v2_xml_shape(live_server):
@@ -1651,10 +1653,23 @@ _OBJECT_SUBRESOURCE_ROWS = [
         200,
         None,
         _DECL
-        + '<GetObjectAttributesResponse xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><ETag>{etag}</ETag><StorageClass>STANDARD</StorageClass><ObjectSize>{size}</ObjectSize></GetObjectAttributesResponse>',
+        + '<GetObjectAttributesResponse xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><ETag>{etag}</ETag><Checksum><ChecksumCRC64NVME>{crc}</ChecksumCRC64NVME><ChecksumType>FULL_OBJECT</ChecksumType></Checksum><StorageClass>STANDARD</StorageClass><ObjectSize>{size}</ObjectSize></GetObjectAttributesResponse>',
         404,
         "<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message><Key>{missing}</Key><RequestId/><HostId/></Error>",
     ),
+    *[
+        (
+            "attributes",
+            {"x-amz-object-attributes": names},
+            200,
+            None,
+            _DECL
+            + '<GetObjectAttributesResponse xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Checksum><ChecksumCRC64NVME>{crc}</ChecksumCRC64NVME><ChecksumType>FULL_OBJECT</ChecksumType></Checksum></GetObjectAttributesResponse>',
+            404,
+            "<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message><Key>{missing}</Key><RequestId/><HostId/></Error>",
+        )
+        for names in ("Checksum", "Checksum,ObjectParts")
+    ],
     (
         "attributes",
         {"x-amz-object-attributes": "ObjectSize, ETag"},
@@ -1807,16 +1822,6 @@ _OBJECT_SUBRESOURCE_ROWS = [
         _DECL
         + "<Error><Code>InvalidArgument</Code><Message>Invalid version id specified</Message><ArgumentName>versionId</ArgumentName><ArgumentValue>NULL</ArgumentValue><RequestId/><HostId/></Error>",
     ),
-    (
-        "versionId=null",
-        {},
-        200,
-        None,
-        None,
-        404,
-        _DECL
-        + "<Error><Code>NoSuchVersion</Code><Message>The specified version does not exist.</Message><Key>{missing}</Key><VersionId>null</VersionId><RequestId/><HostId/></Error>",
-    ),
 ]
 
 
@@ -1837,9 +1842,12 @@ def test_an_objects_subresource_is_what_real_answers_for_an_object_with_none_of_
     owner = _get_xml(base_url, "/s3/eng-artifacts", settings.admin_token).findtext(
         f"{NS}Contents/{NS}Owner/{NS}ID"
     )
+    from backlot.routers import s3 as s3_router
+
     fill = dict(
         owner=owner,
         etag=hashlib.md5(OBJECT_TEXT).hexdigest(),
+        crc=s3_router._crc64nvme(OBJECT_TEXT),
         size=len(OBJECT_TEXT),
         bucket="eng-artifacts",
         key="runbooks/oncall.md",
@@ -1847,14 +1855,8 @@ def test_an_objects_subresource_is_what_real_answers_for_an_object_with_none_of_
     )
     r = _signed(base_url, f"{OBJECT_PATH}?{query}", settings.admin_token, extra_headers=headers)
     assert r.status_code == status
-    if body is None:
-        # The object itself, as without the `versionId`.
-        plain = _signed(base_url, OBJECT_PATH, settings.admin_token)
-        assert r.content == plain.content == OBJECT_TEXT
-        assert r.headers["content-type"] == plain.headers["content-type"]
-    else:
-        assert r.headers.get("content-type") == content_type
-        assert _without_request_ids(r.text) == body.format(**fill)
+    assert r.headers.get("content-type") == content_type
+    assert _without_request_ids(r.text) == body.format(**fill)
     missing = _signed(
         base_url,
         f"/s3/eng-artifacts/no/such.md?{query}",
@@ -1886,6 +1888,7 @@ _BAD_NAME = "Invalid attribute name specified."
 _MISMATCH = "The request signature we calculated does not match"
 _PART_RANGE = "Part number must be an integer between 1 and 10000, inclusive"
 _PART_AND_RANGE = "Cannot specify both Range header and partNumber query parameter"
+_BAD_CHECKSUM_MODE = "Value for x-amz-checksum-mode header is invalid."
 _NO_SUCH_PART = (
     "The requested partnumber is not satisfiable</Message><PartNumberRequested>{}"
     "</PartNumberRequested><ActualPartCount>1</ActualPartCount>"
@@ -2076,6 +2079,148 @@ _OBJECT_ORDER_ROWS = [
     ("present", "partNumber=2", {}, 416, "InvalidPartNumber", _NO_SUCH_PART.format(2)),
     ("present", "partNumber=02", {}, 416, "InvalidPartNumber", _NO_SUCH_PART.format(2)),
     ("present", "partNumber=010000", {}, 416, "InvalidPartNumber", _NO_SUCH_PART.format(10000)),
+    # A `versionId` beside a selector whose operation takes none, `null` included, before the
+    # bucket and the credential, where `?acl` reads it after the bucket (2026-09-30).
+    ("absent", "versioning&versionId=x", {}, 400, "InvalidArgument", _NO_VERSION_ID),
+    ("tampered", "location&versionId=x", {}, 400, "InvalidArgument", _NO_VERSION_ID),
+    ("present", "cors&versionId=x", {}, 400, "InvalidArgument", _NO_VERSION_ID),
+    ("present", "logging&versionId=x", {}, 400, "InvalidArgument", _NO_VERSION_ID),
+    ("present", "uploads&versionId=x", {}, 400, "InvalidArgument", _NO_VERSION_ID),
+    ("present", "uploadId=u&versionId=null", {}, 400, "InvalidArgument", _NO_VERSION_ID),
+    ("present", "versioning&versionId=null", {}, 400, "InvalidArgument", _NO_VERSION_ID),
+    ("absent", "acl&versionId=x", {}, 404, "NoSuchBucket", _NO_BUCKET),
+    # `x-amz-object-attributes` read as `_attribute_names` reads it.
+    (
+        "present",
+        "attributes",
+        {"x-amz-object-attributes": ",ETag"},
+        400,
+        "InvalidArgument",
+        "<ArgumentValue></ArgumentValue>",
+    ),
+    (
+        "present",
+        "attributes",
+        {"x-amz-object-attributes": "ETag,,ObjectSize"},
+        400,
+        "InvalidArgument",
+        "<ArgumentValue></ArgumentValue>",
+    ),
+    (
+        "absent",
+        "attributes",
+        {"x-amz-object-attributes": "ETag, ,ObjectSize"},
+        400,
+        "InvalidArgument",
+        "<ArgumentValue></ArgumentValue>",
+    ),
+    (
+        "tampered",
+        "attributes",
+        {"x-amz-object-attributes": "etag,garbage"},
+        400,
+        "InvalidArgument",
+        "<ArgumentValue>etag<",
+    ),
+    (
+        "present",
+        "attributes",
+        {"x-amz-object-attributes": "garbage,etag"},
+        400,
+        "InvalidArgument",
+        "<ArgumentValue>garbage<",
+    ),
+    (
+        "present",
+        "attributes",
+        {"x-amz-object-attributes": "ETag, etag"},
+        400,
+        "InvalidArgument",
+        "<ArgumentValue>etag<",
+    ),
+    (
+        "present",
+        "attributes",
+        {"x-amz-object-attributes": ","},
+        400,
+        "InvalidRequest",
+        "either missing or empty",
+    ),
+    ("absent", "attributes", {"x-amz-object-attributes": ","}, 404, "NoSuchBucket", _NO_BUCKET),
+    (
+        "tampered",
+        "attributes",
+        {"x-amz-object-attributes": ",,"},
+        403,
+        "SignatureDoesNotMatch",
+        _MISMATCH,
+    ),
+    # A key the bucket does not hold, asked for by version or by part.
+    ("missing", "versionId=null", {}, 404, "NoSuchVersion", "<VersionId>null</VersionId>"),
+    ("missing", "partNumber=1", {}, 404, "NoSuchKey", "<Key>no/such.md</Key>"),
+    (
+        "missing",
+        "partNumber=1&versionId=null",
+        {},
+        404,
+        "NoSuchVersion",
+        "<VersionId>null</VersionId>",
+    ),
+    # A checksum mode other than `ENABLED`: after the bucket, the credential, the version, the
+    # part's refusals and a range or a part the object lacks, and ahead of a missing key.
+    ("present", "", {"x-amz-checksum-mode": "garbage"}, 400, "InvalidRequest", _BAD_CHECKSUM_MODE),
+    ("present", "", {"x-amz-checksum-mode": ""}, 400, "InvalidRequest", _BAD_CHECKSUM_MODE),
+    ("missing", "", {"x-amz-checksum-mode": "garbage"}, 400, "InvalidRequest", _BAD_CHECKSUM_MODE),
+    (
+        "missing",
+        "versionId=null",
+        {"x-amz-checksum-mode": "garbage"},
+        400,
+        "InvalidRequest",
+        _BAD_CHECKSUM_MODE,
+    ),
+    ("absent", "", {"x-amz-checksum-mode": "garbage"}, 404, "NoSuchBucket", _NO_BUCKET),
+    ("tampered", "", {"x-amz-checksum-mode": "garbage"}, 403, "SignatureDoesNotMatch", _MISMATCH),
+    (
+        "present",
+        "versionId=garbage",
+        {"x-amz-checksum-mode": "garbage"},
+        400,
+        "InvalidArgument",
+        _BAD_VERSION,
+    ),
+    (
+        "present",
+        "partNumber=abc",
+        {"x-amz-checksum-mode": "garbage"},
+        400,
+        "InvalidArgument",
+        _PART_RANGE,
+    ),
+    (
+        "present",
+        "partNumber=2",
+        {"x-amz-checksum-mode": "garbage"},
+        416,
+        "InvalidPartNumber",
+        _NO_SUCH_PART.format(2),
+    ),
+    (
+        "present",
+        "",
+        {"x-amz-checksum-mode": "garbage", "Range": "bytes=999-"},
+        416,
+        "InvalidRange",
+        "not satisfiable",
+    ),
+    (
+        "present",
+        "partNumber=1",
+        {"x-amz-checksum-mode": "garbage", "Range": "bytes=0-1"},
+        400,
+        "InvalidRequest",
+        _PART_AND_RANGE,
+    ),
 ]
 
 
@@ -2098,7 +2243,7 @@ def test_an_objects_subresource_refusals_sit_where_real_puts_them(
     path = {
         "absent": "/s3/no-such-bucket/k.txt",
         "missing": "/s3/eng-artifacts/no/such.md",
-    }.get(where, OBJECT_PATH) + f"?{query}"
+    }.get(where, OBJECT_PATH) + (f"?{query}" if query else "")
     url, signed = _sign_get(
         base_url, path, settings.admin_token, tamper=where == "tampered", extra_headers=headers
     )
@@ -2107,22 +2252,59 @@ def test_an_objects_subresource_refusals_sit_where_real_puts_them(
     assert f"<Code>{code}</Code>" in r.text and fragment in r.text
 
 
-def test_an_objects_one_part_is_the_whole_object_as_the_206_of_its_range(live_server):
-    """Every object here is one part, which real sends as the 206 of the object's whole range on a
-    GET and a HEAD, leading zeros and a `versionId=null` beside it alike (measured 2026-09-29)."""
+_FULL_RANGE = f"bytes 0-{len(OBJECT_TEXT) - 1}/{len(OBJECT_TEXT)}"
+_FIRST_TEN = f"bytes 0-9/{len(OBJECT_TEXT)}"
+# The object's own answer to a GET and a HEAD, as real answered its object (2026-09-29 and
+# 2026-09-30): the query, the headers sent, the status, the range the answer names (None: none) and
+# whether it carries the object's checksum.
+_OBJECT_ANSWER_ROWS = [
+    ("", {}, 200, None, False),
+    ("versionId=null", {}, 200, None, False),
+    ("partNumber=1", {}, 206, _FULL_RANGE, False),
+    ("partNumber=01", {}, 206, _FULL_RANGE, False),
+    ("partNumber=1&versionId=null", {}, 206, _FULL_RANGE, False),
+    ("", {"Range": "bytes=0-9"}, 206, _FIRST_TEN, False),
+    ("", {"x-amz-checksum-mode": "ENABLED"}, 200, None, True),
+    ("", {"x-amz-checksum-mode": "enabled"}, 200, None, True),
+    ("versionId=null", {"x-amz-checksum-mode": "ENABLED"}, 200, None, True),
+    ("partNumber=1", {"x-amz-checksum-mode": "ENABLED"}, 206, _FULL_RANGE, True),
+    ("", {"x-amz-checksum-mode": "ENABLED", "Range": "bytes=0-"}, 206, _FULL_RANGE, True),
+    ("", {"x-amz-checksum-mode": "ENABLED", "Range": "bytes=0-9"}, 206, _FIRST_TEN, False),
+]
+
+
+@pytest.mark.parametrize(
+    "query, headers, status, content_range, checksum",
+    _OBJECT_ANSWER_ROWS,
+    ids=[
+        "-".join([r[0] or "bare", *(f"{k}={v}" for k, v in r[1].items())])
+        for r in _OBJECT_ANSWER_ROWS
+    ],
+)
+def test_an_objects_own_answer_is_what_real_sends_for_its_object(
+    live_server, query, headers, status, content_range, checksum
+):
+    """On a GET and a HEAD, the bytes of the range named or of the whole object, its one part the
+    206 of its whole range, and in checksum mode the object's CRC-64/NVME beside an answer that
+    holds all of it and none beside one that holds less."""
+    from backlot.routers import s3 as s3_router
+
     base_url, settings = live_server
-    plain = _signed(base_url, OBJECT_PATH, settings.admin_token)
-    assert plain.status_code == 200 and "content-range" not in plain.headers
-    for query in ("partNumber=1", "partNumber=01", "partNumber=1&versionId=null"):
-        for method in ("GET", "HEAD"):
-            r = _signed(base_url, f"{OBJECT_PATH}?{query}", settings.admin_token, method=method)
-            assert r.status_code == 206, (query, method)
-            assert (
-                r.headers["content-range"] == f"bytes 0-{len(OBJECT_TEXT) - 1}/{len(OBJECT_TEXT)}"
-            )
-            assert r.headers["content-length"] == str(len(OBJECT_TEXT))
-            assert r.headers["etag"] == plain.headers["etag"]
-            assert r.content == (OBJECT_TEXT if method == "GET" else b"")
+    path = f"{OBJECT_PATH}?{query}" if query else OBJECT_PATH
+    etag = _signed(base_url, OBJECT_PATH, settings.admin_token).headers["etag"]
+    first, last = 0, len(OBJECT_TEXT) - 1
+    if content_range is not None:
+        first, last = map(int, content_range.split()[1].split("/")[0].split("-"))
+    for method in ("GET", "HEAD"):
+        r = _signed(base_url, path, settings.admin_token, method=method, extra_headers=headers)
+        assert r.status_code == status, method
+        assert r.headers.get("content-range") == content_range, method
+        assert r.headers["content-length"] == str(last - first + 1), method
+        assert r.content == (OBJECT_TEXT[first : last + 1] if method == "GET" else b""), method
+        assert r.headers["etag"] == etag, method
+        crc = s3_router._crc64nvme(OBJECT_TEXT) if checksum else None
+        assert r.headers.get("x-amz-checksum-crc64nvme") == crc, method
+        assert r.headers.get("x-amz-checksum-type") == ("FULL_OBJECT" if checksum else None), method
 
 
 def test_an_objects_attributes_size_is_its_bytes(tmp_path):
@@ -2165,9 +2347,17 @@ def test_the_listing_location_and_object_still_answer_and_an_unknown_key_is_igno
     token = settings.admin_token
     # A bare bucket GET is ListObjects and `?list-type=2` its v2 form; `?foo=bar` and an `x-id` key
     # (the AWS SDK for JavaScript names the operation with one) are not selectors; `?Versioning` is
-    # not `?versioning`; and `?session` (CreateSession, directory buckets only) lists on a general
-    # purpose bucket.
-    for query in ("", "?list-type=2", "?foo=bar", "?x-id=ListObjects", "?Versioning", "?session"):
+    # not `?versioning`; `?session` (CreateSession, directory buckets only) lists on a general
+    # purpose bucket; and so does `?annotationName=v`, which real signs (2026-09-29).
+    for query in (
+        "",
+        "?list-type=2",
+        "?foo=bar",
+        "?x-id=ListObjects",
+        "?Versioning",
+        "?session",
+        "?annotationName=v",
+    ):
         root = _get_xml(base_url, f"/s3/eng-artifacts{query}", token)
         assert root.tag == f"{NS}ListBucketResult", query
     assert _get_xml(base_url, "/s3/eng-artifacts?location", token).tag == f"{NS}LocationConstraint"
@@ -2713,6 +2903,65 @@ _PARAMETER_ROWS = [
     # A valued `website`, at a bucket's path and a key's.
     ("GET", "/s3/no-such-bucket?website=v", 400, _NO_WEBSITE_VALUE, _argued("website", "v")),
     ("PUT", "/s3/no-such-bucket?website=v", 400, _NO_WEBSITE_VALUE, _argued("website", "v")),
+    # A key's writes read a valued `website` before the bucket too; an empty one is the write's
+    # (2026-09-30).
+    *[
+        (
+            method,
+            "/s3/no-such-bucket/k.txt?website=v",
+            400,
+            _NO_WEBSITE_VALUE,
+            _argued("website", "v"),
+        )
+        for method in ("PUT", "DELETE", "POST", "PATCH")
+    ],
+    *[
+        (
+            method,
+            "/s3/no-such-bucket/k.txt?website=",
+            404,
+            _NO_BUCKET,
+            "<BucketName>no-such-bucket</BucketName>",
+        )
+        for method in ("PUT", "DELETE")
+    ],
+    # A bucket's writes and a `versionId`: a bare `POST` is the 412 first, `PUT ?acl` and `POST
+    # ?restore` read it as a version after the bucket, and `DELETE ?acl` refuses it before
+    # (2026-09-30).
+    (
+        "POST",
+        "/s3/eng-artifacts?versionId=x",
+        412,
+        "At least one of the pre-conditions you specified did not hold",
+        "<Condition>Bucket POST must be of the enclosure-type multipart/form-data</Condition>",
+    ),
+    *[
+        (
+            method,
+            f"/s3/no-such-bucket?{selector}&versionId=x",
+            404,
+            _NO_BUCKET,
+            "<BucketName>no-such-bucket</BucketName>",
+        )
+        for method, selector in (("PUT", "acl"), ("POST", "restore"))
+    ],
+    *[
+        (
+            method,
+            f"/s3/eng-artifacts?{selector}&versionId=x",
+            400,
+            _BAD_VERSION,
+            _argued("versionId", "x"),
+        )
+        for method, selector in (("PUT", "acl"), ("POST", "restore"))
+    ],
+    (
+        "DELETE",
+        "/s3/no-such-bucket?acl&versionId=x",
+        400,
+        _NO_VERSION_ID,
+        _argued("versionId", "x"),
+    ),
     (
         "GET",
         "/s3/eng-artifacts/no/such.md?website=v",
@@ -2980,13 +3229,6 @@ def test_s3_what_list_object_versions_refuses_after_the_bucket_comes_after_the_c
     assert "<Code>NoSuchBucket</Code>" in httpx.get(f"{base_url}{path}").text
 
 
-def test_s3_an_annotation_name_at_a_bucket_is_left_to_the_listing(live_server):
-    """Real signs `annotationName` at a bucket's path and answers the listing (2026-09-29)."""
-    base_url, settings = live_server
-    root = _get_xml(base_url, "/s3/eng-artifacts?annotationName=v", settings.admin_token)
-    assert root.tag == f"{NS}ListBucketResult"
-
-
 # Every kind of answer a HEAD gets, the token it is sent with ("tampered": signed, then the
 # signature spoiled; None: unsigned), and the length it declares, which only an object's own
 # answers do.
@@ -3034,6 +3276,13 @@ _HEAD_ROWS = [
     ),
     ("/s3/no-such-bucket/a.txt?attributes", "admin", {}, 405, None),
     ("/s3/no-such-bucket/a.txt?annotation&max-annotation-results=abc", "admin", {}, 405, None),
+    # A checksum mode, and two parses a HEAD at a key makes before the bucket (2026-09-30).
+    (OBJECT_PATH, "admin", {"x-amz-checksum-mode": "ENABLED"}, 200, len(OBJECT_TEXT)),
+    (OBJECT_PATH, "admin", {"x-amz-checksum-mode": "garbage"}, 400, None),
+    ("/s3/eng-artifacts/no/such.md", "admin", {"x-amz-checksum-mode": "garbage"}, 404, None),
+    (f"{OBJECT_PATH}?acl", "admin", {"x-amz-checksum-mode": "garbage"}, 405, None),
+    ("/s3/no-such-bucket/a.txt?versioning&versionId=x", "admin", {}, 400, None),
+    ("/s3/no-such-bucket/a.txt?attributes", "admin", {"x-amz-object-attributes": ","}, 405, None),
 ]
 
 
@@ -3531,6 +3780,35 @@ _BAD_KMS_FORMAT = (
 )
 
 
+_CHECKSUM_NAMES = (
+    "crc32",
+    "crc32c",
+    "crc64nvme",
+    "md5",
+    "sha1",
+    "sha256",
+    "sha512",
+    "xxhash64",
+    "xxhash3",
+    "xxhash128",
+)
+
+
+def _right_checksum(name: str, body: bytes) -> bytes:
+    """Each checksum of ``body`` as real took it (2026-09-29): the standard library's, the
+    xxhash library's digest, and the router's two CRCs, which the test below checks on their own."""
+    import xxhash
+
+    from backlot.routers import s3 as s3_router
+
+    if name == "crc32":
+        return zlib.crc32(body).to_bytes(4, "big")
+    if name in ("crc32c", "crc64nvme"):
+        return s3_router._checksum(name, body)
+    xx = {"xxhash64": xxhash.xxh64, "xxhash3": xxhash.xxh3_64, "xxhash128": xxhash.xxh3_128}
+    return xx[name](body).digest() if name in xx else hashlib.new(name, body).digest()
+
+
 def _encryption(arn=None, bucket_key=None, kind="SSE-KMS") -> bytes:
     inner = "" if arn is None else f"<KMSKeyArn>{arn}</KMSKeyArn>"
     inner += "" if bucket_key is None else f"<BucketKeyEnabled>{bucket_key}</BucketKeyEnabled>"
@@ -3805,6 +4083,8 @@ _WRITE_CHECK_ROWS = [
         )
         for body in (
             b"<Delete/>",
+            b"<Delete><Object><Key>k</Key><VersionId>a</VersionId><VersionId>b</VersionId></Object></Delete>",
+            b"<Delete><Object><Key>k</Key><ETag>a</ETag><ETag>b</ETag></Object></Delete>",
             b"<Delete><Quiet>true</Quiet></Delete>",
             b"<Delete><Object/></Delete>",
             b"<Delete><Object><Key>k</Key></Object><Nope/></Delete>",
@@ -3932,6 +4212,40 @@ _WRITE_CHECK_ROWS = [
         501,
         "NotImplemented",
         "A method you provided writes to the corpus, which this server does not implement: POST",
+        "",
+    ),
+    # Each algorithm's right value for the body, and the SDK's algorithm beside it, which has to
+    # name that algorithm, compared without case (2026-09-29 and 2026-09-30).
+    *[
+        (
+            "POST",
+            "/s3/eng-artifacts?delete",
+            _GOOD_DELETE,
+            {f"x-amz-checksum-{name}": _b64(_right_checksum(name, _GOOD_DELETE)), **sdk},
+            501,
+            "NotImplemented",
+            "A method you provided writes to the corpus, which this server does not implement: POST",
+            "",
+        )
+        for name, sdk in [
+            *((name, {}) for name in _CHECKSUM_NAMES),
+            *(
+                ("crc32", {"x-amz-sdk-checksum-algorithm": alg})
+                for alg in ("crc32", "Crc32", "CRC32")
+            ),
+        ]
+    ],
+    (
+        "POST",
+        "/s3/eng-artifacts?delete",
+        _GOOD_DELETE,
+        {
+            "x-amz-checksum-crc32": _b64(zlib.crc32(_GOOD_DELETE).to_bytes(4, "big")),
+            "x-amz-sdk-checksum-algorithm": "SHA256",
+        },
+        400,
+        "InvalidRequest",
+        "Value for x-amz-sdk-checksum-algorithm header is invalid.",
         "",
     ),
     # A key's `POST ?delete` is the bucket's DeleteObjects, whatever the key.
@@ -4157,6 +4471,20 @@ _WRITE_CHECK_ROWS = [
         _BAD_KMS_FORMAT,
         "",
     ),
+    # A key's id is letters, digits and hyphens after `key/` (2026-09-30).
+    *[
+        (
+            "PUT",
+            "/s3/eng-artifacts/runbooks/oncall.md?encryption",
+            _encryption(f"arn:aws:kms:us-east-1:111111111111:{resource}"),
+            {},
+            400,
+            "InvalidRequest",
+            _BAD_KMS_FORMAT,
+            "",
+        )
+        for resource in ("key:abc", "key/abc/def", "key/abc:def", "keys/abc", "key/a b")
+    ],
     (
         "PUT",
         "/s3/eng-artifacts/runbooks/oncall.md?encryption",
@@ -4167,6 +4495,25 @@ _WRITE_CHECK_ROWS = [
         "BucketKeyEnabled must be 'true' or 'false'. Invalid value: maybe",
         "",
     ),
+    # What real took on to the key's account, which this server has none of, so what is left is
+    # the write: `TRUE` and a key id (2026-09-29 and 2026-09-30).
+    *[
+        (
+            "PUT",
+            "/s3/eng-artifacts/runbooks/oncall.md?encryption",
+            _encryption(arn, bucket_key),
+            {},
+            501,
+            "NotImplemented",
+            "A method you provided writes to the corpus, which this server does not implement: PUT",
+            "",
+        )
+        for arn, bucket_key in (
+            ("arn:aws:kms:us-east-1:111111111111:key/x", "TRUE"),
+            ("arn:aws:kms:us-east-1:111111111111:key/abc", None),
+            ("arn:aws:kms:us-east-1:111111111111:key/1234abcd-12ab-34cd-56ef-1234567890ab", None),
+        )
+    ],
 ]
 
 
@@ -4251,72 +4598,6 @@ def test_s3_an_encryption_write_signed_with_signature_version_2_is_refused_for_i
             "<Message>Requests modifying object encryption configuration require AWS Signature "
             "Version 4.</Message>" in r.text
         )
-
-
-def _right_checksum(name: str, body: bytes) -> bytes:
-    """Each checksum of ``body`` as real took it (2026-09-29): the standard library's, the
-    xxhash library's digest, and the router's two CRCs, which the test below checks on their own."""
-    import xxhash
-
-    from backlot.routers import s3 as s3_router
-
-    if name == "crc32":
-        return zlib.crc32(body).to_bytes(4, "big")
-    if name in ("crc32c", "crc64nvme"):
-        return s3_router._checksum(name, body)
-    xx = {"xxhash64": xxhash.xxh64, "xxhash3": xxhash.xxh3_64, "xxhash128": xxhash.xxh3_128}
-    return xx[name](body).digest() if name in xx else hashlib.new(name, body).digest()
-
-
-@pytest.mark.parametrize(
-    "name",
-    [
-        "crc32",
-        "crc32c",
-        "crc64nvme",
-        "md5",
-        "sha1",
-        "sha256",
-        "sha512",
-        "xxhash64",
-        "xxhash3",
-        "xxhash128",
-    ],
-)
-def test_s3_a_delete_carrying_its_right_checksum_is_the_write(live_server, name):
-    """Real took each of these, the body's own value, and went on to the delete (2026-09-29); the
-    same header over another body is the BadDigest the table above asserts."""
-    base_url, settings = live_server
-    headers = {f"x-amz-checksum-{name}": _b64(_right_checksum(name, _GOOD_DELETE))}
-    r = _signed(
-        base_url,
-        "/s3/eng-artifacts?delete",
-        settings.admin_token,
-        method="POST",
-        body=_GOOD_DELETE,
-        extra_headers=headers,
-    )
-    assert r.status_code == 501 and "<Code>NotImplemented</Code>" in r.text
-    other = _signed(
-        base_url,
-        "/s3/eng-artifacts?delete",
-        settings.admin_token,
-        method="POST",
-        body=_GOOD_DELETE + b" ",
-        extra_headers=headers,
-    )
-    assert "<Code>BadDigest</Code>" in other.text
-
-
-def test_s3_an_encryption_write_reads_bucket_key_enabled_without_case(live_server):
-    """Real took `TRUE` and went on to the key's account (2026-09-29), which this server has none
-    of, so what is left is the write; `maybe` is the refusal the table above asserts."""
-    base_url, settings = live_server
-    body = _encryption("arn:aws:kms:us-east-1:111111111111:key/x", "TRUE")
-    r = _signed(
-        base_url, f"{OBJECT_PATH}?encryption", settings.admin_token, method="PUT", body=body
-    )
-    assert r.status_code == 501 and "<Code>NotImplemented</Code>" in r.text
 
 
 @pytest.mark.parametrize(
@@ -5445,46 +5726,40 @@ def test_signature_version_2_signs_the_query_parameters_real_signs(where, name, 
 
 
 @pytest.mark.parametrize(
-    "query, signed, amz",
+    "query, signed, amz, headers",
     [
-        ("versionId=v&acl", "?acl&versionId=v", ""),
-        ("uploads&prefix=x", "?uploads", ""),
-        ("acl=", "?acl", ""),
+        ("versionId=v&acl", "?acl&versionId=v", "", {}),
+        ("uploads&prefix=x", "?uploads", "", {}),
+        ("acl=", "?acl", "", {}),
         (
             "response-content-type=a%2Fb&response-expires=x",
             "?response-content-type=a/b&response-expires=x",
             "",
+            {},
         ),
-        ("x-amz-foo=1&acl", "?acl", "x-amz-foo:1\n"),
-        ("X-Amz-Foo=1&acl", "?acl", "x-amz-foo:1\n"),
-        ("partNumber=2&uploadId=a%20b", "?partNumber=2&uploadId=a b", ""),
-        ("tagging&tagging", "?tagging", ""),
-        ("acl=a&acl=b", "?acl", ""),
+        ("x-amz-foo=1&acl", "?acl", "x-amz-foo:1\n", {}),
+        ("X-Amz-Foo=1&acl", "?acl", "x-amz-foo:1\n", {}),
+        ("partNumber=2&uploadId=a%20b", "?partNumber=2&uploadId=a b", "", {}),
+        ("tagging&tagging", "?tagging", "", {}),
+        ("acl=a&acl=b", "?acl", "", {}),
+        # A query's `x-amz-*` parameter signed over a header of its name.
+        ("x-amz-foo=1", "", "x-amz-foo:1\n", {"x-amz-foo": "2"}),
     ],
 )
-def test_signature_version_2_sorts_names_and_decodes_values_as_real_does(query, signed, amz):
+def test_signature_version_2_sorts_names_and_decodes_values_as_real_does(
+    query, signed, amz, headers
+):
     """Measured 2026-09-29 at a key over a bad secret: the signed parameters sorted, a value decoded
     where one is signed, a name sent twice signed once, and an `x-amz-*` parameter signed as a
-    header, lower-cased. The mismatch names the string this server signed, which is real's, over
-    the path under the mount (``backlot.auth._verify_v2``)."""
+    header, lower-cased, over a header of its name. The mismatch names the string this server
+    signed, which is real's, over the path under the mount (``backlot.auth._verify_v2``)."""
     path = "/s3/eng-artifacts/runbooks/oncall.md"
     date = _http_date()
-    req, _ = _v2_request("GET", path, query, {"date": date}, secret="x" * 40)
+    req, _ = _v2_request("GET", path, query, {"date": date, **headers}, secret="x" * 40)
     caller, err = auth.resolve_sigv4(req)
     assert caller is None and err.code == "SignatureDoesNotMatch"
     under = path.removeprefix("/s3")
     assert dict(err.members)["StringToSign"] == f"GET\n\n\n{date}\n{amz}{under}{signed}"
-
-
-def test_signature_version_2_signs_a_query_amz_parameter_over_a_header_of_its_name():
-    """`x-amz-foo: 2` beside `?x-amz-foo=1` was signed `x-amz-foo:1` (2026-09-29)."""
-    path, date = "/s3/eng-artifacts/runbooks/oncall.md", _http_date()
-    req, _ = _v2_request(
-        "GET", path, "x-amz-foo=1", {"date": date, "x-amz-foo": "2"}, secret="x" * 40
-    )
-    _, err = auth.resolve_sigv4(req)
-    under = path.removeprefix("/s3")
-    assert dict(err.members)["StringToSign"] == f"GET\n\n\n{date}\nx-amz-foo:1\n{under}"
 
 
 def test_a_signature_version_2_mismatch_names_what_real_names():
