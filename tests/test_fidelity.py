@@ -928,15 +928,41 @@ def test_the_s3_model_yields_read_operations_keyed_by_what_selects_them():
     assert len({str(o) for o in s3_probe.operations(shared)}) == 2
 
 
-def test_an_operation_answered_with_another_operations_body_is_breaking(monkeypatch):
-    """The failure a path diff cannot see: not refused, not implemented, answered 200 with whatever
-    the catch-all route returns."""
-    listing = '<?xml version="1.0"?><ListBucketResult><Name>b</Name></ListBucketResult>'
-    error = '<?xml version="1.0"?><Error><Code>NotImplemented</Code></Error>'
+_LISTING = '<?xml version="1.0"?><ListBucketResult><Name>b</Name></ListBucketResult>'
 
+
+@pytest.mark.parametrize(
+    "acl, tagging, expected",
+    [
+        # The failure a path diff cannot see: not refused, not implemented, answered 200 with
+        # whatever the catch-all route returns; and `NotImplemented`, the refusal.
+        (
+            (200, _LISTING),
+            (400, "<Error><Code>NotImplemented</Code></Error>"),
+            {
+                "GetBucketAcl": ("silent_fallthrough", BREAKING),
+                "GetObjectTagging": ("missing_operation", GAP),
+            },
+        ),
+        # A 404 naming a vendor code is what an implemented operation answers where nothing is
+        # configured, as real's `NoSuchCORSConfiguration` is; the same status with
+        # `NotImplemented` is still the refusal.
+        (
+            (404, "<Error><Code>NoSuchCORSConfiguration</Code></Error>"),
+            (404, "<Error><Code>NotImplemented</Code></Error>"),
+            {"GetBucketAcl": None, "GetObjectTagging": ("missing_operation", GAP)},
+        ),
+    ],
+    ids=["another-operations-body", "a-vendors-own-error"],
+)
+def test_an_operation_is_judged_by_what_the_server_answers_it_with(
+    monkeypatch, acl, tagging, expected
+):
     def fake(method, url, headers=None, timeout=None):
-        refused = "tagging" in url
-        return httpx.Response(400 if refused else 200, text=error if refused else listing)
+        for selector, (status, text) in (("tagging", tagging), ("acl", acl)):
+            if selector in url:
+                return httpx.Response(status, text=text)
+        return httpx.Response(200, text=_LISTING)
 
     monkeypatch.setattr(s3_probe.httpx, "request", fake)
     found = {
@@ -945,38 +971,9 @@ def test_an_operation_answered_with_another_operations_body_is_breaking(monkeypa
             "http://x", "ak", "sk", s3_probe.operations(S3_MODEL), bucket="b", key="k"
         )
     }
-    assert (found["GetBucketAcl"].kind, found["GetBucketAcl"].severity) == (
-        "silent_fallthrough",
-        BREAKING,
-    )
-    assert (found["GetObjectTagging"].kind, found["GetObjectTagging"].severity) == (
-        "missing_operation",
-        GAP,
-    )
-
-
-def test_an_error_of_the_vendors_own_is_an_answer_and_not_a_missing_operation(monkeypatch):
-    """A 404 naming a vendor code is what an implemented operation answers where there is nothing
-    configured, as real's `NoSuchCORSConfiguration` is; only `NotImplemented` is a refusal. The
-    control is the same status with that code."""
-    listing = '<?xml version="1.0"?><ListBucketResult><Name>b</Name></ListBucketResult>'
-
-    def fake(method, url, headers=None, timeout=None):
-        if "tagging" in url:
-            return httpx.Response(404, text="<Error><Code>NotImplemented</Code></Error>")
-        if "acl" in url:
-            return httpx.Response(404, text="<Error><Code>NoSuchCORSConfiguration</Code></Error>")
-        return httpx.Response(200, text=listing)
-
-    monkeypatch.setattr(s3_probe.httpx, "request", fake)
-    found = {
-        f.path.split(":")[0]: f
-        for f in s3_probe.probe(
-            "http://x", "ak", "sk", s3_probe.operations(S3_MODEL), bucket="b", key="k"
-        )
-    }
-    assert "GetBucketAcl" not in found
-    assert found["GetObjectTagging"].kind == "missing_operation"
+    for operation, finding in expected.items():
+        got = found.get(operation)
+        assert (None if got is None else (got.kind, got.severity)) == finding, operation
 
 
 def test_two_bodies_under_one_root_element_are_told_apart_by_their_children(monkeypatch):

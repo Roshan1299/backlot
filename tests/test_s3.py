@@ -1378,10 +1378,10 @@ def test_list_objects_v2_delimiter_common_prefixes(live_server):
 # ------------------------------------------------------------ sub-resources
 # S3 dispatches on the query string: `?versioning`, `?acl`, `?tagging` and the rest each select an
 # operation of their own at a bucket's or an object's path. Backlot answers every one of a bucket's
-# as real answers a bucket nobody configured, and refuses an object's with 501. Every claim about
-# real S3 below was measured against a general purpose bucket: each selector is answered as its own
-# operation, an unknown key (`?foo=bar`, `?x-id=…`) is ignored, the match is case-sensitive, two
-# selectors conflict, and HEAD with a selector is 405.
+# as real answers a bucket nobody configured, and an object's as real answers an object with none of
+# them. Every claim about real S3 below was measured against a general purpose bucket: each selector
+# is answered as its own operation, an unknown key (`?foo=bar`, `?x-id=…`) is ignored, the match is
+# case-sensitive, two selectors conflict, and HEAD with a selector is 405.
 
 # What real answered each selector's GET with on a bucket nobody configured: status, Content-Type
 # and the body as sent, request ids aside (2026-09-29, us-east-1).
@@ -2382,7 +2382,7 @@ def test_two_subresources_at_once_conflict_the_way_real_s3_conflicts_them(live_s
         assert (
             b"<ArgumentName>ResourceType</ArgumentName><ArgumentValue>acl</ArgumentValue>" in body
         )
-    # `location` and `uploads`, which Backlot answers, conflict like any other.
+    # `location` and `uploads` conflict like any other.
     err = _refused(base_url, "/s3/eng-artifacts?location&versioning", settings.admin_token)
     assert err.code == 400 and b"location, versioning" in err.read()
     err = _refused(base_url, "/s3/eng-artifacts?versioning&uploads", settings.admin_token)
@@ -2601,8 +2601,8 @@ _MEMBER_ROWS = [
         "NoSuchBucket",
         "<BucketName>no-such-bucket</BucketName>",
     ),
-    # A bucket's selectors at a key's path are the bucket's own operations, whatever the key, and
-    # name the bucket.
+    # The bucket selectors real answers at a key's path are the bucket's own operations, whatever
+    # the key, and name the bucket; `?logging` and `?versions` are 400s of their own there.
     (
         "GET",
         "/s3/eng-artifacts/runbooks/oncall.md?cors",
@@ -2925,8 +2925,8 @@ _PARAMETER_ROWS = [
         )
         for method in ("PUT", "DELETE")
     ],
-    # A bucket's writes and a `versionId`: a bare `POST` is the 412 first, `PUT ?acl` and `POST
-    # ?restore` read it as a version after the bucket, and `DELETE ?acl` refuses it before
+    # A bucket's writes and a `versionId`: a bare `POST` is the 412 first, `PUT ?acl` and
+    # `POST ?restore` read it as a version after the bucket, and `DELETE ?acl` refuses it before
     # (2026-09-30).
     (
         "POST",
@@ -4537,7 +4537,7 @@ def test_s3_a_write_is_checked_as_real_checks_it_before_the_501(
 def test_s3_a_write_is_checked_once_the_bucket_is_one_the_caller_can_see(live_server):
     """The checks come after the bucket, so a caller who cannot see it, and an unsigned one, is told
     there is none whatever the body says (see
-    ``test_s3_a_request_in_a_bucket_the_caller_cannot_see``)."""
+    ``test_s3_a_request_in_a_bucket_the_caller_cannot_see_is_nosuchbucket``)."""
     import httpx
 
     base_url, settings = live_server
@@ -4835,7 +4835,7 @@ def test_header_auth_skew_check_precedes_signature_check():
 
 
 # A `%3F` in the key decodes to a `?` that splits Starlette's rebuilt `request.url`, so the
-# canonical request has to come off the wire — see the comment in `resolve_sigv4`.
+# canonical request has to come off the wire — see ``backlot.auth._wire``.
 SIGNED_PATHS = ["/s3/eng-artifacts", "/s3/eng-artifacts/q%3Fx.txt"]
 
 
@@ -5797,16 +5797,6 @@ def test_a_signature_version_2_mismatch_names_what_real_names():
     assert dict(err.members)["SignatureProvided"] == "abc"
 
 
-@pytest.mark.parametrize("query", ["AWSAccessKeyId=" + AK, "Expires=9999999999&AWSAccessKeyId=x"])
-def test_a_query_without_signature_is_the_anonymous_callers(query):
-    """Real answered `?AWSAccessKeyId=` alone on a bucket its owner holds as it answers no
-    credential (2026-09-29): without a `Signature` there is no V2 query to read."""
-    assert auth.resolve_sigv4(_request("GET", "/s3/eng-artifacts", query, {"host": "backlot"})) == (
-        ANONYMOUS,
-        None,
-    )
-
-
 def test_a_lower_case_v4_scheme_is_v4_and_is_signed_as_sent():
     """Real reads `aws4-hmac-sha256` as V4 and names it as sent on the first line of the string it
     signs, so a signature over the upper-case line is the mismatch (2026-09-29)."""
@@ -5927,10 +5917,21 @@ def test_signature_version_2_is_served_as_real_serves_it(live_server):
     assert (bad.status_code, bad.content) == (403, b"")
 
 
-@pytest.mark.parametrize("query", ["", "X-Amz-Signature=00", "list-type=2"])
+@pytest.mark.parametrize(
+    "query",
+    [
+        "",
+        "X-Amz-Signature=00",
+        "list-type=2",
+        "AWSAccessKeyId=" + AK,
+        "Expires=9999999999&AWSAccessKeyId=x",
+    ],
+)
 def test_a_request_with_no_credential_is_the_anonymous_callers(query):
     """Real reads a request carrying no credential as an anonymous caller's, an `X-Amz-Signature`
-    without `X-Amz-Algorithm` among them (a public bucket's listing answered that one)."""
+    without `X-Amz-Algorithm` and an `AWSAccessKeyId` without `Signature` among them: a public
+    bucket's listing answered the first, and a bucket's own owner was answered the second as no
+    credential is (2026-09-29)."""
     caller, err = auth.resolve_sigv4(
         _request("GET", "/s3/eng-artifacts", query, {"host": "backlot"})
     )

@@ -410,22 +410,22 @@ def resolve_sigv4(request: Request) -> tuple[Caller | None, SigV4Refusal | None]
     without the first and an `AWSAccessKeyId` without the second are unsigned on real (a public
     bucket's listing answered the one and a bucket's own owner was refused the other as anonymous).
 
-    Each refusal is real's own code, message and members, and they come in real's order:
-    measured 2026-09-29 against `s3.us-east-1.amazonaws.com`, one fault at a time and, where two
-    could meet, the two together. A header beside `X-Amz-Algorithm` or `Signature` in the query is
-    refused first, whatever either says, and the two query forms beside each other. For a header it
-    is then its one space and its scheme, matched without case (anything but `AWS4-HMAC-SHA256` and
-    V2's `AWS` is `InvalidArgument`, "Unsupported Authorization Type", Bearer and `AWS4-HMAC-SHA512`
+    Each refusal is real's own code, message and members, and they come in real's order: measured
+    2026-09-29 against `s3.us-east-1.amazonaws.com`, one fault at a time and, where two could meet,
+    the two together. A header beside `X-Amz-Algorithm` or `Signature` in the query is refused
+    first, whatever either says, and the two query forms beside each other. For a header it is then
+    its one space and its scheme, matched without case (anything but `AWS4-HMAC-SHA256` and V2's
+    `AWS` is `InvalidArgument`, "Unsupported Authorization Type", Bearer and `AWS4-HMAC-SHA512`
     alike), a missing or unreadable `x-amz-date` (an `AccessDenied`), the clock skew, its three
     components, the credential scope's shape, region, service and terminal (``_credential_fault``),
-    a scope date that is not the request's, the access key and the signature: the date and the
-    skew come ahead of every fault in the header's body. For a query it is the algorithm, the six
-    parameters, the date, `X-Amz-Expires` as a number, as not negative and as a week at most, a
-    date not yet valid, the expiry, the credential scope's shape, region, service and terminal, its
-    date, the access key and the signature. A signature mismatch names the string this server
-    signed and the canonical request it signed it over, as bytes too, the way real names its own.
-    The canonical URI and query are the raw wire path and query string (S3 signs the path
-    verbatim, see ``_wire``)."""
+    a scope date that is not the request's, the access key and the signature: the date and the skew
+    come ahead of every fault in the header's body. For a query it is the algorithm, the six
+    parameters, the date, `X-Amz-Expires` as a number, as not negative and as a week at most, a date
+    not yet valid, the expiry, the credential scope's shape, region, service and terminal, its date,
+    the access key and the signature. A SigV4 mismatch names the string this server signed and the
+    canonical request it signed it over, as bytes too, the way real names its own; a V2 one is
+    ``_verify_v2``'s. The canonical URI and query are the raw wire path and query string (S3 signs
+    the path verbatim, see ``_wire``)."""
     hdrs = {k.lower(): v for k, v in request.headers.items()}
     qs = request.query_params
     now = datetime.now(timezone.utc)

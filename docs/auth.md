@@ -267,8 +267,9 @@ print([b["Name"] for b in s3.list_buckets()["Buckets"]])
 refused credential get is in [supported-sources.md](supported-sources.md#amazon-s3--s3).
 
 **Signature Version 2 is verified too**, in the header and in the query, since real S3 still
-verifies it; botocore signs that way with `Config(signature_version="s3")`. The two refuse
-differently and each refuses as real does.
+verifies it; botocore signs that way with `Config(signature_version="s3")`, though its signature for
+a bucket's own operations is the mismatch real answers it with. The two refuse differently and each
+refuses as real does.
 
 **Path addressing is not optional.** Backlot serves `/s3/{bucket}/{key}`, so virtual-hosted
 addressing — which puts the bucket in the host, `acme-artifacts.localhost:8000` — reaches nothing.

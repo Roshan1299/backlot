@@ -123,7 +123,8 @@ clean match every time — a green check that means nothing.
 So S3 is compared by asking a running server instead. Backlot starts on a free port, every read
 operation botocore declares is sent to it signed, and the answer is classified:
 
-- **refused** — the honest answer for an operation Backlot does not serve. A `gap`.
+- **refused with `NotImplemented`** — the honest answer for an operation Backlot does not serve. A
+  `gap`. An error of the vendor's own, such as the 404 `NoSuchCORSConfiguration`, is an answer.
 - **answered distinctly** — implemented. No finding.
 - **answered with the body the same path returns when nothing selects an operation** — Backlot
   neither implements the operation nor refuses it, so the caller parses another operation's body
