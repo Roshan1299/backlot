@@ -43,6 +43,9 @@ dependencies = [
     # The three xxhash checksums an S3 DeleteObjects carries (`x-amz-checksum-xxhash64`, `-xxhash3`,
     # `-xxhash128`), which real compares with the body; the standard library has none of them.
     "xxhash>=3.0",
+    # SigV4a's ECDSA over P-256 (`backlot.sigv4a`), which the standard library has none of either;
+    # `pyjwt[crypto]` above installs it already, and this names the import the S3 router makes.
+    "cryptography>=3.4",
 ]
 
 [project.optional-dependencies]

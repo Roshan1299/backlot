@@ -249,6 +249,12 @@ _ERR_STATUS = {
     "InvalidPartNumber": 416,
     "NoSuchAnnotation": 404,
     "UserAnnotationNameMustBeSpecified": 400,
+    # A SigV4a region set, a date past the year 9999 or a V2 query's `Expires` before the year zero
+    # (``backlot.auth``), and a payload hash (``_payload_mismatch``, ``_put_object_refusal``).
+    "RegionSetMismatch": 400,
+    "InternalError": 500,
+    "XAmzContentSHA256Mismatch": 400,
+    "MissingContentLength": 411,
     # "A header you provided implies functionality that is not implemented. HTTP Status Code: 501"
     # — S3 API reference, the Error data type's code table.
     "NotImplemented": 501,
@@ -634,6 +640,32 @@ def _refused_credential(refusal: auth.SigV4Refusal, head: bool = False) -> Respo
     return _error(refusal.code, refusal.message, members)
 
 
+# The payload hashes that name a trailing checksum, which an upload's aws-chunked body carries
+# (``_put_object_refusal``). Real refused each elsewhere with "The value of x-amz-content-sha256
+# header is invalid.": on a GET of a listing, of a bucket's `?versioning` and `?acl`, of an object
+# and of a key the bucket does not hold, on a HEAD, a `DELETE`, a `POST ?delete`, a key's
+# `PUT ?tagging`, a presign's GET and the service root's. It came after a signature that fails,
+# after a bucket that does not exist and after what is refused before the credential, a `max-keys`
+# of `abc` and two selectors, and ahead of a `continuation-token`, a `partNumber` and a `versionId`
+# that are refused after the bucket (2026-09-29).
+_TRAILERS = frozenset(
+    {
+        "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+        "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER",
+    }
+)
+
+
+def _trailer_refusal(request: Request, head: bool = False) -> Response | None:
+    """The 400 for a payload hash in ``_TRAILERS`` on an operation that takes no upload, or ``None``."""
+    if auth.signed_payload_hash(request) not in _TRAILERS:
+        return None
+    if head:
+        return _head(400)
+    return _error("InvalidRequest", "The value of x-amz-content-sha256 header is invalid.")
+
+
 def _signature_refusal(request: Request) -> auth.SigV4Refusal | None:
     """The refusal of a credential that was sent and does not verify, or ``None``.
 
@@ -914,6 +946,9 @@ async def list_buckets(request: Request):
         return err
     if caller.is_anonymous:
         return Response(status_code=307, headers={"Location": _ANONYMOUS_LIST_BUCKETS})
+    trailer = _trailer_refusal(request)
+    if trailer is not None:
+        return trailer
     after = None
     token = _first(q, "continuation-token", None)
     if token:
@@ -1009,7 +1044,7 @@ async def head_bucket(request: Request, bucket: str):
         return err
     if not _bucket_visible(auth.conn(request), bucket, visible):
         return _head(404)
-    err = _listing_checks(q, v2)[-1]
+    err = _trailer_refusal(request, head=True) or _listing_checks(q, v2)[-1]
     if err is not None:
         return _head(err.status_code)
     return _head(
@@ -1064,6 +1099,9 @@ async def bucket_get(request: Request, bucket: str):
     conn = auth.conn(request)
     if not _bucket_visible(conn, bucket, visible):
         return _no_such_bucket(bucket)
+    trailer = _trailer_refusal(request)
+    if trailer is not None:
+        return trailer
     if selected == ["torrent"]:
         return _method_refusal(request, _BUCKET_WRITE_SELECTORS["torrent"][0])
     if selected == ["uploadId"]:
@@ -1754,6 +1792,9 @@ async def object_get(request: Request, bucket: str, key: str):
     conn = auth.conn(request)
     if not _bucket_visible(conn, bucket, visible):
         return _head(404) if head else _no_such_bucket(bucket)
+    trailer = _trailer_refusal(request, head)
+    if trailer is not None:
+        return trailer
     if selected and selected[0] in _KEY_BUCKET_SELECTORS:
         # The bucket's own operation, whatever the key (`_KEY_BUCKET_SELECTORS`).
         if selected[0] in _KEY_BUCKET_REFUSALS:
@@ -2430,7 +2471,10 @@ def _content_md5(request: Request) -> tuple[str | None, bytes | None, Response |
     return sent, digest, None
 
 
-def _md5_mismatch(sent: str, digest: bytes, body: bytes) -> Response | None:
+def _md5_mismatch(expected: str, digest: bytes, body: bytes) -> Response | None:
+    """`BadDigest` for a `Content-MD5` ``body`` does not match, naming the digest computed in base64
+    and ``expected`` as the operation names the one sent: DeleteObjects as sent, and PutObject in
+    hex (2026-09-29)."""
     actual = hashlib.md5(body).digest()
     if actual == digest:
         return None
@@ -2438,8 +2482,78 @@ def _md5_mismatch(sent: str, digest: bytes, body: bytes) -> Response | None:
         "BadDigest",
         "The Content-MD5 you specified did not match what we received.",
         f"<CalculatedDigest>{base64.b64encode(actual).decode()}</CalculatedDigest>"
-        f"<ExpectedDigest>{escape(sent)}</ExpectedDigest>",
+        f"<ExpectedDigest>{escape(expected)}</ExpectedDigest>",
     )
+
+
+def _payload_mismatch(request: Request, body: bytes) -> Response | None:
+    """`XAmzContentSHA256Mismatch` for a signed payload hash of 64 hex digits that ``body`` does not
+    match without case, naming it as sent and the body's own, or ``None``. Real checked it on
+    PutObject, a key's `PUT ?tagging`, a bucket's `PUT ?versioning`, DeleteObjects and
+    UpdateObjectEncryption, an empty body included, and not on a `DELETE` with a body or a GET
+    (2026-09-29); where each checks it among its other refusals is in its own function."""
+    sent = auth.signed_payload_hash(request)
+    if sent is None or not re.fullmatch(r"[0-9a-fA-F]{64}", sent):
+        return None
+    actual = hashlib.sha256(body).hexdigest()
+    if sent.lower() == actual:
+        return None
+    return _error(
+        "XAmzContentSHA256Mismatch",
+        "The provided 'x-amz-content-sha256' header does not match what was computed.",
+        f"<ClientComputedContentSHA256>{escape(sent)}</ClientComputedContentSHA256>"
+        f"<S3ComputedContentSHA256>{actual}</S3ComputedContentSHA256>",
+    )
+
+
+def _checksum_headers(headers) -> tuple[tuple[str, bytes] | None, Response | None]:
+    """The `x-amz-checksum-*` header a write names and the digest it decodes to, or the refusal of
+    the headers, in real's order: an algorithm ``_CHECKSUM_WIDTHS`` does not name, more than one, a
+    value that is not one; then an `x-amz-sdk-checksum-algorithm` with none of them and no
+    `x-amz-trailer`, which names the checksum an aws-chunked body carries after it, and one naming
+    another algorithm, compared without case. PutObject and DeleteObjects read them alike, and an
+    aws-chunked PutObject naming its checksum in `x-amz-trailer` was served (2026-09-29)."""
+    named = {
+        name[len("x-amz-checksum-") :]: value
+        for name, value in headers.items()
+        if name.startswith("x-amz-checksum-")
+        and name[len("x-amz-checksum-") :] not in _NOT_CHECKSUMS
+    }
+    if set(named) - _CHECKSUM_WIDTHS.keys():
+        return None, _error(
+            "InvalidRequest",
+            "The algorithm type you specified in x-amz-checksum- header is invalid.",
+        )
+    if len(named) > 1:
+        return None, _error(
+            "InvalidRequest",
+            "Expecting a single x-amz-checksum- header. Multiple checksum Types are not allowed.",
+        )
+    checksum = None
+    for name, value in named.items():
+        checksum = (name, _decoded(value, _CHECKSUM_WIDTHS[name]))
+        if checksum[1] is None:
+            message = f"Value for x-amz-checksum-{name} header is invalid."
+            return None, _error("InvalidRequest", message)
+    algorithm = headers.get("x-amz-sdk-checksum-algorithm")
+    if algorithm is not None and checksum is None and "x-amz-trailer" not in headers:
+        return None, _error(
+            "InvalidRequest",
+            "x-amz-sdk-checksum-algorithm specified, but no corresponding x-amz-checksum-* or "
+            "x-amz-trailer headers were found.",
+        )
+    if algorithm is not None and checksum is not None and algorithm.lower() != checksum[0]:
+        return None, _error(
+            "InvalidRequest", "Value for x-amz-sdk-checksum-algorithm header is invalid."
+        )
+    return checksum, None
+
+
+def _checksum_mismatch(checksum: tuple[str, bytes] | None, body: bytes) -> Response | None:
+    if checksum is None or _checksum(checksum[0], body) == checksum[1]:
+        return None
+    message = f"The {checksum[0].upper()} you specified did not match the calculated checksum."
+    return _error("BadDigest", message)
 
 
 async def _restore_without_a_key(request: Request, bucket: str, key: str, visible) -> Response:
@@ -2452,43 +2566,16 @@ async def _restore_without_a_key(request: Request, bucket: str, key: str, visibl
 async def _delete_objects_refusal(
     request: Request, bucket: str, key: str, visible
 ) -> Response | None:
-    """DeleteObjects' refusals, in real's order: the `x-amz-checksum-*` headers
-    (``_CHECKSUM_WIDTHS``) and an `x-amz-sdk-checksum-algorithm` with none of them; a `Content-MD5`
-    that is not one; neither a `Content-MD5` nor a checksum ("Missing required header for this
-    request: Content-MD5 OR x-amz-checksum-*"); no body; a body the schema refuses
-    (``_delete_keys``); an empty `Key`; a `Content-MD5` or a checksum the body does not match. A
-    request past all of them is the delete itself."""
-    headers = request.headers
-    named = {
-        name[len("x-amz-checksum-") :]: value
-        for name, value in headers.items()
-        if name.startswith("x-amz-checksum-")
-        and name[len("x-amz-checksum-") :] not in _NOT_CHECKSUMS
-    }
-    if set(named) - _CHECKSUM_WIDTHS.keys():
-        return _error(
-            "InvalidRequest",
-            "The algorithm type you specified in x-amz-checksum- header is invalid.",
-        )
-    if len(named) > 1:
-        return _error(
-            "InvalidRequest",
-            "Expecting a single x-amz-checksum- header. Multiple checksum Types are not allowed.",
-        )
-    checksum = None
-    for name, value in named.items():
-        checksum = (name, _decoded(value, _CHECKSUM_WIDTHS[name]))
-        if checksum[1] is None:
-            return _error("InvalidRequest", f"Value for x-amz-checksum-{name} header is invalid.")
-    algorithm = headers.get("x-amz-sdk-checksum-algorithm")
-    if algorithm is not None and checksum is None:
-        return _error(
-            "InvalidRequest",
-            "x-amz-sdk-checksum-algorithm specified, but no corresponding x-amz-checksum-* or "
-            "x-amz-trailer headers were found.",
-        )
-    if algorithm is not None and algorithm.lower() != checksum[0]:
-        return _error("InvalidRequest", "Value for x-amz-sdk-checksum-algorithm header is invalid.")
+    """DeleteObjects' refusals, in real's order: the `x-amz-checksum-*` headers and
+    `x-amz-sdk-checksum-algorithm` (``_checksum_headers``); a `Content-MD5` that is not one;
+    neither a `Content-MD5` nor a checksum ("Missing required header for this request: Content-MD5
+    OR x-amz-checksum-*"); no body; a body the schema refuses (``_delete_keys``); an empty `Key`; a
+    `Content-MD5` or a checksum the body does not match; and last a payload hash the body does not
+    match, which ``_refuse_write`` checks once these pass: real named each of those before it
+    (2026-09-29). A request past all of them is the delete itself."""
+    checksum, refusal = _checksum_headers(request.headers)
+    if refusal is not None:
+        return refusal
     sent, digest, refusal = _content_md5(request)
     if refusal is not None:
         return refusal
@@ -2507,14 +2594,35 @@ async def _delete_objects_refusal(
         return _error("UserKeyMustBeSpecified", _USER_KEY)
     if digest is not None and (mismatch := _md5_mismatch(sent, digest, body)) is not None:
         return mismatch
-    if checksum is not None:
-        name, expected = checksum
-        if _checksum(name, body) != expected:
-            return _error(
-                "BadDigest",
-                f"The {name.upper()} you specified did not match the calculated checksum.",
-            )
-    return None
+    return _checksum_mismatch(checksum, body)
+
+
+async def _put_object_refusal(request: Request, bucket: str, key: str, visible) -> Response | None:
+    """PutObject's refusals, in real's order: a `Content-MD5` that is not one; the checksum headers
+    (``_checksum_headers``); an aws-chunked payload hash (`STREAMING-…`) without an
+    `x-amz-decoded-content-length`, the 411 real answered a plain body with, a trailer's value and
+    a signed one alike; a payload hash the body does not match (``_payload_mismatch``); a
+    `Content-MD5` the body does not match, naming the digest sent in hex; a checksum the body does
+    not match (all measured 2026-09-29). A chunked body is not decoded here, so one that declares
+    its length is taken on to the write this server does not do."""
+    sent, digest, refusal = _content_md5(request)
+    if refusal is not None:
+        return refusal
+    checksum, refusal = _checksum_headers(request.headers)
+    if refusal is not None:
+        return refusal
+    payload_hash = auth.signed_payload_hash(request) or ""
+    if payload_hash.startswith("STREAMING-"):
+        if "x-amz-decoded-content-length" in request.headers:
+            return None
+        return _error("MissingContentLength", "You must provide the Content-Length HTTP header.")
+    body = await request.body()
+    mismatch = _payload_mismatch(request, body)
+    if mismatch is not None:
+        return mismatch
+    if digest is not None and (mismatch := _md5_mismatch(digest.hex(), digest, body)) is not None:
+        return mismatch
+    return _checksum_mismatch(checksum, body)
 
 
 def _object_encryption(body: bytes) -> tuple[str, str, str | None] | None:
@@ -2584,11 +2692,12 @@ async def _object_encryption_refusal(
 ) -> Response | None:
     """UpdateObjectEncryption's refusals, in real's order: a request signed with Signature Version 2
     (``auth.signed_with_v2``); a `Content-MD5` that is not one; no body; a body the schema refuses
-    (``_object_encryption``); a `Content-MD5` the body does not match; the key, named with its
-    bucket; `SSE-S3`, which the operation does not take; the KMS key's ARN, empty, malformed
-    (``_arn_fault``) or not a key's (``_is_kms_key``); a `BucketKeyEnabled` that is not `true` or
-    `false` without case. What real checks after those is the key's account, which this server has
-    none of to compare, and then the write."""
+    (``_object_encryption``); a `Content-MD5` the body does not match; a payload hash the body does
+    not match (``_payload_mismatch``); the key, named with its bucket; `SSE-S3`, which the operation
+    does not take; the KMS key's ARN, empty, malformed (``_arn_fault``) or not a key's
+    (``_is_kms_key``); a `BucketKeyEnabled` that is not `true` or `false` without case. What real
+    checks after those is the key's account, which this server has none of to compare, and then the
+    write."""
     if auth.signed_with_v2(request):
         return _error(
             "InvalidRequest",
@@ -2604,6 +2713,9 @@ async def _object_encryption_refusal(
     if asked is None:
         return _error("MalformedXML", _MALFORMED_XML)
     if digest is not None and (mismatch := _md5_mismatch(sent, digest, body)) is not None:
+        return mismatch
+    mismatch = _payload_mismatch(request, body)
+    if mismatch is not None:
         return mismatch
     if _object_row(auth.conn(request), bucket, key, visible) is None:
         return _no_such_key(f"{bucket}/{key}")
@@ -2648,6 +2760,7 @@ async def _refuse_write(
     instead: Response | None = None,
     validate=None,
     key: str = "",
+    upload: bool = False,
 ) -> Response:
     """The 501 for a write, or ``instead``, once the credential and, unless ``resolve`` is false,
     the bucket it names resolve, and once ``validate`` — what real checks of the request before it
@@ -2663,6 +2776,11 @@ async def _refuse_write(
     it is refused with ``resolve=False`` and says nothing about the name. An unsigned one is real's
     `AccessDenied` for an anonymous caller (measured 2026-09-29), and any other unsigned write
     names a bucket that caller cannot see.
+
+    Past the bucket, a payload hash naming a trailer is refused (``_trailer_refusal``) unless the
+    write is an ``upload``, whose own check reads it; and once ``validate`` finds nothing, a `PUT`'s
+    and a `POST`'s payload hash is checked against the body (``_payload_mismatch``), which real
+    named on the writes measured after the bucket and after their other refusals.
     """
     caller, visible, err = _auth(request)
     if err is not None:
@@ -2673,10 +2791,16 @@ async def _refuse_write(
         )
     if resolve and not _bucket_visible(auth.conn(request), bucket, visible):
         return _no_such_bucket(bucket)
+    if not upload and (trailer := _trailer_refusal(request)) is not None:
+        return trailer
     if validate is not None:
         refused = await validate(request, bucket, key, visible)
         if refused is not None:
             return refused
+    if instead is None and method in ("PUT", "POST"):
+        mismatch = _payload_mismatch(request, await request.body())
+        if mismatch is not None:
+            return mismatch
     return instead or _error("NotImplemented", _WRITE_IS_NOT_SERVED + method)
 
 
@@ -2743,9 +2867,9 @@ async def service_method_refusal(request: Request) -> Response:
 
 # A bucket's writes that read a `versionId` as a version after the bucket rather than refusing it
 # before: real answered `PUT ?acl&versionId=x` and `POST ?restore&versionId=x` with `NoSuchBucket`
-# for a name nobody owns and "Invalid version id specified" on the public bucket, where `DELETE
-# ?acl`, `PUT ?versioning`, `DELETE ?cors`, `PUT ?tagging` and a bare `DELETE` refused it before the
-# bucket, and a bare `POST ?versionId=x` was the 412 (2026-09-30).
+# for a name nobody owns and "Invalid version id specified" on the public bucket, where
+# `DELETE ?acl`, `PUT ?versioning`, `DELETE ?cors`, `PUT ?tagging` and a bare `DELETE` refused it
+# before the bucket, and a bare `POST ?versionId=x` was the 412 (2026-09-30).
 _VERSION_AFTER_THE_BUCKET = frozenset({("PUT", "acl"), ("POST", "restore")})
 
 
@@ -2827,4 +2951,8 @@ async def object_method_refusal(request: Request, bucket: str, key: str) -> Resp
         return by_selector
     if method in ("PATCH", "POST"):
         return _method_refusal(request, "OBJECT", {"Allow": _ALLOW_OBJECT})
+    if method == "PUT":
+        return await _refuse_write(
+            request, bucket, method, validate=_put_object_refusal, key=key, upload=True
+        )
     return await _refuse_write(request, bucket, method)

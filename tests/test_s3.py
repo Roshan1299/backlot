@@ -22,13 +22,15 @@ import pytest
 import yaml
 from starlette.requests import Request
 
-from backlot import auth, synth
+from backlot import auth, sigv2, sigv4a, synth
 from backlot.acl import ANONYMOUS, Acl, Caller
 from backlot.sigv4 import (
+    canonical_request,
     expected_signature,
     is_skewed,
     parse_amz_date,
     parse_authorization,
+    sign,
     split_credential,
 )
 from tests._helpers import client_for, complete, tiny_corpus
@@ -36,15 +38,31 @@ from tests._helpers import client_for, complete, tiny_corpus
 # ------------------------------------------------------------------------ S3 (SigV4/404/416 edges)
 
 
-def _sign_get(base_url, path, token, *, tamper=False, extra_headers=None, method="GET"):
+def _s3_signer(ak, sk):
+    """botocore's S3 signer, which over http hashes the body into `x-amz-content-sha256` as boto3
+    does, except where the request already names one: then it signs that value, as a client
+    sending a trailer's keyword or a hash of its own does."""
+    from botocore.auth import S3SigV4Auth
+    from botocore.credentials import Credentials
+
+    class _Signer(S3SigV4Auth):
+        def _modify_request_before_signing(self, request):
+            sent = request.headers.get("x-amz-content-sha256")
+            super()._modify_request_before_signing(request)
+            if sent is not None:
+                del request.headers["x-amz-content-sha256"]
+                request.headers["x-amz-content-sha256"] = sent
+
+    return _Signer(Credentials(ak, sk), "s3", "us-east-1")
+
+
+def _sign_get(base_url, path, token, *, tamper=False, extra_headers=None, method="GET", body=None):
     """Return (url, headers) for a SigV4-signed GET (or ``method``), using botocore (the real
-    signer)."""
+    signer) over ``body``."""
     pytest.importorskip("botocore")
     from urllib.parse import parse_qsl, quote, urlencode
 
-    from botocore.auth import S3SigV4Auth
     from botocore.awsrequest import AWSRequest
-    from botocore.credentials import Credentials
 
     from backlot import synth
 
@@ -60,9 +78,8 @@ def _sign_get(base_url, path, token, *, tamper=False, extra_headers=None, method
     ak = synth.s3_access_key_id(token)
     sk = synth.s3_secret_access_key(token)
     url = f"{base_url}{path}"
-    req = AWSRequest(method=method, url=url, headers=dict(extra_headers or {}))
-    req.headers["x-amz-content-sha256"] = "UNSIGNED-PAYLOAD"
-    S3SigV4Auth(Credentials(ak, sk), "s3", "us-east-1").add_auth(req)
+    req = AWSRequest(method=method, url=url, headers=dict(extra_headers or {}), data=body)
+    _s3_signer(ak, sk).add_auth(req)
     headers = dict(req.headers)
     if tamper:
         headers["Authorization"] = headers["Authorization"][:-4] + "dead"
@@ -74,9 +91,14 @@ def _signed(base_url, path, token, method="GET", extra_headers=None, body=None):
     so an exception for a 4xx would hide them."""
     import httpx
 
-    url, headers = _sign_get(base_url, path, token, method=method, extra_headers=extra_headers)
+    url, headers = _sign_get(
+        base_url, path, token, method=method, extra_headers=extra_headers, body=body
+    )
     return httpx.request(method, url, headers=headers, content=body)
 
+
+# A payload hash naming a trailing checksum (``backlot.routers.s3._TRAILERS``).
+_TRAILER = "STREAMING-UNSIGNED-PAYLOAD-TRAILER"
 
 # The pair real puts on every answer, and the refusal it gives a method this router does not serve.
 # The pair measured 2026-09-22 at ap-northeast-2 over twenty-five response shapes; the refusals
@@ -567,7 +589,11 @@ def test_s3_unknown_access_key_rejected(live_server):
     now = datetime.now(timezone.utc).strftime(AMZ_DATE_FORMAT)
     r = httpx.get(
         f"{base_url}/s3/eng-artifacts?list-type=2",
-        headers={"authorization": _v4("AKIABOGUS0000000BOGUS", now), "x-amz-date": now},
+        headers={
+            "authorization": _v4("AKIABOGUS0000000BOGUS", now),
+            "x-amz-date": now,
+            "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
+        },
     )
     assert r.status_code == 403
     assert (
@@ -910,9 +936,7 @@ def _s3_send(client, method, path, token, headers=None, body=None):
     in-process TestClient instead of a live socket."""
     from urllib.parse import parse_qsl, quote, urlencode
 
-    from botocore.auth import S3SigV4Auth
     from botocore.awsrequest import AWSRequest
-    from botocore.credentials import Credentials
 
     from backlot import synth
 
@@ -925,9 +949,8 @@ def _s3_send(client, method, path, token, headers=None, body=None):
     url = f"{base_url}{path}"
     ak = synth.s3_access_key_id(token)
     sk = synth.s3_secret_access_key(token)
-    req = AWSRequest(method=method, url=url, headers=dict(headers or {}))
-    req.headers["x-amz-content-sha256"] = "UNSIGNED-PAYLOAD"
-    S3SigV4Auth(Credentials(ak, sk), "s3", "us-east-1").add_auth(req)
+    req = AWSRequest(method=method, url=url, headers=dict(headers or {}), data=body)
+    _s3_signer(ak, sk).add_auth(req)
     return client.request(method, url, headers=dict(req.headers), content=body)
 
 
@@ -2270,6 +2293,8 @@ _OBJECT_ANSWER_ROWS = [
     ("partNumber=1", {"x-amz-checksum-mode": "ENABLED"}, 206, _FULL_RANGE, True),
     ("", {"x-amz-checksum-mode": "ENABLED", "Range": "bytes=0-"}, 206, _FULL_RANGE, True),
     ("", {"x-amz-checksum-mode": "ENABLED", "Range": "bytes=0-9"}, 206, _FIRST_TEN, False),
+    ("", {"x-amz-content-sha256": "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"}, 200, None, False),
+    ("", {"x-amz-content-sha256": "0" * 64}, 200, None, False),
 ]
 
 
@@ -2286,7 +2311,8 @@ def test_an_objects_own_answer_is_what_real_sends_for_its_object(
 ):
     """On a GET and a HEAD, the bytes of the range named or of the whole object, its one part the
     206 of its whole range, and in checksum mode the object's CRC-64/NVME beside an answer that
-    holds all of it and none beside one that holds less."""
+    holds all of it and none beside one that holds less; a signed payload hash that is not the
+    empty body's, or that names an aws-chunked one, is not read."""
     from backlot.routers import s3 as s3_router
 
     base_url, settings = live_server
@@ -2628,23 +2654,70 @@ _MEMBER_ROWS = [
     ),
     # This server's own refusal, which has no real body to copy.
     ("DELETE", "/s3/eng-artifacts", 501, "NotImplemented", ""),
+    # A payload hash naming a trailer, on an operation that takes no upload: after the bucket and
+    # what is refused before the credential, ahead of what is refused after the bucket.
+    *[
+        ("GET", path, 400, "InvalidRequest", "", {"x-amz-content-sha256": trailer})
+        for trailer in (
+            "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+            "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER",
+        )
+        for path in ("/s3/eng-artifacts?list-type=2", "/s3/eng-artifacts/runbooks/oncall.md")
+    ],
+    *[
+        ("GET", path, 400, "InvalidRequest", "", {"x-amz-content-sha256": _TRAILER})
+        for path in (
+            "/s3/eng-artifacts?versioning",
+            "/s3/eng-artifacts?acl",
+            "/s3/eng-artifacts?list-type=2&continuation-token=garbage",
+            "/s3/eng-artifacts/does/not/exist.md",
+            "/s3/eng-artifacts/runbooks/oncall.md?partNumber=abc",
+            "/s3/eng-artifacts/runbooks/oncall.md?versionId=garbage",
+            "/s3/",
+        )
+    ],
+    (
+        "GET",
+        "/s3/no-such-bucket?list-type=2",
+        404,
+        "NoSuchBucket",
+        "<BucketName>no-such-bucket</BucketName>",
+        {"x-amz-content-sha256": _TRAILER},
+    ),
+    (
+        "GET",
+        "/s3/eng-artifacts?max-keys=abc",
+        400,
+        "InvalidArgument",
+        "<ArgumentName>max-keys</ArgumentName><ArgumentValue>abc</ArgumentValue>",
+        {"x-amz-content-sha256": _TRAILER},
+    ),
+    (
+        "GET",
+        "/s3/eng-artifacts?acl&versioning",
+        400,
+        "InvalidArgument",
+        "<ArgumentName>ResourceType</ArgumentName><ArgumentValue>acl</ArgumentValue>",
+        {"x-amz-content-sha256": _TRAILER},
+    ),
 ]
 
 
 @pytest.mark.parametrize(
-    "method, path, status, code, members",
-    _MEMBER_ROWS,
-    ids=[f"{r[0]}-{r[3]}-{r[1].rsplit('/', 1)[-1]}" for r in _MEMBER_ROWS],
+    "method, path, status, code, members, headers",
+    [r if len(r) == 6 else (*r, {}) for r in _MEMBER_ROWS],
+    ids=[f"{i}-{r[0]}-{r[3]}-{r[1].rsplit('/', 1)[-1]}" for i, r in enumerate(_MEMBER_ROWS)],
 )
 def test_s3_a_refusal_names_what_it_refused_with_the_member_real_uses_for_its_code(
-    live_server, method, path, status, code, members
+    live_server, method, path, status, code, members, headers
 ):
     """Measured 2026-09-29 against us-east-1: `BucketName` for NoSuchBucket, whether the path names
     a key or not, the key alone as `Key` for NoSuchKey, the argument and no resource for
     InvalidArgument, the method and the type for MethodNotAllowed, and nothing more for a key's GET
-    `?uploads`."""
+    `?uploads`; and none for a payload hash naming a trailer (2026-09-29)."""
     base_url, settings = live_server
-    r = _signed(base_url, path, settings.admin_token, method=method)
+    r = _signed(base_url, path, settings.admin_token, method=method, extra_headers=headers)
     assert r.status_code == status
     named = re.search(r"<Code>([^<]+)</Code><Message>[^<]*</Message>(.*)<RequestId>", r.text)
     assert (named[1], named[2]) == (code, members)
@@ -3245,6 +3318,11 @@ _HEAD_ROWS = [
     (OBJECT_PATH, "tampered", {}, 403, None),
     (OBJECT_PATH, None, {}, 404, None),
     ("/s3/eng-artifacts?max-keys=abc", "admin", {}, 400, None),
+    ("/s3/eng-artifacts", "admin", {"x-amz-content-sha256": _TRAILER}, 400, None),
+    ("/s3/eng-artifacts/no/such.md", "admin", {"x-amz-content-sha256": _TRAILER}, 400, None),
+    ("/s3/no-such-bucket", "admin", {"x-amz-content-sha256": _TRAILER}, 404, None),
+    ("/s3/eng-artifacts", "admin", {"x-amz-content-sha256": "garbage"}, 400, None),
+    ("/s3/eng-artifacts", None, {"Authorization": "Bearer abc"}, 400, None),
     ("/s3/no-such-bucket?list-type=2&marker=x", "admin", {}, 400, None),
     ("/s3/eng-artifacts?encoding-type=bogus", "admin", {}, 400, None),
     ("/s3/eng-artifacts?list-type=2&continuation-token=garbage", "admin", {}, 400, None),
@@ -3807,6 +3885,40 @@ def _right_checksum(name: str, body: bytes) -> bytes:
         return s3_router._checksum(name, body)
     xx = {"xxhash64": xxhash.xxh64, "xxhash3": xxhash.xxh3_64, "xxhash128": xxhash.xxh3_128}
     return xx[name](body).digest() if name in xx else hashlib.new(name, body).digest()
+
+
+_ZEROS = "0" * 64
+_NEW = "/s3/eng-artifacts/backlot-new.txt"
+_WRITTEN = "A method you provided writes to the corpus, which this server does not implement: "
+_TRAILER_REFUSED = "The value of x-amz-content-sha256 header is invalid."
+_NO_LENGTH = "You must provide the Content-Length HTTP header."
+_BAD_MD5 = "The Content-MD5 you specified was invalid."
+_SDK_ALONE = (
+    "x-amz-sdk-checksum-algorithm specified, but no corresponding x-amz-checksum-* or "
+    "x-amz-trailer headers were found."
+)
+
+
+def _sha_mismatch(body: bytes, sent: str = _ZEROS) -> tuple[str, str]:
+    """`XAmzContentSHA256Mismatch`'s message and members: the hash sent, and the body's."""
+    return (
+        "The provided 'x-amz-content-sha256' header does not match what was computed.",
+        f"<ClientComputedContentSHA256>{sent}</ClientComputedContentSHA256>"
+        f"<S3ComputedContentSHA256>{hashlib.sha256(body).hexdigest()}</S3ComputedContentSHA256>",
+    )
+
+
+def _crc32(body: bytes) -> str:
+    return _b64(zlib.crc32(body).to_bytes(4, "big"))
+
+
+def _chunked(data: bytes) -> bytes:
+    """An aws-chunked body of one chunk, trailed by its CRC32."""
+    return (
+        f"{len(data):x}\r\n".encode()
+        + data
+        + f"\r\n0\r\nx-amz-checksum-crc32:{_crc32(data)}\r\n\r\n".encode()
+    )
 
 
 def _encryption(arn=None, bucket_key=None, kind="SSE-KMS") -> bytes:
@@ -4514,6 +4626,388 @@ _WRITE_CHECK_ROWS = [
             ("arn:aws:kms:us-east-1:111111111111:key/1234abcd-12ab-34cd-56ef-1234567890ab", None),
         )
     ],
+    # PutObject: a `Content-MD5` that is not one ahead of every checksum header.
+    *[
+        (
+            "PUT",
+            _NEW,
+            b"hello",
+            {"Content-MD5": "garbage", **extra},
+            400,
+            "InvalidDigest",
+            _BAD_MD5,
+            "<Content-MD5>garbage</Content-MD5>",
+        )
+        for extra in (
+            {},
+            {"x-amz-checksum-crc32": "garbage"},
+            {"x-amz-checksum-foo": "AAAAAA=="},
+            {"x-amz-sdk-checksum-algorithm": "CRC32"},
+            {"x-amz-checksum-crc32": "AAAAAA==", "x-amz-checksum-crc32c": "AAAAAA=="},
+            {"x-amz-content-sha256": _TRAILER},
+            {"x-amz-content-sha256": _ZEROS},
+        )
+    ],
+    # Its checksum headers, ahead of an aws-chunked payload hash and of a payload hash that the body
+    # does not match.
+    *[
+        ("PUT", _NEW, b"hello", {**extra, **sha}, 400, "InvalidRequest", message, "")
+        for extra, message in (
+            (
+                {"x-amz-checksum-foo": "AAAAAA=="},
+                "The algorithm type you specified in x-amz-checksum- header is invalid.",
+            ),
+            (
+                {"x-amz-checksum-crc32": "AAAAAA==", "x-amz-checksum-crc32c": "AAAAAA=="},
+                "Expecting a single x-amz-checksum- header. Multiple checksum Types are not allowed.",
+            ),
+            (
+                {"x-amz-checksum-crc32": "garbage"},
+                "Value for x-amz-checksum-crc32 header is invalid.",
+            ),
+            ({"x-amz-sdk-checksum-algorithm": "CRC32"}, _SDK_ALONE),
+            (
+                {"x-amz-sdk-checksum-algorithm": "CRC32", "x-amz-checksum-crc32c": "AAAAAA=="},
+                "Value for x-amz-sdk-checksum-algorithm header is invalid.",
+            ),
+        )
+        for sha in ({}, {"x-amz-content-sha256": _ZEROS}, {"x-amz-content-sha256": _TRAILER})
+    ],
+    # An aws-chunked payload hash with no decoded length, trailer's and signed alike.
+    *[
+        (
+            "PUT",
+            _NEW,
+            b"hello",
+            {"x-amz-content-sha256": sha},
+            411,
+            "MissingContentLength",
+            _NO_LENGTH,
+            "",
+        )
+        for sha in (_TRAILER, "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+    ],
+    (
+        "PUT",
+        _NEW,
+        b"",
+        {"x-amz-content-sha256": _TRAILER},
+        411,
+        "MissingContentLength",
+        _NO_LENGTH,
+        "",
+    ),
+    # An aws-chunked body naming its checksum in `x-amz-trailer`, which real wrote, and the same
+    # without the `x-amz-trailer` the algorithm needs.
+    (
+        "PUT",
+        _NEW,
+        _chunked(b"hello world"),
+        {
+            "x-amz-content-sha256": _TRAILER,
+            "content-encoding": "aws-chunked",
+            "x-amz-decoded-content-length": "11",
+            "x-amz-trailer": "x-amz-checksum-crc32",
+            "x-amz-sdk-checksum-algorithm": "CRC32",
+        },
+        501,
+        "NotImplemented",
+        _WRITTEN + "PUT",
+        "",
+    ),
+    (
+        "PUT",
+        _NEW,
+        _chunked(b"hello world"),
+        {
+            "x-amz-content-sha256": _TRAILER,
+            "content-encoding": "aws-chunked",
+            "x-amz-decoded-content-length": "11",
+            "x-amz-sdk-checksum-algorithm": "CRC32",
+        },
+        400,
+        "InvalidRequest",
+        _SDK_ALONE,
+        "",
+    ),
+    # A payload hash the body does not match, ahead of a `Content-MD5` or a checksum it does not
+    # match, an empty body too; a right one, in either case, is the write.
+    *[
+        (
+            "PUT",
+            _NEW,
+            body,
+            {"x-amz-content-sha256": _ZEROS, **extra},
+            400,
+            "XAmzContentSHA256Mismatch",
+            *_sha_mismatch(body),
+        )
+        for body, extra in (
+            (b"hello", {}),
+            (b"", {}),
+            (b"hello", {"Content-MD5": _md5(b"other")}),
+            (b"hello", {"x-amz-checksum-crc32": _crc32(b"other")}),
+        )
+    ],
+    *[
+        (
+            "PUT",
+            _NEW,
+            b"hello",
+            {"x-amz-content-sha256": sha},
+            501,
+            "NotImplemented",
+            _WRITTEN + "PUT",
+            "",
+        )
+        for sha in (
+            hashlib.sha256(b"hello").hexdigest(),
+            hashlib.sha256(b"hello").hexdigest().upper(),
+            "UNSIGNED-PAYLOAD",
+        )
+    ],
+    # A `Content-MD5` the body does not match, named in hex, ahead of a checksum it does not match.
+    *[
+        (
+            "PUT",
+            _NEW,
+            b"hello",
+            {"Content-MD5": _md5(b"other"), **extra},
+            400,
+            "BadDigest",
+            "The Content-MD5 you specified did not match what we received.",
+            f"<CalculatedDigest>{_md5(b'hello')}</CalculatedDigest>"
+            f"<ExpectedDigest>{hashlib.md5(b'other').hexdigest()}</ExpectedDigest>",
+        )
+        for extra in ({}, {"x-amz-checksum-crc32": _crc32(b"other")})
+    ],
+    (
+        "PUT",
+        _NEW,
+        b"hello",
+        {"x-amz-checksum-crc32": _crc32(b"other")},
+        400,
+        "BadDigest",
+        "The CRC32 you specified did not match the calculated checksum.",
+        "",
+    ),
+    *[
+        ("PUT", _NEW, b"hello", extra, 501, "NotImplemented", _WRITTEN + "PUT", "")
+        for extra in (
+            {"Content-MD5": _md5(b"hello"), "x-amz-checksum-crc32": _crc32(b"hello")},
+            {"x-amz-sdk-checksum-algorithm": "crc32", "x-amz-checksum-crc32": _crc32(b"hello")},
+        )
+    ],
+    # The bucket comes first.
+    *[
+        (
+            "PUT",
+            path,
+            b"hello",
+            {"x-amz-content-sha256": sha},
+            404,
+            "NoSuchBucket",
+            "The specified bucket does not exist",
+            "<BucketName>no-such-bucket</BucketName>",
+        )
+        for path in ("/s3/no-such-bucket/k.txt", "/s3/no-such-bucket/k.txt?tagging")
+        for sha in (_ZEROS, _TRAILER)
+    ],
+    # DeleteObjects checks the payload hash after everything else it checks.
+    (
+        "POST",
+        "/s3/eng-artifacts?delete",
+        _GOOD_DELETE,
+        {"x-amz-content-sha256": _ZEROS, "Content-MD5": _md5(_GOOD_DELETE)},
+        400,
+        "XAmzContentSHA256Mismatch",
+        *_sha_mismatch(_GOOD_DELETE),
+    ),
+    (
+        "POST",
+        "/s3/eng-artifacts?delete",
+        b"<x/>",
+        {"x-amz-content-sha256": _ZEROS, "Content-MD5": _md5(b"<x/>")},
+        400,
+        "MalformedXML",
+        _MALFORMED,
+        "",
+    ),
+    (
+        "POST",
+        "/s3/eng-artifacts?delete",
+        b"",
+        {"x-amz-content-sha256": _ZEROS, "Content-MD5": _md5(b"")},
+        400,
+        "MissingRequestBodyError",
+        "Request Body is empty",
+        "",
+    ),
+    (
+        "POST",
+        "/s3/eng-artifacts?delete",
+        _GOOD_DELETE,
+        {"x-amz-content-sha256": _ZEROS},
+        400,
+        "InvalidRequest",
+        _MISSING_CHECKSUM,
+        "",
+    ),
+    (
+        "POST",
+        "/s3/eng-artifacts?delete",
+        _GOOD_DELETE,
+        {"x-amz-content-sha256": _ZEROS, "Content-MD5": _md5(b"other")},
+        400,
+        "BadDigest",
+        "The Content-MD5 you specified did not match what we received.",
+        f"<CalculatedDigest>{_md5(_GOOD_DELETE)}</CalculatedDigest>"
+        f"<ExpectedDigest>{_md5(b'other')}</ExpectedDigest>",
+    ),
+    (
+        "POST",
+        "/s3/eng-artifacts?delete",
+        _GOOD_DELETE,
+        {"x-amz-content-sha256": _ZEROS, "Content-MD5": "garbage"},
+        400,
+        "InvalidDigest",
+        _BAD_MD5,
+        "<Content-MD5>garbage</Content-MD5>",
+    ),
+    (
+        "POST",
+        "/s3/eng-artifacts?delete",
+        b"<Delete><Object><Key></Key></Object></Delete>",
+        {
+            "x-amz-content-sha256": _ZEROS,
+            "Content-MD5": _md5(b"<Delete><Object><Key></Key></Object></Delete>"),
+        },
+        400,
+        "UserKeyMustBeSpecified",
+        _USER_KEY,
+        "",
+    ),
+    (
+        "POST",
+        "/s3/eng-artifacts?delete",
+        _GOOD_DELETE,
+        {"x-amz-content-sha256": _TRAILER, "Content-MD5": _md5(_GOOD_DELETE)},
+        400,
+        "InvalidRequest",
+        _TRAILER_REFUSED,
+        "",
+    ),
+    # UpdateObjectEncryption: after the schema and a `Content-MD5` the body does not match, ahead of
+    # the key.
+    (
+        "PUT",
+        "/s3/eng-artifacts/runbooks/oncall.md?encryption",
+        b"<x/>",
+        {"x-amz-content-sha256": _ZEROS},
+        400,
+        "MalformedXML",
+        _MALFORMED,
+        "",
+    ),
+    (
+        "PUT",
+        "/s3/eng-artifacts/runbooks/oncall.md?encryption",
+        b"",
+        {"x-amz-content-sha256": _ZEROS},
+        400,
+        "MissingRequestBodyError",
+        "Request Body is empty",
+        "",
+    ),
+    (
+        "PUT",
+        "/s3/eng-artifacts/runbooks/oncall.md?encryption",
+        _encryption(kind="SSE-S3"),
+        {"x-amz-content-sha256": _ZEROS, "Content-MD5": _md5(b"other")},
+        400,
+        "BadDigest",
+        "The Content-MD5 you specified did not match what we received.",
+        f"<CalculatedDigest>{_md5(_encryption(kind='SSE-S3'))}</CalculatedDigest>"
+        f"<ExpectedDigest>{_md5(b'other')}</ExpectedDigest>",
+    ),
+    *[
+        (
+            "PUT",
+            f"/s3/eng-artifacts/{key}?encryption",
+            _encryption(kind="SSE-S3"),
+            {"x-amz-content-sha256": _ZEROS, **extra},
+            400,
+            "XAmzContentSHA256Mismatch",
+            *_sha_mismatch(_encryption(kind="SSE-S3")),
+        )
+        for key, extra in (
+            ("runbooks/oncall.md", {"Content-MD5": _md5(_encryption(kind="SSE-S3"))}),
+            ("backlot-no-such-key", {}),
+        )
+    ],
+    # The other writes measured: a key's and a bucket's `PUT`s check the payload hash once the
+    # bucket is found, a `DELETE` does not, and each refuses a trailer's.
+    (
+        "PUT",
+        "/s3/eng-artifacts/runbooks/oncall.md?tagging",
+        b"<Tagging><TagSet/></Tagging>",
+        {"x-amz-content-sha256": _ZEROS},
+        400,
+        "XAmzContentSHA256Mismatch",
+        *_sha_mismatch(b"<Tagging><TagSet/></Tagging>"),
+    ),
+    (
+        "PUT",
+        "/s3/eng-artifacts?versioning",
+        b"<VersioningConfiguration/>",
+        {"x-amz-content-sha256": _ZEROS},
+        400,
+        "XAmzContentSHA256Mismatch",
+        *_sha_mismatch(b"<VersioningConfiguration/>"),
+    ),
+    (
+        "PUT",
+        "/s3/eng-artifacts/runbooks/oncall.md?tagging",
+        b"<Tagging><TagSet/></Tagging>",
+        {"x-amz-content-sha256": _TRAILER},
+        400,
+        "InvalidRequest",
+        _TRAILER_REFUSED,
+        "",
+    ),
+    (
+        "DELETE",
+        "/s3/eng-artifacts/runbooks/oncall.md",
+        None,
+        {"x-amz-content-sha256": _TRAILER},
+        400,
+        "InvalidRequest",
+        _TRAILER_REFUSED,
+        "",
+    ),
+    *[
+        (
+            "DELETE",
+            "/s3/eng-artifacts/runbooks/oncall.md",
+            body,
+            {"x-amz-content-sha256": sha},
+            501,
+            "NotImplemented",
+            _WRITTEN + "DELETE",
+            "",
+        )
+        for body, sha in ((b"hello", _ZEROS), (None, "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"))
+    ],
+    (
+        "POST",
+        "/s3/eng-artifacts?restore",
+        b"<RestoreRequest/>",
+        {"x-amz-content-sha256": _ZEROS},
+        400,
+        "UserKeyMustBeSpecified",
+        _USER_KEY,
+        "",
+    ),
 ]
 
 
@@ -4733,62 +5227,84 @@ def _request(method, path, query, headers) -> Request:
     return Request(scope)
 
 
+V4 = "AWS4-HMAC-SHA256"
+V4A = "AWS4-ECDSA-P256-SHA256"
+
+
+def _signature(algorithm, date_line, scope, canonical, secret=SK):
+    """The signature over the string real signs, spelt out here: SigV4's HMAC under the scope's
+    signing key, or SigV4a's ECDSA under the key ``backlot.sigv4a`` derives, which
+    ``test_sigv4a_derives_the_key_botocores_crt_signer_signs_with`` pins."""
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    digest = hashlib.sha256(canonical.encode()).hexdigest()
+    to_sign = f"{algorithm}\n{date_line}\n{scope}\n{digest}"
+    if algorithm.upper() == V4A:
+        key = sigv4a.private_key(AK, secret)
+        return key.sign(to_sign.encode(), ec.ECDSA(hashes.SHA256())).hex()
+    date_stamp, region = scope.split("/")[:2]
+    return sign(secret, date_stamp, region, to_sign)
+
+
 def _header_auth_request(
-    amz_date: str, path="/s3/eng-artifacts", query="list-type=2", region="us-east-1"
+    amz_date: str,
+    path="/s3/eng-artifacts",
+    query="list-type=2",
+    region="us-east-1",
+    algorithm=V4,
+    dates=None,
+    scope_date=None,
+    region_set="*",
 ):
-    """Build a header-auth GET signed for `amz_date` with a genuinely valid signature."""
-    date_stamp = amz_date[:8]
-    signed_headers = "host;x-amz-date"
-    headers = {
-        "host": "backlot",
-        "x-amz-date": amz_date,
-        "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
-    }
-    sig = expected_signature(
-        SK,
-        "GET",
-        path,
-        query,
-        headers,
-        signed_headers,
-        "UNSIGNED-PAYLOAD",
-        amz_date,
-        date_stamp,
-        region,
+    """Build a header-auth GET with a genuinely valid signature, dated `amz_date` in `x-amz-date`
+    unless ``dates`` names the date headers sent, the scope dated ``scope_date`` or the date's
+    first eight characters. A SigV4a one signs its ``region_set`` as well."""
+    headers = {"host": "backlot", "x-amz-content-sha256": "UNSIGNED-PAYLOAD"}
+    headers.update(dates or {"x-amz-date": amz_date})
+    if algorithm == V4A:
+        headers["x-amz-region-set"] = region_set
+    signed_headers = ";".join(sorted(k for k in headers if k != "x-amz-content-sha256"))
+    date_line = headers["x-amz-date"] if "x-amz-date" in headers else headers["date"]
+    date_stamp = scope_date or amz_date[:8]
+    scope = (
+        f"{date_stamp}/s3/aws4_request"
+        if algorithm == V4A
+        else (f"{date_stamp}/{region}/s3/aws4_request")
     )
-    credential = f"{AK}/{date_stamp}/{region}/s3/aws4_request"
+    canonical = canonical_request("GET", path, query, headers, signed_headers, "UNSIGNED-PAYLOAD")
+    sig = _signature(algorithm, date_line, scope, canonical)
     headers["authorization"] = (
-        f"AWS4-HMAC-SHA256 Credential={credential}, SignedHeaders={signed_headers}, Signature={sig}"
+        f"{algorithm} Credential={AK}/{scope}, SignedHeaders={signed_headers}, Signature={sig}"
     )
     return _request("GET", path, query, headers)
 
 
-def _presigned_request(amz_date: str, expires: int, path="/s3/eng-artifacts", region="us-east-1"):
-    """Build a presigned-query GET signed for `amz_date`/`expires` with a valid signature."""
+def _presigned_request(
+    amz_date: str, expires: int, path="/s3/eng-artifacts", region="us-east-1", algorithm=V4
+):
+    """Build a presigned-query GET signed for `amz_date`/`expires` with a valid signature; a
+    SigV4a one names `*` as its region set."""
     date_stamp = amz_date[:8]
     signed_headers = "host"
     headers = {"host": "backlot"}
-    credential = f"{AK}/{date_stamp}/{region}/s3/aws4_request"
+    scope = (
+        f"{date_stamp}/s3/aws4_request"
+        if algorithm == V4A
+        else (f"{date_stamp}/{region}/s3/aws4_request")
+    )
     params = {
-        "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
-        "X-Amz-Credential": credential,
+        "X-Amz-Algorithm": algorithm,
+        "X-Amz-Credential": f"{AK}/{scope}",
         "X-Amz-Date": amz_date,
         "X-Amz-Expires": str(expires),
         "X-Amz-SignedHeaders": signed_headers,
     }
+    if algorithm == V4A:
+        params["X-Amz-Region-Set"] = "*"
     query = urlencode(params, safe="-_.~", quote_via=quote)
-    sig = expected_signature(
-        SK,
-        "GET",
-        path,
-        query,
-        headers,
-        signed_headers,
-        "UNSIGNED-PAYLOAD",
-        amz_date,
-        date_stamp,
-        region,
-    )
+    canonical = canonical_request("GET", path, query, headers, signed_headers, "UNSIGNED-PAYLOAD")
+    sig = _signature(algorithm, amz_date, scope, canonical)
     query = f"{query}&X-Amz-Signature={sig}"
     return _request("GET", path, query, headers)
 
@@ -4839,10 +5355,36 @@ def test_header_auth_skew_check_precedes_signature_check():
 SIGNED_PATHS = ["/s3/eng-artifacts", "/s3/eng-artifacts/q%3Fx.txt"]
 
 
+def _date_headers(form: str, now: datetime) -> dict[str, str]:
+    """The date headers a header request sends in ``form``, each measured on 2026-09-29: real read
+    `Date` without an `x-amz-date`, an `x-amz-date` over a `Date` it cannot read, and an
+    `x-amz-date` in RFC 1123, asctime or RFC 850, each signed as sent, and a `+0900` one beside a
+    scope dated in UTC."""
+    rfc = now.strftime("%a, %d %b %Y %H:%M:%S GMT")
+    return {
+        "x-amz-date": {"x-amz-date": now.strftime(AMZ_DATE_FORMAT)},
+        "Date": {"date": rfc},
+        "x-amz-date-over-a-bad-Date": {"x-amz-date": now.strftime(AMZ_DATE_FORMAT), "date": "x"},
+        "rfc1123-x-amz-date": {"x-amz-date": rfc},
+        "asctime": {"x-amz-date": now.strftime("%a %b %d %H:%M:%S %Y")},
+        "rfc850": {"x-amz-date": now.strftime("%A, %d-%b-%y %H:%M:%S GMT")},
+        "+0900": {"date": (now + timedelta(hours=9)).strftime("%a, %d %b %Y %H:%M:%S +0900")},
+    }[form]
+
+
 @pytest.mark.parametrize("path", SIGNED_PATHS)
-def test_header_auth_accepts_current_date(path):
-    current = datetime.now(timezone.utc).strftime(AMZ_DATE_FORMAT)
-    req = _header_auth_request(current, path=path)
+@pytest.mark.parametrize("algorithm", [V4, V4A])
+@pytest.mark.parametrize(
+    "form",
+    ["x-amz-date", "Date", "x-amz-date-over-a-bad-Date", "rfc1123-x-amz-date", "asctime", "rfc850"]
+    + ["+0900"],
+)
+def test_header_auth_accepts_current_date(path, algorithm, form):
+    now = datetime.now(timezone.utc)
+    current = now.strftime(AMZ_DATE_FORMAT)
+    req = _header_auth_request(
+        current, path=path, algorithm=algorithm, dates=_date_headers(form, now)
+    )
     caller, err = auth.resolve_sigv4(req)
     assert err is None
     assert caller == Caller(email="ava@acme.com", is_admin=False)
@@ -4861,9 +5403,10 @@ def test_presigned_expired_is_access_denied():
 
 
 @pytest.mark.parametrize("path", SIGNED_PATHS)
-def test_presigned_unexpired_ok(path):
+@pytest.mark.parametrize("algorithm", [V4, V4A])
+def test_presigned_unexpired_ok(path, algorithm):
     current = datetime.now(timezone.utc).strftime(AMZ_DATE_FORMAT)
-    req = _presigned_request(current, expires=3600, path=path)
+    req = _presigned_request(current, expires=3600, path=path, algorithm=algorithm)
     caller, err = auth.resolve_sigv4(req)
     assert err is None
     assert caller == Caller(email="ava@acme.com", is_admin=False)
@@ -4874,12 +5417,33 @@ def _now(minutes: int = 0) -> str:
 
 
 def _v4(
-    akid: str, date: str, service: str = "s3", terminal: str = "aws4_request", region="us-east-1"
+    akid: str,
+    date: str,
+    service: str = "s3",
+    terminal: str = "aws4_request",
+    region="us-east-1",
+    scope_date=None,
+    signed="host;x-amz-date",
 ) -> str:
+    stamp = date[:8] if scope_date is None else scope_date
     return (
-        f"AWS4-HMAC-SHA256 Credential={akid}/{date[:8]}/{region}/{service}/{terminal}, "
-        "SignedHeaders=host;x-amz-date, Signature=00"
+        f"AWS4-HMAC-SHA256 Credential={akid}/{stamp}/{region}/{service}/{terminal}, "
+        f"SignedHeaders={signed}, Signature=00"
     )
+
+
+def _v4a(akid: str, date: str, scope=None, signed="host;x-amz-date;x-amz-region-set") -> str:
+    scope = f"{date[:8]}/s3/aws4_request" if scope is None else scope
+    return f"AWS4-ECDSA-P256-SHA256 Credential={akid}/{scope}, SignedHeaders={signed}, Signature=00"
+
+
+def _another_day() -> tuple[str, str]:
+    """A `Date` of now in a zone whose day is not UTC's, and that day as a scope date: `+1400`
+    from ten o'clock UTC on, and `HST`, ten hours behind, before it."""
+    now = datetime.now(timezone.utc)
+    zone, hours = ("+1400", 14) if now.hour >= 10 else ("HST", -10)
+    local = now + timedelta(hours=hours)
+    return local.strftime(f"%a, %d %b %Y %H:%M:%S {zone}"), local.strftime("%Y%m%d")
 
 
 def _http_date(minutes: int = 0) -> str:
@@ -4926,14 +5490,40 @@ _V2_QUERY_PARAMETERS = (
     "Query-string authentication requires the Signature, Expires and AWSAccessKeyId parameters"
 )
 _NOT_A_DATE = "Invalid date (should be seconds since epoch): "
+_NO_PAYLOAD_HASH = "Missing required header for this request: x-amz-content-sha256"
+_BAD_PAYLOAD_HASH = (
+    "x-amz-content-sha256 must be UNSIGNED-PAYLOAD, STREAMING-UNSIGNED-PAYLOAD-TRAILER, "
+    "STREAMING-AWS4-HMAC-SHA256-PAYLOAD, STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER, "
+    "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD, STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER or "
+    "a valid sha256 value."
+)
+_NOT_SIGNED = "There were headers present in the request which were not signed"
+_DATE_FORMAT = 'This date in the credential must be in the format "yyyyMMdd".'
+_SHAPE_4A = 'the Credential is mal-formed; expecting "<YOUR-AKID>/YYYYMMDD/SERVICE/aws4_request".'
+_REGION_SET = "The provided X-Amz-Region-Set doesn't match against the requested S3 region."
+_INTERNAL = "We encountered an internal error. Please try again."
+_A_NUMBER = "X-Amz-Expires should be a number"
 
 
-def _presign(date: str, expires="3600", credential=None, **extra) -> str:
+def _hashed(value: str) -> tuple[tuple[str, str], ...]:
+    return (("ArgumentName", "x-amz-content-sha256"), ("ArgumentValue", value))
+
+
+def _not_signed(names: str) -> tuple[tuple[str, str], ...]:
+    return (("HeadersNotSigned", names),)
+
+
+def _expired_at(expires: str) -> tuple[tuple[str, str], ...]:
+    """A V2 query's expiry as real named it; the server time is the clock's (2026-09-29)."""
+    return (("Expires", expires),)
+
+
+def _presign(date: str, expires="3600", credential=None, algorithm=V4, **extra) -> str:
     """A presign's query with every parameter present, the scope dated `date` unless given. The
     rows below are built when the module is imported, so the default lifetime is an hour, long
     enough for a serial run to reach them unexpired; a row that is to expire says so."""
     return _query(
-        X_Amz_Algorithm="AWS4-HMAC-SHA256",
+        X_Amz_Algorithm=algorithm,
         X_Amz_Credential=credential or f"{AK}/{date[:8]}/us-east-1/s3/aws4_request",
         X_Amz_Date=date,
         X_Amz_Expires=expires,
@@ -5448,23 +6038,693 @@ _REFUSAL_ROWS_UNIT = [
         "InvalidAccessKeyId",
         _NO_KEY,
     ),
+    # The header's `x-amz-content-sha256`, after its one space and its scheme and ahead of its date.
+    (
+        "no payload hash",
+        {
+            "x-amz-content-sha256": None,
+            "x-amz-date": _now(),
+            "authorization": _v4(_UNKNOWN, _now()),
+        },
+        "",
+        "InvalidRequest",
+        _NO_PAYLOAD_HASH,
+        (),
+    ),
+    (
+        "payload hash before the date",
+        {"x-amz-content-sha256": None, "authorization": _v4(_UNKNOWN, _now())},
+        "",
+        "InvalidRequest",
+        _NO_PAYLOAD_HASH,
+        (),
+    ),
+    (
+        "payload hash before the parts",
+        {"x-amz-content-sha256": None, "authorization": "AWS4-HMAC-SHA256 nonsense"},
+        "",
+        "InvalidRequest",
+        _NO_PAYLOAD_HASH,
+        (),
+    ),
+    (
+        "scheme before the payload hash",
+        {"x-amz-content-sha256": None, "authorization": "Bearer abc"},
+        "",
+        "InvalidArgument",
+        "Unsupported Authorization Type",
+    ),
+    (
+        "one space before the payload hash",
+        {"x-amz-content-sha256": None, "authorization": "AWS4-HMAC-SHA256"},
+        "",
+        "InvalidArgument",
+        _NO_SPACE,
+    ),
+    (
+        "v2 reads no payload hash",
+        {"x-amz-content-sha256": None, "date": _http_date(), "authorization": f"AWS {_UNKNOWN}:a"},
+        "",
+        "InvalidAccessKeyId",
+        _NO_KEY,
+    ),
+    *[
+        (
+            f"payload hash {value!r}",
+            {"x-amz-content-sha256": value, "x-amz-date": _now(), "authorization": _v4(AK, _now())},
+            "",
+            "InvalidArgument",
+            _BAD_PAYLOAD_HASH,
+            _hashed(value),
+        )
+        for value in ("garbage", "unsigned-payload", "a" * 63, "a" * 65, "g" * 64, "")
+    ],
+    (
+        "payload hash before the skew",
+        {
+            "x-amz-content-sha256": "garbage",
+            "x-amz-date": _now(-30),
+            "authorization": _v4(AK, _now(-30)),
+        },
+        "",
+        "InvalidArgument",
+        _BAD_PAYLOAD_HASH,
+        _hashed("garbage"),
+    ),
+    (
+        "payload hash before the region",
+        {
+            "x-amz-content-sha256": "garbage",
+            "x-amz-date": _now(),
+            "authorization": _v4(AK, _now(), region="us-west-2"),
+        },
+        "",
+        "InvalidArgument",
+        _BAD_PAYLOAD_HASH,
+        _hashed("garbage"),
+    ),
+    *[
+        (
+            f"payload hash {value[:24]!r} is read",
+            {
+                "x-amz-content-sha256": value,
+                "x-amz-date": _now(),
+                "authorization": _v4(_UNKNOWN, _now()),
+            },
+            "",
+            "InvalidAccessKeyId",
+            _NO_KEY,
+        )
+        for value in (
+            "A" * 64,
+            "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+        )
+    ],
+    # The header's date: `x-amz-date` when one is sent, readable or not, and `Date` otherwise.
+    (
+        "Date alone",
+        {"date": _http_date(), "authorization": _v4(_UNKNOWN, _now())},
+        "",
+        "InvalidAccessKeyId",
+        _NO_KEY,
+    ),
+    (
+        "x-amz-date over Date",
+        {"x-amz-date": "garbage", "date": _http_date(), "authorization": _v4(_UNKNOWN, _now())},
+        "",
+        "AccessDenied",
+        _NO_DATE,
+    ),
+    (
+        "an empty x-amz-date over Date",
+        {"x-amz-date": "", "date": _http_date(), "authorization": _v4(_UNKNOWN, _now())},
+        "",
+        "AccessDenied",
+        _NO_DATE,
+    ),
+    (
+        "Date skewed",
+        {"date": _http_date(-30), "authorization": _v4(_UNKNOWN, _now(-30))},
+        "",
+        "RequestTimeTooSkewed",
+        _SKEWED,
+    ),
+    (
+        "Date before 1970",
+        {"date": "Tue, 29 Sep 1969 16:00:00 GMT", "authorization": _v4(_UNKNOWN, _now())},
+        "",
+        "AccessDenied",
+        _NO_DATE,
+    ),
+    (
+        "Date past 9999",
+        {"date": "Tue, 29 Sep 10000 16:00:00 GMT", "authorization": _v4(_UNKNOWN, _now())},
+        "",
+        "InternalError",
+        _INTERNAL,
+        (),
+    ),
+    (
+        "x-amz-date past 9999",
+        {"x-amz-date": "Tue, 29 Sep 10000 16:00:00 GMT", "authorization": _v4(_UNKNOWN, _now())},
+        "",
+        "InternalError",
+        _INTERNAL,
+        (),
+    ),
+    (
+        "x-amz-date in RFC 1123",
+        {"x-amz-date": _http_date(), "authorization": _v4(_UNKNOWN, _now())},
+        "",
+        "InvalidAccessKeyId",
+        _NO_KEY,
+    ),
+    (
+        "scope date in the zone sent",
+        {"date": _another_day()[0], "authorization": _v4(_UNKNOWN, _another_day()[1])},
+        "",
+        "AuthorizationHeaderMalformed",
+        _MALFORMED + "Invalid credential date. Date is not the same as X-Amz-Date.",
+    ),
+    (
+        "scope date in UTC",
+        {"date": _another_day()[0], "authorization": _v4(_UNKNOWN, _now())},
+        "",
+        "InvalidAccessKeyId",
+        _NO_KEY,
+    ),
+    # The scope date's format, ahead of the region and read before it is compared with the date.
+    *[
+        (
+            f"credential date {value!r}",
+            {"x-amz-date": _now(), "authorization": _v4(AK, _now(), scope_date=value)},
+            "",
+            "AuthorizationHeaderMalformed",
+            _MALFORMED + f'incorrect date format "{value}". ' + _DATE_FORMAT,
+            (),
+        )
+        for value in (
+            "",
+            "2026",
+            "20261329",
+            "20260230",
+            "2026090",
+            "20260900",
+            "2026929",
+            "202609291",
+            "2026-09-29",
+            "+2026092",
+            "2026O929",
+        )
+    ],
+    *[
+        (
+            f"credential date {value!r} is a date",
+            {"x-amz-date": _now(), "authorization": _v4(AK, _now(), scope_date=value)},
+            "",
+            "AuthorizationHeaderMalformed",
+            _MALFORMED + "Invalid credential date. Date is not the same as X-Amz-Date.",
+        )
+        for value in ("2026092", _now()[:8] + "x")
+    ],
+    (
+        "credential date before the region",
+        {"x-amz-date": _now(), "authorization": _v4(AK, _now(), scope_date="", region="us-west-2")},
+        "",
+        "AuthorizationHeaderMalformed",
+        _MALFORMED + 'incorrect date format "". ' + _DATE_FORMAT,
+        (),
+    ),
+    (
+        "credential date before an empty region",
+        {"x-amz-date": _now(), "authorization": _v4(AK, _now(), scope_date="", region="")},
+        "",
+        "AuthorizationHeaderMalformed",
+        _MALFORMED + 'incorrect date format "". ' + _DATE_FORMAT,
+        (),
+    ),
+    (
+        "query credential date",
+        {},
+        _presign(_now(), credential=f"{AK}/2026/us-east-1/s3/aws4_request"),
+        "AuthorizationQueryParametersError",
+        _QUERY_CREDENTIAL + 'incorrect date format "2026". ' + _DATE_FORMAT,
+        (),
+    ),
+    (
+        "query credential date before the region",
+        {},
+        _presign(_now(), credential=f"{AK}//us-west-2/s3/aws4_request"),
+        "AuthorizationQueryParametersError",
+        _QUERY_CREDENTIAL + 'incorrect date format "". ' + _DATE_FORMAT,
+        (),
+    ),
+    (
+        "query credential date read and compared",
+        {},
+        _presign(_now(), credential=f"{AK}/{_now()[:8]}x/us-east-1/s3/aws4_request"),
+        "AuthorizationQueryParametersError",
+        f'Invalid credential date "{_now()[:8]}x". This date is not the same as X-Amz-Date: '
+        f'"{_now()[:8]}".',
+    ),
+    # A header that had to be signed and was not: after the scope, ahead of the key.
+    (
+        "x-amz-meta-foo unsigned",
+        {"x-amz-date": _now(), "x-amz-meta-foo": "bar", "authorization": _v4(_UNKNOWN, _now())},
+        "",
+        "AccessDenied",
+        _NOT_SIGNED,
+        _not_signed("x-amz-meta-foo"),
+    ),
+    (
+        "content-md5 unsigned",
+        {"x-amz-date": _now(), "content-md5": _md5(b""), "authorization": _v4(_UNKNOWN, _now())},
+        "",
+        "AccessDenied",
+        _NOT_SIGNED,
+        _not_signed("content-md5"),
+    ),
+    (
+        "host unsigned",
+        {"x-amz-date": _now(), "authorization": _v4(_UNKNOWN, _now(), signed="x-amz-date")},
+        "",
+        "AccessDenied",
+        _NOT_SIGNED,
+        _not_signed("host"),
+    ),
+    (
+        "x-amz-date unsigned",
+        {"x-amz-date": _now(), "authorization": _v4(_UNKNOWN, _now(), signed="host")},
+        "",
+        "AccessDenied",
+        _NOT_SIGNED,
+        _not_signed("x-amz-date"),
+    ),
+    (
+        "unsigned in real's order",
+        {
+            "x-amz-date": _now(),
+            "x-amz-meta-b": "1",
+            "content-md5": _md5(b""),
+            "x-amz-meta-a": "2",
+            "authorization": _v4(_UNKNOWN, _now()),
+        },
+        "",
+        "AccessDenied",
+        _NOT_SIGNED,
+        _not_signed("x-amz-meta-a, x-amz-meta-b, content-md5"),
+    ),
+    (
+        "unsigned headers real signs no matter",
+        {
+            "x-amz-date": _now(),
+            "content-type": "text/plain",
+            "range": "bytes=0-1",
+            "date": _http_date(),
+            "if-none-match": '"x"',
+            "x-amzn-trace-id": "Root=1-x",
+            "authorization": _v4(_UNKNOWN, _now()),
+        },
+        "",
+        "InvalidAccessKeyId",
+        _NO_KEY,
+    ),
+    (
+        "scope date before unsigned",
+        {"x-amz-date": _now(), "x-amz-meta-foo": "bar", "authorization": _v4(AK, "20200101")},
+        "",
+        "AuthorizationHeaderMalformed",
+        _MALFORMED + "Invalid credential date. Date is not the same as X-Amz-Date.",
+    ),
+    (
+        "region before unsigned",
+        {
+            "x-amz-date": _now(),
+            "x-amz-meta-foo": "bar",
+            "authorization": _v4(AK, _now(), region="us-west-2"),
+        },
+        "",
+        "AuthorizationHeaderMalformed",
+        _MALFORMED + _WRONG_REGION,
+    ),
+    (
+        "payload hash before unsigned",
+        {
+            "x-amz-date": _now(),
+            "x-amz-meta-foo": "bar",
+            "x-amz-content-sha256": "garbage",
+            "authorization": _v4(AK, _now()),
+        },
+        "",
+        "InvalidArgument",
+        _BAD_PAYLOAD_HASH,
+        _hashed("garbage"),
+    ),
+    (
+        "query unsigned",
+        {"x-amz-meta-foo": "bar"},
+        _presign(_now(), credential=f"{_UNKNOWN}/{_now()[:8]}/us-east-1/s3/aws4_request"),
+        "AccessDenied",
+        _NOT_SIGNED,
+        _not_signed("x-amz-meta-foo"),
+    ),
+    (
+        "query x-amz-date header unsigned",
+        {"x-amz-date": _now()},
+        _presign(_now(), credential=f"{_UNKNOWN}/{_now()[:8]}/us-east-1/s3/aws4_request"),
+        "AccessDenied",
+        _NOT_SIGNED,
+        _not_signed("x-amz-date"),
+    ),
+    (
+        "query expiry before unsigned",
+        {"x-amz-meta-foo": "bar"},
+        _presign(_now(-600), expires="60"),
+        "AccessDenied",
+        "Request has expired",
+    ),
+    # `X-Amz-Expires` as a Java long.
+    *[
+        (
+            f"query X-Amz-Expires {value!r}",
+            {},
+            _presign(_now(), expires=value),
+            "AuthorizationQueryParametersError",
+            _A_NUMBER,
+        )
+        for value in (
+            " 300",
+            "300 ",
+            "3_00",
+            "3e2",
+            "0x12c",
+            "300.0",
+            "",
+            "-",
+            "+",
+            "9223372036854775808",
+            "-9223372036854775809",
+        )
+    ],
+    (
+        "query X-Amz-Expires the least long",
+        {},
+        _presign(_now(), expires="-9223372036854775808"),
+        "AuthorizationQueryParametersError",
+        "X-Amz-Expires must be non-negative",
+    ),
+    (
+        "query X-Amz-Expires the greatest long",
+        {},
+        _presign(_now(), expires="9223372036854775807"),
+        "AuthorizationQueryParametersError",
+        _WEEK,
+    ),
+    *[
+        (
+            f"query X-Amz-Expires {value!r} is 300",
+            {},
+            _presign(
+                _now(),
+                expires=value,
+                credential=f"{_UNKNOWN}/{_now()[:8]}/us-east-1/s3/aws4_request",
+            ),
+            "InvalidAccessKeyId",
+            _NO_KEY,
+        )
+        for value in ("+300", "0300", "\u0663\u0660\u0660", "\uff13\uff10\uff10", "0" * 40 + "300")
+    ],
+    # A V2 query's `Expires`: every negative long is a date, a positive one to an int32's largest,
+    # and the milliseconds it makes wrap as a long's.
+    (
+        "v2 query Expires with a plus",
+        {},
+        _query(Signature="abc", AWSAccessKeyId=_UNKNOWN, Expires="+2147483647"),
+        "InvalidAccessKeyId",
+        _NO_KEY,
+    ),
+    *[
+        (
+            f"v2 query Expires {value}",
+            {},
+            _query(Signature="abc", AWSAccessKeyId=_UNKNOWN, Expires=value),
+            "AccessDenied",
+            "Request has expired",
+            _expired_at(expires),
+        )
+        for value, expires in (
+            ("-2147483649", "1901-12-13T20:45:51Z"),
+            ("-9999999999", "1653-02-10T06:13:21Z"),
+            ("-62135596800", "0001-01-03T00:00:00Z"),
+            ("-62135596801", "0001-01-02T23:59:59Z"),
+            ("-62167219200", "0001-01-03T00:00:00Z"),
+            ("-30610224000", "0999-12-27T00:00:00Z"),
+            ("-50000000000", "0385-07-24T07:06:40Z"),
+            ("-9223372036854775807", "1970-01-01T00:00:01Z"),
+            ("-9223372036854775808", "1970-01-01T00:00:00Z"),
+        )
+    ],
+    *[
+        (
+            f"v2 query Expires {value} is real's 500",
+            {},
+            _query(Signature="abc", AWSAccessKeyId=_UNKNOWN, Expires=value),
+            "InternalError",
+            _INTERNAL,
+            (),
+        )
+        for value in ("-62167219201", "-70000000000", "-9223372036854775")
+    ],
+    (
+        "v2 query Expires that wraps into the future",
+        {},
+        _query(Signature="abc", AWSAccessKeyId=_UNKNOWN, Expires="-9223372036854776"),
+        "InvalidAccessKeyId",
+        _NO_KEY,
+    ),
+    (
+        "v2 query Expires below a long",
+        {},
+        _query(Signature="abc", AWSAccessKeyId=_UNKNOWN, Expires="-9223372036854775809"),
+        "AccessDenied",
+        _NOT_A_DATE + "-9223372036854775809",
+    ),
+    (
+        "v2 Date past 9999",
+        {"date": "Tue, 29 Sep 10000 16:00:00 GMT", "authorization": f"AWS {_UNKNOWN}:abc"},
+        "",
+        "InternalError",
+        _INTERNAL,
+        (),
+    ),
+    # SigV4a in the header: its scope has no region, and it signs a region set.
+    (
+        "v4a scope with a region",
+        {
+            "x-amz-date": _now(),
+            "authorization": _v4a(AK, _now(), scope=f"{_now()[:8]}/us-east-1/s3/aws4_request"),
+        },
+        "",
+        "AuthorizationHeaderMalformed",
+        _MALFORMED + _SHAPE_4A,
+        (),
+    ),
+    (
+        "v4a no payload hash",
+        {"x-amz-content-sha256": None, "authorization": _v4a(AK, _now())},
+        "",
+        "InvalidRequest",
+        _NO_PAYLOAD_HASH,
+        (),
+    ),
+    (
+        "v4a service",
+        {
+            "x-amz-date": _now(),
+            "x-amz-region-set": "us-west-2",
+            "authorization": _v4a(AK, _now(), scope=f"{_now()[:8]}/ec2/aws4_request"),
+        },
+        "",
+        "AuthorizationHeaderMalformed",
+        _MALFORMED + 'incorrect service "ec2". This endpoint belongs to "s3".',
+    ),
+    (
+        "v4a terminal",
+        {
+            "x-amz-date": _now(),
+            "authorization": _v4a(AK, _now(), scope=f"{_now()[:8]}/s3/aws5_request"),
+        },
+        "",
+        "AuthorizationHeaderMalformed",
+        _MALFORMED + 'incorrect terminal "aws5_request". This endpoint uses "aws4_request".',
+    ),
+    (
+        "v4a credential date",
+        {"x-amz-date": _now(), "authorization": _v4a(AK, _now(), scope="/ec2/aws4_request")},
+        "",
+        "AuthorizationHeaderMalformed",
+        _MALFORMED + 'incorrect date format "". ' + _DATE_FORMAT,
+        (),
+    ),
+    (
+        "v4a scope date before the region set",
+        {"x-amz-date": _now(), "authorization": _v4a(AK, _now(), scope="20200101/s3/aws4_request")},
+        "",
+        "AuthorizationHeaderMalformed",
+        _MALFORMED + "Invalid credential date. Date is not the same as X-Amz-Date.",
+    ),
+    (
+        "v4a no region set",
+        {"x-amz-date": _now(), "authorization": _v4a(_UNKNOWN, _now(), signed="host;x-amz-date")},
+        "",
+        "InvalidRequest",
+        "Missing required header for this request: x-amz-region-set",
+        (),
+    ),
+    (
+        "v4a region set unsigned",
+        {
+            "x-amz-date": _now(),
+            "x-amz-region-set": "us-west-2",
+            "authorization": _v4a(AK, _now(), signed="host;x-amz-date"),
+        },
+        "",
+        "AccessDenied",
+        _NOT_SIGNED,
+        _not_signed("x-amz-region-set"),
+    ),
+    (
+        "v4a unsigned before the region set",
+        {
+            "x-amz-date": _now(),
+            "x-amz-meta-foo": "bar",
+            "authorization": _v4a(AK, _now(), signed="host;x-amz-date"),
+        },
+        "",
+        "AccessDenied",
+        _NOT_SIGNED,
+        _not_signed("x-amz-meta-foo"),
+    ),
+    *[
+        (
+            f"v4a region set {value!r}",
+            {
+                "x-amz-date": _now(),
+                "x-amz-region-set": value,
+                "authorization": _v4a(_UNKNOWN, _now()),
+            },
+            "",
+            "RegionSetMismatch",
+            _REGION_SET,
+            (("RequestedRegion", "us-east-1"), ("RegionSet", value)),
+        )
+        for value in ("us-west-2", "")
+    ],
+    (
+        "v4a region set before the key",
+        {"x-amz-date": _now(), "x-amz-region-set": "us-*", "authorization": _v4a(_UNKNOWN, _now())},
+        "",
+        "InvalidAccessKeyId",
+        _NO_KEY,
+    ),
+    # And in the query.
+    (
+        "v4a query scope with a region",
+        {},
+        _presign(_now(), credential=f"{AK}/{_now()[:8]}/us-east-1/s3/aws4_request", algorithm=V4A),
+        "AuthorizationQueryParametersError",
+        _QUERY_CREDENTIAL + _SHAPE_4A,
+        (),
+    ),
+    (
+        "v4a query no region set",
+        {},
+        _presign(_now(), credential=f"{_UNKNOWN}/{_now()[:8]}/s3/aws4_request", algorithm=V4A),
+        "AuthorizationQueryParametersError",
+        "SigV4a query auth requires a non empty x-amz-region-set parameter.",
+        (),
+    ),
+    (
+        "v4a query region set in lower case is none",
+        {},
+        _presign(
+            _now(),
+            credential=f"{_UNKNOWN}/{_now()[:8]}/s3/aws4_request",
+            algorithm=V4A,
+            x_amz_region_set="*",
+        ),
+        "AuthorizationQueryParametersError",
+        "SigV4a query auth requires a non empty x-amz-region-set parameter.",
+        (),
+    ),
+    (
+        "v4a query empty region set",
+        {},
+        _presign(
+            _now(),
+            credential=f"{_UNKNOWN}/{_now()[:8]}/s3/aws4_request",
+            algorithm=V4A,
+            X_Amz_Region_Set="",
+        ),
+        "AuthorizationQueryParametersError",
+        "SigV4a query auth requires a non empty x-amz-region-set parameter.",
+        (),
+    ),
+    (
+        "v4a query region set",
+        {},
+        _presign(
+            _now(),
+            credential=f"{_UNKNOWN}/{_now()[:8]}/s3/aws4_request",
+            algorithm=V4A,
+            X_Amz_Region_Set="us-west-2",
+        ),
+        "RegionSetMismatch",
+        _REGION_SET,
+        (("RequestedRegion", "us-east-1"), ("RegionSet", "us-west-2")),
+    ),
+    (
+        "v4a query unsigned before the region set",
+        {"x-amz-meta-foo": "bar"},
+        _presign(_now(), credential=f"{_UNKNOWN}/{_now()[:8]}/s3/aws4_request", algorithm=V4A),
+        "AccessDenied",
+        _NOT_SIGNED,
+        _not_signed("x-amz-meta-foo"),
+    ),
+    (
+        "v4a query algorithm in lower case",
+        {},
+        _presign(_now(), algorithm="aws4-ecdsa-p256-sha256"),
+        "AuthorizationQueryParametersError",
+        'X-Amz-Algorithm only supports "AWS4-HMAC-SHA256 and AWS4-ECDSA-P256-SHA256"',
+    ),
 ]
 
 
 @pytest.mark.parametrize(
-    "headers, query, code, message",
-    [r[1:] for r in _REFUSAL_ROWS_UNIT],
+    "headers, query, code, message, members",
+    [(*r[1:5], r[5] if len(r) > 5 else None) for r in _REFUSAL_ROWS_UNIT],
     ids=[r[0] for r in _REFUSAL_ROWS_UNIT],
 )
 def test_a_credential_real_refuses_is_refused_with_reals_code_and_message(
-    headers, query, code, message
+    headers, query, code, message, members
 ):
     """Each row is real's answer to that request, measured 2026-09-29 against us-east-1
-    (``backlot.auth.resolve_sigv4`` has the order)."""
+    (``backlot.auth.resolve_sigv4`` has the order), and the members real named where the row names
+    them. Each carries the payload hash boto3 sends, and a row that sends none names it as
+    ``None``."""
+    sent = {"host": "backlot", "x-amz-content-sha256": "UNSIGNED-PAYLOAD", **headers}
     caller, err = auth.resolve_sigv4(
-        _request("GET", "/s3/eng-artifacts", query, {"host": "backlot", **headers})
+        _request(
+            "GET", "/s3/eng-artifacts", query, {k: v for k, v in sent.items() if v is not None}
+        )
     )
     assert caller is None and (err.code, err.message) == (code, message)
+    if members is not None:
+        # The members the row names, the server's clock apart.
+        assert tuple(m for m in err.members if m[0] != "ServerTime") == members
+        return
     if code == "InvalidArgument" and "authorization" in headers:
         assert dict(err.members) == {
             "ArgumentName": "Authorization",
@@ -5518,6 +6778,11 @@ def _v2_request(method, path, query, headers, secret=SK, date_line=None):
         ({"date": "Tue, 29 Sep 2026 09:00:00 GMT"}, None),
         ({"date": "Tuesday, 29-Sep-26 09:00:00 GMT"}, None),
         ({"date": "20260929T090000Z"}, None),
+        ({"date": "Tue, 29 Sep 2026 09:00:00 -0000"}, None),
+        ({"date": "Tue, 29 Sep 2026 18:00:00 +0900"}, None),
+        ({"date": "Tue Sep 29 09:00:00 2026"}, None),
+        ({"x-amz-date": "Tue, 29 Sep 2026 09:00:00 +0000"}, ""),
+        ({"x-amz-date": "Tue Sep 29 09:00:00 2026"}, ""),
         ({"x-amz-date": "Tue, 29 Sep 2026 09:00:00 GMT"}, ""),
         (
             {
@@ -5535,15 +6800,28 @@ def _v2_request(method, path, query, headers, secret=SK, date_line=None):
             None,
         ),
     ],
-    ids=["rfc1123", "rfc850", "iso8601", "x-amz-date", "x-amz-date-over-date", "headers"],
+    ids=[
+        "rfc1123",
+        "rfc850",
+        "iso8601",
+        "-0000",
+        "+0900",
+        "asctime",
+        "x-amz-date-+0000",
+        "x-amz-date-asctime",
+        "x-amz-date",
+        "x-amz-date-over-date",
+        "headers",
+    ],
 )
 def test_a_signature_version_2_header_verifies_over_the_string_real_signs(
     monkeypatch, headers, date_line
 ):
-    """The three date forms real read, each signed as sent (the `StringToSign` real returned for a
-    bad secret named each as sent, 2026-09-29); an `x-amz-date` over a `Date`, signed among the
-    `x-amz-*` lines with the date line empty; and the `Content-Type` and `x-amz-meta-*` lines real
-    signs. Real served the RFC 1123 form, both `x-amz-date` rows and the `x-amz-meta-*` one."""
+    """Date forms real read (``test_a_date_is_read_as_real_read_it`` has the rest), each signed as
+    sent (the `StringToSign` real returned for a bad secret named each as sent, 2026-09-29); an
+    `x-amz-date` over a `Date`, signed among the `x-amz-*` lines with the date line empty; and the
+    `Content-Type` and `x-amz-meta-*` lines real signs. Real served the RFC 1123, `-0000`, `+0900`
+    and asctime forms, every `x-amz-date` row and the `x-amz-meta-*` one."""
     now = datetime(2026, 9, 29, 9, 5, tzinfo=timezone.utc)
     monkeypatch.setattr(
         auth, "datetime", SimpleNamespace(now=lambda tz: now, fromtimestamp=datetime.fromtimestamp)
@@ -5551,6 +6829,116 @@ def test_a_signature_version_2_header_verifies_over_the_string_real_signs(
     req, _ = _v2_request("GET", "/s3/eng-artifacts", "list-type=2", headers, date_line=date_line)
     caller, err = auth.resolve_sigv4(req)
     assert err is None and caller == Caller(email="ava@acme.com", is_admin=False)
+
+
+# Each date form real was sent at 2026-09-29T15:51:47Z against a V2 header, and what it made of
+# it: served, skewed, no date, or its 500.
+_DATE_ROWS = [
+    *[
+        (value, "served")
+        for value in (
+            "Tue, 29 Sep 2026 15:51:47 GMT",
+            "Tue, 29 Sep 2026 15:51:47 -0000",
+            "Tue, 29 Sep 2026 15:51:47 +0000",
+            "Tue, 29 Sep 2026 15:51:47 UTC",
+            "Wed, 30 Sep 2026 00:51:47 +0900",
+            "Tue Sep 29 15:51:47 2026",
+            "Tue, 29 Sep 2026 10:51:47 EST",
+            "tue, 29 sep 2026 15:51:47 gmt",
+            "TUE, 29 SEP 2026 15:51:47 GMT",
+            "Tue, 29 Sep 2026 17:51:47 IST",
+            "Tue, 29 Sep 2026 05:51:47 HDT",
+            "Wed, 30 Sep 2026 01:21:47 ACDT",
+            "Tue, 29 Sep 2026 12:21:47 NST",
+            "Tue, 29 Sep 2026 07:51:47 pst",
+            "Wed, 30 Sep 2026 01:51:47 CHST",
+            "Wed, 30 Sep 2026 00:51:47 GMT+09:00",
+            "Tuesday, 29-Sep-26 15:51:47 +0000",
+            "Tue, 29-Sep-26 15:51:47 GMT",
+            "Tuesday, 29 Sep 2026 15:51:47 GMT",
+            "Tue, 29 September 2026 15:51:47 GMT",
+            "Mon, 29 Sep 2026 15:51:47 GMT",
+            "Tue,  29 Sep 2026 15:51:47 GMT",
+            "Tue, 29 Sep 02026 15:51:47 GMT",
+            "Tue, 29 Sep 2026 15:51:60 GMT",
+            "Tuesday, 29-Sep-2026 15:51:47 GMT",
+            "Tue, 29 Sep 2026 15:51:47 GMT+00:00",
+            "Tue, 29 Sep 2026 15:51:47 GMT-00:00",
+            "Tue, 29 Sep 2026 15:51:47 GMT+0:00",
+            "Wed, 30 Sep 2026 01:21:47 GMT+09:30",
+            "Wed, 30 Sep 2026 01:21:47 +0930",
+            "Wed, 30 Sep 2026 05:51:47 +1400",
+            "Tue, 29 Sep 2026 15:51:47  GMT",
+            "Tue Sep 29 15:51:47  2026",
+            "Tue Sep 029 15:51:47 2026",
+            "Tuesday, 29-Sep- 26 15:51:47 GMT",
+            "20260929T155147Z",
+        )
+    ],
+    *[
+        (value, "skewed")
+        for value in (
+            "Tue, 29 Sep 2026 15:51:47 +0900",
+            "Tue, 29 Sep 2026 21:21:47 IST",
+            "Tue, 29 Sep 2026 5:51:47 GMT",
+            "Tue, 29 Sep 1970 15:51:47 GMT",
+            "Tue, 29 Sep 9999 15:51:47 GMT",
+            "Tue, 29 Sep 2026 25:51:47 GMT",
+            "Tue, 32 Sep 2026 15:51:47 GMT",
+        )
+    ],
+    *[
+        (value, None)
+        for value in (
+            "",
+            "Tue, 29 Sep 2026 15:51:47",
+            "Tue, 29 Sep 2026 15:51:47 Z",
+            "Tue, 29 Sep 2026 15:51:47 UT",
+            "29 Sep 2026 15:51:47 GMT",
+            "Wed, 30 Sep 2026 00:51:47 GMT+9",
+            "Wed, 30 Sep 2026 00:51:47 GMT+0900",
+            "Wed, 30 Sep 2026 00:51:47 +09:00",
+            "Wed, 30 Sep 2026 00:51:47 Asia/Seoul",
+            "Tue, 29 Sep 2026 15:51:47 GMT xyz",
+            "Tue Sep 29 15:51:47 2026 GMT",
+            "2026-09-29T15:51:47Z",
+            "Xyz, 29 Sep 2026 15:51:47 GMT",
+            "Tue, 29 09 2026 15:51:47 GMT",
+            "Tue , 29 Sep 2026 15:51:47 GMT",
+            "Tue,29 Sep 2026 15:51:47 GMT",
+            "Tue,\t29 Sep 2026 15:51:47 GMT",
+            "Tue, 29 Sep 26 15:51:47 GMT",
+            "Tue, 29 Sep 2026 15:51 GMT",
+            "Tue  Sep 29 15:51:47 2026",
+            "Tue, 29 Sep 2026 15:51:47 +00:00",
+            "Tue, 29 Sep 2026 15:51:47 +000",
+            "Tue, 29 Sep 2026 15:51:47 +00000",
+            "Wed, 30 Sep 2026 15:51:47 +2400",
+            "Tue, 29 Sep 2026 16:51:47 +0060",
+            "Tue, 29 Sep 1969 15:51:47 GMT",
+            "Tue, 29 Sep 1000 15:51:47 GMT",
+            "Tue, 29 Sep 999 15:51:47 GMT",
+            "Tuesday, 29-Sep-026 15:51:47 GMT",
+        )
+    ],
+    ("Tue, 29 Sep 10000 15:51:47 GMT", "500"),
+]
+
+
+@pytest.mark.parametrize("value, answer", _DATE_ROWS)
+def test_a_date_is_read_as_real_read_it(value, answer):
+    """``backlot.sigv2.parse_date`` over each form, a skew being a date more than fifteen minutes
+    from the one it was sent at."""
+    sent = datetime(2026, 9, 29, 15, 51, 47, tzinfo=timezone.utc)
+    if answer == "500":
+        with pytest.raises(sigv2.DateOutOfRange):
+            sigv2.parse_date(value)
+        return
+    read = sigv2.parse_date(value)
+    if answer is None:
+        assert read is None
+    else:
+        assert read is not None and is_skewed(read, sent) is (answer == "skewed")
 
 
 # What real named in a Signature Version 2 string to sign for `?<name>=v`, after the path, at a
@@ -5797,16 +7185,192 @@ def test_a_signature_version_2_mismatch_names_what_real_names():
     assert dict(err.members)["SignatureProvided"] == "abc"
 
 
-def test_a_lower_case_v4_scheme_is_v4_and_is_signed_as_sent():
-    """Real reads `aws4-hmac-sha256` as V4 and names it as sent on the first line of the string it
-    signs, so a signature over the upper-case line is the mismatch (2026-09-29)."""
+@pytest.mark.parametrize("algorithm", [V4, V4A])
+def test_a_lower_case_v4_scheme_is_v4_and_is_signed_as_sent(algorithm):
+    """Real reads `aws4-hmac-sha256` as V4, and `aws4-ecdsa-p256-sha256` as SigV4a, and names each
+    as sent on the first line of the string it signs, so a signature over the upper-case line is
+    the mismatch, named with the members a V4 mismatch has and SigV4a's scope, which has no region
+    (2026-09-29)."""
     amz_date = datetime.now(timezone.utc).strftime(AMZ_DATE_FORMAT)
-    req = _header_auth_request(amz_date)
-    authz = dict(req.headers)["authorization"].replace("AWS4-HMAC-SHA256", "aws4-hmac-sha256")
+    req = _header_auth_request(amz_date, algorithm=algorithm)
+    authz = dict(req.headers)["authorization"].replace(algorithm, algorithm.lower())
     headers = {**dict(req.headers), "authorization": authz}
     _, err = auth.resolve_sigv4(_request("GET", "/s3/eng-artifacts", "list-type=2", headers))
     assert err.code == "SignatureDoesNotMatch"
-    assert dict(err.members)["StringToSign"].split("\n")[0] == "aws4-hmac-sha256"
+    assert [name for name, _ in err.members] == [
+        "AWSAccessKeyId",
+        "StringToSign",
+        "SignatureProvided",
+        "StringToSignBytes",
+        "CanonicalRequest",
+        "CanonicalRequestBytes",
+    ]
+    lines = dict(err.members)["StringToSign"].split("\n")
+    scope = (
+        f"{amz_date[:8]}/s3/aws4_request"
+        if algorithm == V4A
+        else (f"{amz_date[:8]}/us-east-1/s3/aws4_request")
+    )
+    assert lines[:3] == [algorithm.lower(), amz_date, scope]
+
+
+# What botocore's CRT signers sent over the key this module signs with, `AK` written in where they
+# name it, header and query, at the date they name (awscrt, 2026-09-29): the derivation ``backlot.sigv4a`` makes is the one real
+# served requests signed with, and these pin it to the CRT's.
+_CRT_HEADERS = {
+    "host": "backlot",
+    "x-amz-date": "20260929T164424Z",
+    "x-amz-region-set": "*",
+    "x-amz-content-sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "authorization": (
+        f"AWS4-ECDSA-P256-SHA256 Credential={AK}/20260929/s3/aws4_request, "
+        "SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-region-set, "
+        "Signature=304502206d7fd0a1310db3d34713b117c2230e5b47b3d882e7434da9302ef25dd742e2f002210"
+        "09a6e8bcac270c6a8b1b85bc833a91adb75fb294700852370908143b0a2fab52b"
+    ),
+}
+_CRT_QUERY = (
+    f"list-type=2&X-Amz-Algorithm=AWS4-ECDSA-P256-SHA256&X-Amz-Credential={AK}%2F"
+    "20260929%2Fs3%2Faws4_request&X-Amz-Date=20260929T164424Z&X-Amz-SignedHeaders=host&X-Amz-Exp"
+    "ires=3600&X-Amz-Region-Set=%2A&X-Amz-Signature=30450220009bb7d3648ca5ca91936a326c794f8e9708"
+    "3ae64b567c0229d6d95deaf47034022100ed134677908751f962bb0f648f3caeb534db767e3e4515e97718b3350"
+    "6514214"
+)
+
+
+@pytest.mark.parametrize("form", ["header", "query"])
+def test_sigv4a_derives_the_key_botocores_crt_signer_signs_with(monkeypatch, form):
+    """Each verifies at a minute past its date, and fails once a byte of its signature changes."""
+    now = datetime(2026, 9, 29, 16, 45, 24, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        auth, "datetime", SimpleNamespace(now=lambda tz: now, fromtimestamp=datetime.fromtimestamp)
+    )
+    headers, query = (
+        (_CRT_HEADERS, "list-type=2") if form == "header" else ({"host": "backlot"}, _CRT_QUERY)
+    )
+    caller, err = auth.resolve_sigv4(_request("GET", "/s3/eng-artifacts", query, headers))
+    assert err is None and caller == Caller(email="ava@acme.com", is_admin=False)
+    if form == "header":
+        headers = {**headers, "authorization": headers["authorization"][:-2] + "00"}
+    else:
+        query = query[:-2] + "00"
+    _, err = auth.resolve_sigv4(_request("GET", "/s3/eng-artifacts", query, headers))
+    assert err.code == "SignatureDoesNotMatch"
+
+
+# The region sets real took for us-east-1 and the ones it refused (2026-09-29).
+_REGION_SET_ROWS = [
+    *[
+        (value, True)
+        for value in (
+            "*",
+            "us-east-1",
+            "US-EAST-1",
+            "us-*",
+            "US-*",
+            "us-east-*",
+            "*-1",
+            "u*1",
+            "us*",
+            "*east*",
+            "us-east-1*",
+            "*1",
+            "**",
+            "us-east-1,us-west-2",
+            "us-west-2,us-east-1",
+            "us-east-1,",
+            ",us-east-1",
+            "us-east-1,*",
+            "*,us-west-2",
+            "us-east-1,us-east-1",
+        )
+    ],
+    *[
+        (value, False)
+        for value in (
+            "us-west-2",
+            "",
+            "us-east-?",
+            "aws-global",
+            "us-east-10",
+            "us-east-",
+            "us-west-2, us-east-1",
+            "us-east-1;us-west-2",
+            "us-east-1 us-west-2",
+        )
+    ],
+]
+
+
+@pytest.mark.parametrize("region_set, matches", _REGION_SET_ROWS)
+def test_a_region_set_names_the_region_as_real_matches_it(region_set, matches):
+    assert sigv4a.region_set_matches(region_set, "us-east-1") is matches
+
+
+# The unsigned headers real named, in the order it named them (2026-09-29).
+_NOT_SIGNED_ROWS = [
+    ("x-amz-meta-a, content-md5, host", ["x-amz-meta-a", "host", "content-md5"]),
+    ("x-amz-meta-a, content-md5, x-amz-meta-z", ["content-md5", "x-amz-meta-z", "x-amz-meta-a"]),
+    ("x-amz-z, x-amz-a", ["x-amz-z", "x-amz-a"]),
+    ("x-amz-meta-a, x-amz-meta-b", ["x-amz-meta-b", "x-amz-meta-a"]),
+    ("x-amz-meta-a, x-amz-meta-b, content-md5", ["x-amz-meta-b", "x-amz-meta-a", "content-md5"]),
+    (
+        "x-amz-meta-a, x-amz-checksum-mode, x-amz-acl",
+        ["x-amz-checksum-mode", "x-amz-meta-a", "x-amz-acl"],
+    ),
+    (
+        "x-amz-meta-a, x-amz-meta-a2, x-amz-meta-a-b",
+        ["x-amz-meta-a", "x-amz-meta-a2", "x-amz-meta-a-b"],
+    ),
+    ("host, x-amz-meta-foo", ["host", "x-amz-meta-foo"]),
+    ("x-amz-meta-a2, x-amz-z", ["x-amz-z", "x-amz-meta-a2"]),
+    ("host, x-amz-meta-a-b", ["x-amz-meta-a-b", "host"]),
+    (
+        "x-amz-meta-k2, x-amz-meta-k1, x-amz-meta-k0, x-amz-meta-k6, x-amz-meta-k5, x-amz-meta-k4, "
+        "x-amz-meta-k3, x-amz-meta-k9, x-amz-meta-k12, x-amz-meta-k8, x-amz-meta-k7, "
+        "x-amz-meta-k10, x-amz-meta-k11",
+        [f"x-amz-meta-k{i}" for i in range(13)],
+    ),
+    (
+        "x-amz-meta-q, x-amz-meta-p, x-amz-meta-s, x-amz-meta-r, x-amz-meta-o, x-amz-meta-i, "
+        "x-amz-meta-h, x-amz-meta-e, x-amz-meta-d, x-amz-meta-g, x-amz-meta-f, x-amz-meta-a, "
+        "x-amz-meta-y, x-amz-meta-u, x-amz-meta-t, x-amz-meta-w",
+        [f"x-amz-meta-{c}" for c in "qwertyuiopasdfgh"],
+    ),
+    (
+        "x-amz-acl, content-md5, x-amz-tagging, x-amz-server-side-encryption, x-amz-storage-class",
+        ["x-amz-acl", "x-amz-tagging", "x-amz-storage-class", "x-amz-server-side-encryption"]
+        + ["content-md5"],
+    ),
+]
+
+
+@pytest.mark.parametrize("named, sent", _NOT_SIGNED_ROWS, ids=[r[0][:40] for r in _NOT_SIGNED_ROWS])
+def test_unsigned_headers_are_named_in_reals_order_whatever_order_they_came_in(named, sent):
+    """Sent in the order given and in the reverse, which real named alike."""
+    for order in (sent, sent[::-1]):
+        assert ", ".join(auth._hash_set_order(order)) == named
+
+
+# Where the payload hash a V4 or SigV4a signature covers comes from, and a request it does not.
+_PAYLOAD_HASH_ROWS = [
+    ({"authorization": "AWS4-HMAC-SHA256 x", "x-amz-content-sha256": "v"}, "", "v"),
+    ({"authorization": "aws4-ecdsa-p256-sha256 x", "x-amz-content-sha256": "v"}, "", "v"),
+    ({"x-amz-content-sha256": "v"}, "X-Amz-Algorithm=AWS4-HMAC-SHA256", "v"),
+    ({}, "X-Amz-Algorithm=AWS4-HMAC-SHA256", None),
+    ({"authorization": "AWS a:b", "x-amz-content-sha256": "v"}, "", None),
+    ({"authorization": "Bearer x", "x-amz-content-sha256": "v"}, "", None),
+    ({"x-amz-content-sha256": "v"}, "Signature=x&AWSAccessKeyId=y&Expires=1", None),
+    ({"x-amz-content-sha256": "v"}, "", None),
+]
+
+
+@pytest.mark.parametrize("headers, query, payload_hash", _PAYLOAD_HASH_ROWS)
+def test_the_payload_hash_is_the_one_a_v4_signature_covers(headers, query, payload_hash):
+    """A V2 header was served over a payload hash real refuses in a V4 one, and a presign over one
+    it signed as its payload line (2026-09-29)."""
+    request = _request("GET", "/s3/eng-artifacts", query, {"host": "backlot", **headers})
+    assert auth.signed_payload_hash(request) == payload_hash
 
 
 @pytest.mark.parametrize(

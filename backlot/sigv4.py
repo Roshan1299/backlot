@@ -5,10 +5,11 @@ server drives) SigV4-sign their requests by default. This module rebuilds the ca
 string-to-sign → signature so the server can authenticate them without adding botocore as a runtime
 dependency; ``backlot.sigv2`` does the same for Signature Version 2.
 
-Only read-only GET/HEAD is served, so the payload hash is taken verbatim from the client's
-``x-amz-content-sha256`` header (empty body / UNSIGNED-PAYLOAD) — no body hashing here. S3's
-signer uses the request path *verbatim* as the canonical URI (no normalization, no re-encoding),
-which is why the router passes the raw wire path through unchanged.
+The payload hash is taken verbatim from the client's ``x-amz-content-sha256`` header, which the
+router checks against a write's body (``backlot.routers.s3._payload_mismatch``); no body is hashed
+here. S3's signer uses the request path *verbatim* as the canonical URI (no normalization, no
+re-encoding), which is why the router passes the raw wire path through unchanged. SigV4a
+(``backlot.sigv4a``) signs this same canonical request.
 """
 
 from __future__ import annotations
@@ -41,14 +42,16 @@ def _signing_key(secret: str, date_stamp: str, region: str, service: str = "s3")
 
 
 def parse_authorization(header: str | None) -> dict | None:
-    """Parse a SigV4 ``Authorization`` header into its three fields, or None if malformed.
+    """Parse a SigV4 or SigV4a ``Authorization`` header into its three fields, or None if malformed.
 
-    The scheme is matched without case, as real matches it: `aws4-hmac-sha256` and
-    `Aws4-Hmac-Sha256` are both read as this scheme and signed as sent (see ``string_to_sign``)."""
-    if not header or header[: len(ALGORITHM)].upper() != ALGORITHM:
+    The scheme is what comes before the first space, which ``backlot.auth.resolve_sigv4`` reads
+    without case, as real reads it: `aws4-hmac-sha256` and `Aws4-Hmac-Sha256` are both this scheme
+    and signed as sent (see ``string_to_sign``)."""
+    scheme, _, fields = (header or "").partition(" ")
+    if not scheme:
         return None
     parts: dict[str, str] = {}
-    for kv in header[len(ALGORITHM) :].strip().split(","):
+    for kv in fields.strip().split(","):
         k, _, v = kv.strip().partition("=")
         if k:
             parts[k.strip()] = v.strip()
