@@ -3097,11 +3097,11 @@ def _get_raw(base_url, path, token):
 
 
 def test_list_multipart_uploads_is_the_empty_page_real_serves_byte_for_byte(live_server):
-    """#169: a browsing client sends `?uploads` after every ListObjectsV2, unprompted, and got a
-    501 where real answers 200. The body is real's for a bucket with no upload in progress, with the bucket's
-    name swapped in: the two markers and the two next-markers present and empty, MaxUploads at the
-    default, IsTruncated false, no Upload element — and no Prefix, Delimiter or EncodingType when
-    none was sent."""
+    """#169: a browsing client sends `?uploads` after every ListObjectsV2, unprompted, and got a 501
+    where real answers 200. The body is real's for a bucket with no upload in progress, with the
+    bucket's name swapped in: the two markers and the two next-markers present and empty, MaxUploads
+    at the default, IsTruncated false, no Upload element — and no Prefix, Delimiter or EncodingType
+    when none was sent."""
     base_url, settings = live_server
     for query in ("?uploads", "?uploads="):  # with and without the `=`; real treats both alike
         status, headers, body = _get_raw(
@@ -4309,8 +4309,8 @@ def test_s3_a_delete_carrying_its_right_checksum_is_the_write(live_server, name)
 
 
 def test_s3_an_encryption_write_reads_bucket_key_enabled_without_case(live_server):
-    """Real took `TRUE` and went on to the key's account (2026-09-29), which this server has none of,
-    so what is left is the write; `maybe` is the refusal the table above asserts."""
+    """Real took `TRUE` and went on to the key's account (2026-09-29), which this server has none
+    of, so what is left is the write; `maybe` is the refusal the table above asserts."""
     base_url, settings = live_server
     body = _encryption("arn:aws:kms:us-east-1:111111111111:key/x", "TRUE")
     r = _signed(
@@ -5524,8 +5524,8 @@ def test_a_signature_version_2_mismatch_names_what_real_names():
 
 @pytest.mark.parametrize("query", ["AWSAccessKeyId=" + AK, "Expires=9999999999&AWSAccessKeyId=x"])
 def test_a_query_without_signature_is_the_anonymous_callers(query):
-    """Real answered `?AWSAccessKeyId=` alone on a bucket its owner holds as it answers no credential
-    (2026-09-29): without a `Signature` there is no V2 query to read."""
+    """Real answered `?AWSAccessKeyId=` alone on a bucket its owner holds as it answers no
+    credential (2026-09-29): without a `Signature` there is no V2 query to read."""
     assert auth.resolve_sigv4(_request("GET", "/s3/eng-artifacts", query, {"host": "backlot"})) == (
         ANONYMOUS,
         None,

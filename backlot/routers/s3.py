@@ -8,9 +8,9 @@ sees everything, a user's key is ACL-filtered, and an unsigned request is the an
 who sees no bucket (``_auth``). A method this router does not serve, and a GET or a HEAD naming a
 selector it cannot take, is refused before the bucket and whether or not a credential is sent, as
 real refuses them, but after a signature that was sent and does not verify (``_method_refusal``,
-``_read_refusal``); a write resolves the credential and the bucket first.
-Responses are S3 XML (namespace ``http://s3.amazonaws.com/doc/2006-03-01/``) or raw object bytes;
-errors use the S3 ``<Error>`` envelope.
+``_read_refusal``); a write resolves the credential and the bucket first. Responses are S3 XML
+(namespace ``http://s3.amazonaws.com/doc/2006-03-01/``) or raw object bytes; errors use the S3
+``<Error>`` envelope.
 
 S3 dispatches on the query string: ``?acl``, ``?versioning``, ``?tagging`` and the rest each select
 a different operation at the same path. Every one of a bucket's is answered, as real answers a
@@ -1319,11 +1319,11 @@ def _list_objects(
     # and sends no element when the parameter is absent (measured 2026-09-17).
     start_after = _first(q, "start-after", None) if v2 else None
 
-    # A continuation-token wins over start-after, exactly like
-    # real S3 — start-after only seeds the very first page of a listing. Its mode (exclusive
-    # "after" a raw key, vs inclusive "at" a CommonPrefixes-group successor — see
-    # _encode_group_token) picks which of list_s3_objects' two independent lower bounds to use.
-    # V1 reaches the same two bounds through `marker` alone (``_resume_after``).
+    # A continuation-token wins over start-after, exactly like real S3 — start-after only seeds the
+    # very first page of a listing. Its mode (exclusive "after" a raw key, vs inclusive "at" a
+    # CommonPrefixes-group successor — see _encode_group_token) picks which of list_s3_objects' two
+    # independent lower bounds to use. V1 reaches the same two bounds through `marker` alone
+    # (``_resume_after``).
     after, at, past_the_end = None, None, False
     if decoded is not None:
         mode, value = decoded
@@ -1552,17 +1552,17 @@ def _list_object_versions(request: Request, conn, bucket: str, visible, max_keys
     versioned: every one is the version real names `null` and the latest.
 
     The shape is real's, measured 2026-09-29 on two buckets this account created that day, one of
-    four keys and one of three: ``Name``, ``Prefix``, ``KeyMarker`` and ``VersionIdMarker`` always, echoing what was sent;
-    ``NextKeyMarker`` whenever the page is truncated, the last entry by key whether a key or a
-    group, and ``NextVersionIdMarker`` beside it, `null`, unless that entry is a group;
-    ``MaxKeys`` as parsed, uncapped; ``Delimiter`` whenever one was sent, an empty one included;
-    ``EncodingType`` as sent; ``IsTruncated``; each ``Version`` and then each ``CommonPrefixes``.
-    A ``Version`` carries the listing's fields with ``VersionId`` and ``IsLatest`` after the key
-    and the ``Owner`` a V1 listing carries. Paging is V1's: ``key-marker`` resumes past the key, or
-    past the whole group holding it (``_resume_after``), and following the markers walked the four
-    keys a page each and a delimited listing past its group. `version-id-marker` can only be
-    `null`, which resumes where ``key-marker`` alone does; beside an empty ``key-marker`` real
-    served a page of nothing.
+    four keys and one of three: ``Name``, ``Prefix``, ``KeyMarker`` and ``VersionIdMarker`` always,
+    echoing what was sent; ``NextKeyMarker`` whenever the page is truncated, the last entry by key
+    whether a key or a group, and ``NextVersionIdMarker`` beside it, `null`, unless that entry is a
+    group; ``MaxKeys`` as parsed, uncapped; ``Delimiter`` whenever one was sent, an empty one
+    included; ``EncodingType`` as sent; ``IsTruncated``; each ``Version`` and then each
+    ``CommonPrefixes``. A ``Version`` carries the listing's fields with ``VersionId`` and
+    ``IsLatest`` after the key and the ``Owner`` a V1 listing carries. Paging is V1's:
+    ``key-marker`` resumes past the key, or past the whole group holding it (``_resume_after``), and
+    following the markers walked the four keys a page each and a delimited listing past its group.
+    `version-id-marker` can only be `null`, which resumes where ``key-marker`` alone does; beside an
+    empty ``key-marker`` real served a page of nothing.
 
     What is refused before the bucket is in ``_versions_parse``. After it, in this order: a
     ``version-id-marker`` that is not `null` ("Invalid version id specified", `NULL` included), an
@@ -2137,16 +2137,15 @@ _UPLOAD_PART = ("PART", frozenset({"PUT"}))
 # The selectors a GET and a HEAD naming one are refused for with the 405 naming its type, before the
 # bucket is looked up: those whose operations are all on the methods above, which is every selector
 # of a write table outside `_BUCKET_SELECTORS` and `_OBJECT_SELECTORS`, a key's `uploads` and a
-# bucket's `torrent` and `uploadId` apart.
-# Measured 2026-09-29 against `s3.us-east-1.amazonaws.com`: the selectors of both tables but the
-# three `metadata*Table` ones, and `partNumber`, `renameObject`, `select-type` and `session`, 40 in
-# all, each on a GET and a HEAD at a bucket nobody owns and at a key in it, 160 requests. These are
-# the ones a GET answered with a 405, which named the type and carried an `Allow` of the write
-# methods, and a HEAD answered each with the 405 and the same `Allow`; the public bucket
-# `noaa-ghcn-pds` and one of its objects answered them the same, and so did a bucket's three
-# `metadata*Table` selectors in a later sweep of every selector at both paths (same date). The
-# `Allow` is not repeated, since this server serves no method at these selectors, which is the line
-# `_head_refusal` draws.
+# bucket's `torrent` and `uploadId` apart. Measured 2026-09-29 against `s3.us-east-1.amazonaws.com`:
+# the selectors of both tables but the three `metadata*Table` ones, and `partNumber`,
+# `renameObject`, `select-type` and `session`, 40 in all, each on a GET and a HEAD at a bucket
+# nobody owns and at a key in it, 160 requests. These are the ones a GET answered with a 405, which
+# named the type and carried an `Allow` of the write methods, and a HEAD answered each with the 405
+# and the same `Allow`; the public bucket `noaa-ghcn-pds` and one of its objects answered them the
+# same, and so did a bucket's three `metadata*Table` selectors in a later sweep of every selector at
+# both paths (same date). The `Allow` is not repeated, since this server serves no method at these
+# selectors, which is the line `_head_refusal` draws.
 _BUCKET_READ_REFUSED = {
     selector: resource_type
     for selector, (resource_type, _) in _BUCKET_WRITE_SELECTORS.items()

@@ -100,7 +100,7 @@ _DATE_FORMATS = ("%a, %d %b %Y %H:%M:%S GMT", "%A, %d-%b-%y %H:%M:%S GMT", "%Y%m
 
 
 def parse_date(value: str) -> datetime | None:
-    """A ``Date`` or ``x-amz-date`` value as a UTC time, or ``None`` when real reads no date there."""
+    """A ``Date`` or ``x-amz-date`` value as a UTC time, or ``None`` where real reads no date."""
     for fmt in _DATE_FORMATS:
         try:
             return datetime.strptime(value, fmt).replace(tzinfo=timezone.utc)

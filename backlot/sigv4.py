@@ -120,9 +120,9 @@ def is_skewed(request_time: datetime, now: datetime, max_skew: int = 900) -> boo
 def string_to_sign(
     amz_date: str, date_stamp: str, region: str, canonical: str, algorithm: str = ALGORITHM
 ) -> str:
-    """``algorithm`` is the scheme as the header spells it: real signs `aws4-hmac-sha256` as it came,
-    so that header verifies against a signature computed over that line and no other (the first
-    line of the `StringToSign` it returned for the two spellings above, 2026-09-29)."""
+    """``algorithm`` is the scheme as the header spells it: real signs `aws4-hmac-sha256` as it
+    came, so that header verifies against a signature computed over that line and no other (the
+    first line of the `StringToSign` it returned for the two spellings above, 2026-09-29)."""
     scope = f"{date_stamp}/{region}/s3/aws4_request"
     return "\n".join([algorithm, amz_date, scope, _sha256_hex(canonical.encode("utf-8"))])
 

@@ -242,8 +242,8 @@ curl -s localhost:8000/fireflies/graphql \
 ### Amazon S3 — SigV4
 
 S3 does not take a bearer token. Each identity carries an `s3_access_key_id` /
-`s3_secret_access_key` pair, derived from that identity's token — which is what Backlot's
-verifier resolves back to a user — so hand them to any AWS client:
+`s3_secret_access_key` pair, derived from that identity's token — which is what Backlot's verifier
+resolves back to a user — so hand them to any AWS client:
 
 ```python
 import boto3, httpx
@@ -257,7 +257,7 @@ s3 = boto3.client(
     endpoint_url="http://localhost:8000/s3",
     aws_access_key_id=ava["s3_access_key_id"],
     aws_secret_access_key=ava["s3_secret_access_key"],
-    region_name="us-east-1",                       # the region Backlot presents; real refuses others
+    region_name="us-east-1",                       # the region Backlot presents; others are refused
     config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
 )
 print([b["Name"] for b in s3.list_buckets()["Buckets"]])
@@ -267,8 +267,8 @@ print([b["Name"] for b in s3.list_buckets()["Buckets"]])
 refused credential get is in [supported-sources.md](supported-sources.md#amazon-s3--s3).
 
 **Signature Version 2 is verified too**, in the header and in the query, since real S3 still
-verifies it; botocore signs that way with `Config(signature_version="s3")`. The two refuse differently
-and each refuses as real does.
+verifies it; botocore signs that way with `Config(signature_version="s3")`. The two refuse
+differently and each refuses as real does.
 
 **Path addressing is not optional.** Backlot serves `/s3/{bucket}/{key}`, so virtual-hosted
 addressing — which puts the bucket in the host, `acme-artifacts.localhost:8000` — reaches nothing.
