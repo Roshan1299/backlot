@@ -4,8 +4,9 @@ Path-style endpoint for a client: ``http://<host>/s3`` (boto3: ``endpoint_url=".
 ``addressing_style=path``; mirage: ``S3Config(endpoint_url=".../s3", path_style=True)``). Auth is
 full AWS SigV4 (``backlot.auth.resolve_sigv4``) against a per-caller access-key/secret derived from a
 bearer token; the admin/service token's key sees everything, a user's key is ACL-filtered. A method
-this router does not serve is refused before any of that, as real refuses one; a write resolves
-the credential and the bucket first.
+this router does not serve is refused before any of that, as real refuses one, and so is a GET or a
+HEAD naming a selector it cannot take (``_read_refusal``); a write resolves the credential and the
+bucket first.
 Responses are S3 XML (namespace ``http://s3.amazonaws.com/doc/2006-03-01/``) or raw object bytes;
 errors use the S3 ``<Error>`` envelope.
 
@@ -150,6 +151,7 @@ _ERR_STATUS = {
     "NoSuchKey": 404,
     "InvalidRange": 416,
     "InvalidArgument": 400,
+    "InvalidRequest": 400,
     # "A header you provided implies functionality that is not implemented. HTTP Status Code: 501"
     # — S3 API reference, the Error data type's code table.
     "NotImplemented": 501,
@@ -164,9 +166,10 @@ _ERR_STATUS = {
 # than the object's bytes at an object's path. botocore's S3 service model (2006-03-01) declares
 # each as its own operation — `GetBucketVersioning: GET /{Bucket}?versioning`, `GetObjectTagging:
 # GET /{Bucket}/{Key+}?tagging` — and `backlot diff --source s3` asks a running server every one.
-# Real S3 dispatches on exactly these keys and ignores any other query key (measured against a
-# general purpose bucket: `?foo=bar` and `?x-id=ListObjects` both answer the listing, the match is
-# case-sensitive so `?Versioning` lists too, and the value is ignored so `?versioning=1` is still
+# Real S3 dispatches a GET on these keys and on the ones a GET cannot take (`_BUCKET_READ_REFUSED`,
+# `_OBJECT_READ_REFUSED`), and ignores the other query keys measured (against a general purpose
+# bucket: `?foo=bar` and `?x-id=ListObjects` both answer the listing, the match is case-sensitive so
+# `?Versioning` lists too, and the value is ignored so `?versioning=1` is still
 # GetBucketVersioning). The `x-id` key is what the AWS SDK for JavaScript adds to name the operation
 # where several share a path — `?x-id=GetObject`, `?analytics&x-id=GetBucketAnalyticsConfiguration`
 # — and it must stay ignorable here as it is there. So the refusal is keyed on this set
@@ -264,19 +267,56 @@ def request_ids(method: str, path: str, query: str) -> tuple[str, str]:
     return request_id, base64.b64encode(raw[10:]).decode("ascii")
 
 
-def _error(
-    code: str, message: str, resource: str = "", extra: str = "", headers: dict | None = None
-) -> Response:
+def _error(code: str, message: str, extra: str = "", headers: dict | None = None) -> Response:
+    """Real S3's `<Error>`: the code, the message, ``extra``, then the request id pair.
+
+    ``extra`` is whatever real names the failure with, which is a member of the code's own rather
+    than one element every code shares: `BucketName` for `NoSuchBucket`, the key alone as `Key` for
+    `NoSuchKey`, `ArgumentName` and mostly `ArgumentValue` for `InvalidArgument`, `RangeRequested`
+    and `ActualObjectSize` for `InvalidRange`, and `Method` and `ResourceType` for
+    `MethodNotAllowed`. Measured 2026-09-29 against `s3.us-east-1.amazonaws.com` over fifty-three
+    error bodies of nine codes, a key in an absent bucket and a missing key under a prefix among
+    them; none carried a `Resource`. `NotImplemented` is this server's own refusal, with no real
+    body to copy, and names nothing.
+    """
     ids = REQUEST_IDS.get()
     # Real names them last, after the members that describe the failure (measured over seven error
     # bodies: `NoSuchBucket`, `NoSuchKey`, `InvalidArgument`, `MethodNotAllowed`, `BadRequest`,
     # `PreconditionFailed` and `AccessForbidden`).
     tail = f"<RequestId>{ids[0]}</RequestId><HostId>{ids[1]}</HostId>" if ids else ""
-    # An error real sends about no particular resource carries no element for one: its CORS 403
-    # and its method 405 name the method and the resource TYPE and nothing else.
-    named = f"<Resource>{escape(resource)}</Resource>" if resource else ""
-    body = f"<Error><Code>{code}</Code><Message>{escape(message)}</Message>{named}{extra}{tail}</Error>"
+    body = f"<Error><Code>{code}</Code><Message>{escape(message)}</Message>{extra}{tail}</Error>"
     return _xml(body, status=_ERR_STATUS.get(code, 400), headers=headers)
+
+
+def _no_such_bucket(bucket: str) -> Response:
+    return _error(
+        "NoSuchBucket",
+        "The specified bucket does not exist",
+        f"<BucketName>{escape(bucket)}</BucketName>",
+    )
+
+
+def _no_such_key(key: str) -> Response:
+    return _error("NoSuchKey", "The specified key does not exist.", f"<Key>{escape(key)}</Key>")
+
+
+def _head(status: int, headers: dict | None = None) -> Response:
+    """An answer to a `HEAD` other than an object's 200 or 206: no body, framed as real frames it.
+
+    Real sends each of them `Transfer-Encoding: chunked` with no `Content-Length`, and as
+    `application/xml` — the service root's 405, a bucket's 200, the 404s, a selector's 405 and the
+    conflict's 400, a 416 and the credential's 403s alike — where an object's 200 and 206 carry the
+    object's type and the length a GET would send (measured 2026-09-29 against
+    `s3.us-east-1.amazonaws.com`, twenty-two `HEAD`s, signed and unsigned). Starlette writes a
+    `Content-Length` on each of these, `0` for the empty body, so it is taken off here and the
+    framing named instead: uvicorn's httptools protocol writes no body for a `HEAD` whatever its
+    framing header says, and its h11 protocol keeps a chunked framing it is given, so
+    `backlot serve` sends what real sends on either.
+    """
+    response = Response(status_code=status, media_type="application/xml", headers=headers)
+    del response.headers["content-length"]
+    response.headers["transfer-encoding"] = "chunked"
+    return response
 
 
 def _selected(q, selectors: frozenset[str]) -> list[str]:
@@ -298,13 +338,12 @@ def _first(q, name: str, default: str | None = "") -> str | None:
     return values[0] if values else default
 
 
-def _argument_error(message: str, name: str, value: str, resource: str) -> Response:
+def _argument_error(message: str, name: str, value: str) -> Response:
     """Real S3's ``InvalidArgument`` for one query parameter: the message beside the parameter's
     name and the value as sent, in ``ArgumentName`` and ``ArgumentValue`` (measured)."""
     return _error(
         "InvalidArgument",
         message,
-        resource,
         extra=(
             f"<ArgumentName>{escape(name)}</ArgumentName>"
             f"<ArgumentValue>{escape(value)}</ArgumentValue>"
@@ -322,7 +361,7 @@ def _argument_name(name: str) -> str:
     return f"<ArgumentName>{escape(name)}</ArgumentName>"
 
 
-def _conflict(selected: list[str], resource: str) -> Response:
+def _conflict(selected: list[str]) -> Response:
     """Two selectors at once, refused as real S3 refuses them (measured).
 
     The name real reports here is ``ResourceType`` rather than a parameter's, and the value is the
@@ -331,7 +370,53 @@ def _conflict(selected: list[str], resource: str) -> Response:
         "Conflicting query string parameters: " + ", ".join(selected),
         "ResourceType",
         selected[0],
-        resource,
+    )
+
+
+def _signature_refusal(request: Request) -> str | None:
+    """The code refusing a credential that was sent and does not verify, or ``None``.
+
+    ``None`` as well when no credential is sent: real takes an unsigned request as an anonymous
+    caller's and gives it the selector refusal a signed one gets, where a signature that fails and
+    an access key AWS does not know are each refused with their 403 first (measured 2026-09-29
+    against `s3.us-east-1.amazonaws.com`, twelve selector refusals across a GET and a HEAD at a
+    bucket and at a key, each sent signed, unsigned, signed over a bad secret and with an unknown
+    key).
+    """
+    _, err = auth.resolve_sigv4(request)
+    return None if err == "MissingSecurityHeader" else err
+
+
+def _read_refusal(
+    request: Request,
+    selected: list[str],
+    refused: dict[str, str],
+    served_on_get: frozenset[str],
+) -> Response | None:
+    """What a GET or a HEAD naming a selector is refused with before the bucket is looked up, or
+    ``None`` when the request goes on to be answered.
+
+    Two selectors are the conflict before any credential is read: real answered seven such requests,
+    at a bucket and at a key, on a GET and a HEAD, and in a bucket that does not exist, with the 400
+    whether each was signed, unsigned, signed over a bad secret or sent with an unknown key
+    (2026-09-29). One selector is refused on a HEAD whatever it is (``_head_refusal``) and on a GET
+    when the GET cannot take it (``refused``, the type its 405 names), once a signature that was
+    sent verifies (``_signature_refusal``).
+    """
+    head = request.method == "HEAD"
+    if len(selected) > 1:
+        return _head_refusal(selected, served_on_get) if head else _conflict(selected)
+    if not selected or not (head or selected[0] in refused):
+        return None
+    code = _signature_refusal(request)
+    if code is not None:
+        return _head(_ERR_STATUS[code]) if head else _error(code, code)
+    if head:
+        return _head_refusal(selected, served_on_get)
+    return _error(
+        "MethodNotAllowed",
+        _METHOD_NOT_ALLOWED,
+        extra=_method_type("GET", refused[selected[0]]),
     )
 
 
@@ -340,14 +425,14 @@ def _head_refusal(selected: list[str], served_on_get: frozenset[str]) -> Respons
 
     No sub-resource has a HEAD form: real S3 answers ``HEAD /{bucket}?versioning`` and
     ``HEAD /{key}?acl`` 405 with an empty ``application/xml`` body, whether or not the bucket or the
-    key exists, and two selectors at once with the conflict's 400 and the same empty body
-    (measured). Real S3 also sends an ``Allow`` naming the methods that sub-resource takes, GET and
-    PUT and DELETE among them (measured), and what an ``Allow`` names is the resource answering
-    rather than S3: "a list of the target resource's currently supported methods" (RFC 9110,
-    Section 15.5.6). ``served_on_get`` is that list — the selectors this same path answers on a GET,
-    which is a different set at a bucket's path and at a key's — so each of them gets ``GET``, and a
-    selector whose GET is a 501 gets no header, naming a method there being as false a claim as
-    repeating real's PUT and DELETE.
+    key exists, and two selectors at once with the conflict's 400 and the same empty body (measured;
+    ``_head`` frames both). Real S3 also sends an ``Allow`` naming the methods that sub-resource
+    takes, GET and PUT and DELETE among them (measured), and what an ``Allow`` names is the resource
+    answering rather than S3: "a list of the target resource's currently supported methods" (RFC
+    9110, Section 15.5.6). ``served_on_get`` is that list — the selectors this same path answers on
+    a GET, which is a different set at a bucket's path and at a key's — so each of them gets
+    ``GET``, and a selector this path's GET refuses gets no header, naming a method there being as
+    false a claim as repeating real's PUT and DELETE.
 
     No header leaves Section 15.5.6's MUST unmet, and Section 10.2.1's "An empty Allow field value
     indicates that the resource allows no methods" would meet it and does survive this stack. Real
@@ -355,12 +440,11 @@ def _head_refusal(selected: list[str], served_on_get: frozenset[str]) -> Respons
     to a value real never sends.
     """
     if len(selected) > 1:
-        return Response(status_code=400, media_type="application/xml")
-    headers = {"Allow": "GET"} if selected[0] in served_on_get else None
-    return Response(status_code=405, media_type="application/xml", headers=headers)
+        return _head(400)
+    return _head(405, {"Allow": "GET"} if selected[0] in served_on_get else None)
 
 
-def _not_implemented(selector: str, resource: str) -> Response:
+def _not_implemented(selector: str) -> Response:
     """Refuse an operation Backlot does not implement, instead of answering it with another's body.
 
     ``NotImplemented`` is the S3 error code for "functionality that is not implemented" (the API
@@ -379,7 +463,6 @@ def _not_implemented(selector: str, resource: str) -> Response:
         "NotImplemented",
         "A query string parameter you provided selects an operation that is not implemented: "
         + selector,
-        resource,
     )
 
 
@@ -487,17 +570,27 @@ async def head_bucket(request: Request, bucket: str):
     """HeadBucket — 200 if the caller can see this bucket, 404 if they cannot, and the signature's
     own status (403, or 400 for a malformed header) when the request does not authenticate at all.
 
-    Headers alone in every case, which is why it carries no MCP tool (see ``backlot.openapi``)."""
+    Headers alone in every case, which is why it carries no MCP tool (see ``backlot.openapi``). The
+    200 carries the two real sends beside the region, the bucket's ARN and that the name is not an
+    access point alias, which boto3's ``head_bucket`` returns as ``BucketArn`` and
+    ``AccessPointAlias`` (measured 2026-09-29 on the public bucket `noaa-ghcn-pds` in us-east-1)."""
+    selected = _selected(request.query_params, _BUCKET_READ_SELECTORS)
+    refused = _read_refusal(request, selected, _BUCKET_READ_REFUSED, _BUCKET_GETS)
+    if refused is not None:
+        return refused
     caller, visible, err = _auth(request)
     if err:
-        return Response(status_code=err.status_code)
-    conn = auth.conn(request)
-    selected = _selected(request.query_params, _BUCKET_SELECTORS)
-    if selected:
-        return _head_refusal(selected, _BUCKET_GETS)
-    if not _bucket_visible(conn, bucket, visible):
-        return Response(status_code=404)
-    return Response(status_code=200, headers={"x-amz-bucket-region": "us-east-1"})
+        return _head(err.status_code)
+    if not _bucket_visible(auth.conn(request), bucket, visible):
+        return _head(404)
+    return _head(
+        200,
+        {
+            "x-amz-bucket-region": "us-east-1",
+            "x-amz-access-point-alias": "false",
+            "x-amz-bucket-arn": f"arn:aws:s3:::{bucket}",
+        },
+    )
 
 
 @router.get("/{bucket}", openapi_extra={"parameters": _P_BUCKET_GET})
@@ -510,17 +603,15 @@ async def bucket_get(request: Request, bucket: str):
     path and are selected the same way: with ``location`` present it answers GetBucketLocation, and
     with ``uploads`` present ListMultipartUploads, always the empty page because no upload is ever
     in progress."""
+    q = request.query_params
+    selected = _selected(q, _BUCKET_READ_SELECTORS)
+    refused = _read_refusal(request, selected, _BUCKET_READ_REFUSED, _BUCKET_GETS)
+    if refused is not None:
+        return refused
     caller, visible, err = _auth(request)
     if err:
         return err
     conn = auth.conn(request)
-    q = request.query_params
-    resource = f"/{bucket}"
-    selected = _selected(q, _BUCKET_SELECTORS)
-    if len(selected) > 1:
-        # Before the bucket is looked up: real S3 reports the conflict for a bucket that does not
-        # exist too (measured).
-        return _conflict(selected, resource)
     max_uploads, max_keys = _MAX_UPLOADS, _MAX_KEYS
     v2 = _first(q, "list-type", None) == _LIST_TYPE_V2
     if selected == ["uploads"]:
@@ -528,7 +619,7 @@ async def bucket_get(request: Request, bucket: str):
         # exist is the 400, not NoSuchBucket, where `?uploads&max-uploads=-1` on it is NoSuchBucket:
         # the value is parsed here and judged against the range after the lookup (measured). The
         # other parameters are read after it too.
-        max_uploads, err = _int32_param(q, "max-uploads", _MAX_UPLOADS, resource)
+        max_uploads, err = _int32_param(q, "max-uploads", _MAX_UPLOADS)
         if err:
             return err
     elif not selected:
@@ -536,16 +627,16 @@ async def bucket_get(request: Request, bucket: str):
         # (`?start-after=x&max-keys=abc` on a V1 request is the max-keys refusal, not start-after's),
         # then the other version's parameters are refused, and both happen before the bucket is
         # looked up. What is judged after it is in _list_objects, in the order its docstring gives.
-        max_keys, err = _int32_param(q, "max-keys", _MAX_KEYS, resource)
+        max_keys, err = _int32_param(q, "max-keys", _MAX_KEYS)
         if err:
             return err
         for name, message in _V1_ONLY if v2 else _V2_ONLY:
             if _first(q, name, None) is not None:
-                return _error("InvalidArgument", message, resource, extra=_argument_name(name))
+                return _error("InvalidArgument", message, extra=_argument_name(name))
     if not _bucket_visible(conn, bucket, visible):
-        return _error("NoSuchBucket", "The specified bucket does not exist", bucket)
+        return _no_such_bucket(bucket)
     if selected and selected[0] not in _BUCKET_GETS:
-        return _not_implemented(selected[0], resource)
+        return _not_implemented(selected[0])
     if selected == ["location"]:
         # us-east-1 is represented by an *empty* LocationConstraint element on real S3.
         return _xml(f'<LocationConstraint xmlns="{NS}"></LocationConstraint>')
@@ -629,11 +720,10 @@ def _list_objects(
     answers V1 where the two the other way round answer V2 (measured).
     """
     q = request.query_params
-    resource = f"/{bucket}"
     encoding_type = _first(q, "encoding-type", None)
     if encoding_type is not None and encoding_type.lower() != "url":
         return _argument_error(
-            "Invalid Encoding Method specified in Request", "encoding-type", encoding_type, resource
+            "Invalid Encoding Method specified in Request", "encoding-type", encoding_type
         )
     # What a readable token bounds is at `after, at` further down.
     continuation = _first(q, "continuation-token", None) if v2 else None
@@ -649,10 +739,9 @@ def _list_objects(
             return _error(
                 "InvalidArgument",
                 "The continuation token provided is incorrect",
-                resource,
                 extra=_argument_name("continuation-token"),
             )
-    err = _range_refusal(max_keys, "maxKeys", resource)
+    err = _range_refusal(max_keys, "maxKeys")
     if err:
         return err
     enc = _url_encode if encoding_type is not None else (lambda v: v)
@@ -829,7 +918,7 @@ def _url_encode(value: str) -> str:
     return "".join(out)
 
 
-def _int32_param(q, name: str, default: int, resource: str) -> tuple[int, Response | None]:
+def _int32_param(q, name: str, default: int) -> tuple[int, Response | None]:
     """``max-uploads`` and ``max-keys``, parsed the way real S3 parses both (measured).
 
     Absent or empty is the default; a run of digits, with or without a leading ``-``, is read for
@@ -863,12 +952,12 @@ def _int32_param(q, name: str, default: int, resource: str) -> tuple[int, Respon
     ceiling = _INT32_MAX + 1 if negative else _INT32_MAX
     if not re.fullmatch(r"-?[0-9]+", raw) or len(digits) > 10 or int(digits) > ceiling:
         return 0, _argument_error(
-            f"Provided {name} not an integer or within integer range", name, raw, resource
+            f"Provided {name} not an integer or within integer range", name, raw
         )
     return -int(digits) if negative else int(digits), None
 
 
-def _range_refusal(value: int, name: str, resource: str) -> Response | None:
+def _range_refusal(value: int, name: str) -> Response | None:
     """A parsed ``max-uploads``/``max-keys`` below zero, refused as real refuses it (measured).
 
     Real judges the range after the bucket lookup and after ``encoding-type`` (the listing's full
@@ -882,7 +971,7 @@ def _range_refusal(value: int, name: str, resource: str) -> Response | None:
     if value >= 0:
         return None
     return _argument_error(
-        f"Argument {name} must be an integer between 0 and {_INT32_MAX}", name, str(value), resource
+        f"Argument {name} must be an integer between 0 and {_INT32_MAX}", name, str(value)
     )
 
 
@@ -916,21 +1005,18 @@ def _list_multipart_uploads(request: Request, bucket: str, max_uploads: int) -> 
     parsed, ``-01`` as ``-1`` (measured 2026-09-11). Past ``_MAX_UPLOADS`` it is served at the cap.
     """
     q = request.query_params
-    resource = f"/{bucket}"
     encoding_type = _first(q, "encoding-type", None)
     if encoding_type is not None and encoding_type.lower() != "url":
         return _argument_error(
-            "Invalid Encoding Method specified in Request", "encoding-type", encoding_type, resource
+            "Invalid Encoding Method specified in Request", "encoding-type", encoding_type
         )
-    err = _range_refusal(max_uploads, "max-uploads", resource)
+    err = _range_refusal(max_uploads, "max-uploads")
     if err:
         return err
     key_marker = _first(q, "key-marker")
     upload_id_marker = _first(q, "upload-id-marker")
     if key_marker and upload_id_marker:
-        return _argument_error(
-            "Invalid uploadId marker", "upload-id-marker", upload_id_marker, resource
-        )
+        return _argument_error("Invalid uploadId marker", "upload-id-marker", upload_id_marker)
     prefix = _first(q, "prefix")
     delimiter = _first(q, "delimiter")
     enc = _url_encode if encoding_type is not None else (lambda v: v)
@@ -953,34 +1039,38 @@ def _list_multipart_uploads(request: Request, bucket: str, max_uploads: int) -> 
 async def object_get(request: Request, bucket: str, key: str):
     """GetObject — the object's bytes, or its metadata headers alone for a HEAD.
 
-    ``key`` is a whole path, slashes and all. A ``Range`` header returns 206 over that slice; an
-    object the caller cannot read is NoSuchKey, not AccessDenied, so a listing and a read agree
-    about what exists."""
+    ``key`` is a whole path, slashes and all. A ``Range`` header returns 206 over that slice. The
+    bucket is looked up before the key, as real looks them up: a key in a bucket that does not exist
+    is NoSuchBucket, with ``?acl`` and ``?uploadId`` as without them (measured 2026-09-29), and so
+    is one in a bucket the caller cannot see. An object the caller cannot read is NoSuchKey, not
+    AccessDenied, so a listing and a read agree about what exists."""
+    head = request.method == "HEAD"
+    selected = _selected(request.query_params, _OBJECT_READ_SELECTORS)
+    # An empty set, not `_BUCKET_GETS`: a key's path serves no sub-resource on a GET, so its HEAD
+    # refusal names no method even for a selector a bucket's path does serve.
+    refused = _read_refusal(request, selected, _OBJECT_READ_REFUSED, frozenset())
+    if refused is not None:
+        return refused
     caller, visible, err = _auth(request)
     if err:
-        return err if request.method == "GET" else Response(status_code=err.status_code)
+        return _head(err.status_code) if head else err
     conn = auth.conn(request)
-    selected = _selected(request.query_params, _OBJECT_SELECTORS)
-    if selected and request.method == "HEAD":
-        # An empty set, not `_BUCKET_GETS`: a key's path serves no sub-resource on a GET, so its
-        # 405 names no method even for a selector a bucket's path does serve.
-        return _head_refusal(selected, frozenset())
-    if len(selected) > 1:
-        return _conflict(selected, f"/{bucket}/{key}")
+    if not _bucket_visible(conn, bucket, visible):
+        return _head(404) if head else _no_such_bucket(bucket)
+    if selected == ["uploads"]:
+        return _error("InvalidRequest", _UPLOADS_ON_A_KEY)
     if selected == ["uploadId"]:
         # ListParts is about an upload, not about the object under the key: real S3 answers
         # `NoSuchUpload` for a key that does not exist, not `NoSuchKey` (measured), so the refusal
         # comes before the key is looked up.
-        return _not_implemented("uploadId", f"/{bucket}/{key}")
+        return _not_implemented("uploadId")
     row = _object_row(conn, bucket, key, visible)
     if row is None:
-        if request.method == "HEAD":
-            return Response(status_code=404)
-        return _error("NoSuchKey", "The specified key does not exist.", f"/{bucket}/{key}")
+        return _head(404) if head else _no_such_key(key)
     if selected:
         # The key exists, so the sub-resource is what is being refused — real S3 checks the key
         # first too: `GET /{missing}?acl` is NoSuchKey (same measurement).
-        return _not_implemented(selected[0], f"/{bucket}/{key}")
+        return _not_implemented(selected[0])
 
     data = row["content"].encode("utf-8")
     total = len(data)
@@ -1001,24 +1091,24 @@ async def object_get(request: Request, bucket: str, key: str):
     if rng:
         parsed = _parse_range(rng, total)
         if parsed is None:
-            range_headers = {**headers, "Content-Range": f"bytes */{total}"}
-            if request.method == "GET":
-                return _error(
-                    "InvalidRange",
-                    "The requested range is not satisfiable",
-                    f"/{bucket}/{key}",
-                    extra=f"<ActualObjectSize>{total}</ActualObjectSize>",
-                    headers={"Content-Range": f"bytes */{total}"},
-                )
-            return Response(status_code=416, headers={**range_headers, "Content-Length": "0"})
+            unsatisfiable = {"Content-Range": f"bytes */{total}"}
+            if head:
+                return _head(416, unsatisfiable)
+            return _error(
+                "InvalidRange",
+                "The requested range is not satisfiable",
+                f"<RangeRequested>{escape(rng)}</RangeRequested>"
+                f"<ActualObjectSize>{total}</ActualObjectSize>",
+                headers=unsatisfiable,
+            )
         start, end = parsed
         status = 206
         headers["Content-Range"] = f"bytes {start}-{end}/{total}"
 
     length = end - start + 1
     headers["Content-Length"] = str(length)
-    if request.method == "HEAD":
-        return Response(status_code=200 if status == 200 else 206, headers=headers)
+    if head:
+        return Response(status_code=status, headers=headers)
     return Response(content=data[start : end + 1], status_code=status, headers=headers)
 
 
@@ -1095,10 +1185,11 @@ _WRITE_IS_NOT_SERVED = (
 # every selector below on each of `PUT`, `POST`, `DELETE` and `PATCH`, 156 requests: a method in the
 # set answered `NoSuchBucket` for the absent bucket, which is the write resolving it, and every
 # other method the 405 naming the type, before the bucket, and with an `Allow` that is exactly the
-# set plus `GET` where the selector has a GET form. A key's `tagging` is a different type from a
-# bucket's, so the two paths keep their own tables. `delete` (DeleteObjects), and a key's `uploads`,
-# `restore` and `select`, are not among the selectors a GET reads here (`_BUCKET_SELECTORS`,
-# `_OBJECT_SELECTORS`); `session` and `renameObject` answered as the bare path does and are left
+# set plus `GET` where the selector has a GET form. A bucket's `restore` and a key's `delete` and
+# `encryption` were measured 2026-09-29 the same way, 23 requests, and answered by the same rule. A
+# key's `tagging` is a different type from a bucket's, so the two paths keep their own tables. The
+# selectors here with no GET form are the ones a GET is refused for (`_BUCKET_READ_REFUSED`,
+# `_OBJECT_READ_REFUSED`); `session` and `renameObject` answered as the bare path does and are left
 # out.
 _BUCKET_WRITE_SELECTORS: dict[str, tuple[str, frozenset[str]]] = {
     "abac": ("BUCKET_ABAC", frozenset({"PUT"})),
@@ -1124,6 +1215,7 @@ _BUCKET_WRITE_SELECTORS: dict[str, tuple[str, frozenset[str]]] = {
     "publicAccessBlock": ("PUBLIC_ACCESS_BLOCK", frozenset({"DELETE", "PUT"})),
     "replication": ("REPLICATION", frozenset({"DELETE", "PUT"})),
     "requestPayment": ("REQUEST_PAYMENT", frozenset({"PUT"})),
+    "restore": ("RESTORE", frozenset({"POST"})),
     "tagging": ("TAGGING", frozenset({"DELETE", "PUT"})),
     "uploads": ("UPLOADS", frozenset({"POST"})),
     "versioning": ("VERSIONING", frozenset({"PUT"})),
@@ -1134,6 +1226,8 @@ _OBJECT_WRITE_SELECTORS: dict[str, tuple[str, frozenset[str]]] = {
     "acl": ("ACL", frozenset({"PUT"})),
     "annotation": ("OBJECT_ANNOTATIONS", frozenset()),
     "attributes": ("OBJECT_ATTRIBUTES", frozenset()),
+    "delete": ("MULTI_OBJECT_DELETE", frozenset({"POST"})),
+    "encryption": ("OBJECT_ENCRYPTION", frozenset({"PUT"})),
     "legal-hold": ("OBJECT_LOCK_LEGALHOLD", frozenset({"PUT"})),
     "restore": ("RESTORE", frozenset({"POST"})),
     "retention": ("OBJECT_LOCK_RETENTION", frozenset({"PUT"})),
@@ -1146,6 +1240,35 @@ _OBJECT_WRITE_SELECTORS: dict[str, tuple[str, frozenset[str]]] = {
 # `uploadId` beside a `partNumber` is UploadPart, a type of its own that only `PUT` is (same date:
 # `PATCH ?partNumber=1&uploadId=…` is the 405 naming `PART` with `Allow: PUT`).
 _UPLOAD_PART = ("PART", frozenset({"PUT"}))
+
+# The selectors a GET and a HEAD naming one are refused for with the 405 naming its type, before the
+# bucket is looked up: those whose operations are all on the methods above, which is every selector
+# of a write table outside `_BUCKET_SELECTORS` and `_OBJECT_SELECTORS`, a key's `uploads` apart.
+# Measured 2026-09-29 against `s3.us-east-1.amazonaws.com`: the selectors of both tables and
+# `partNumber`, `renameObject`, `select-type` and `session`, 40 in all, each on a GET and a HEAD at
+# a bucket nobody owns and at a key in it, 160 requests. These are the ones a GET answered with a
+# 405, which named the type and carried an `Allow` of the write methods, and a HEAD answered each
+# with the 405 and the same `Allow`; the public bucket `noaa-ghcn-pds` and one of its objects
+# answered them the same. The `Allow` is not repeated, since this server serves no method at these
+# selectors, which is the line `_head_refusal` draws.
+_BUCKET_READ_REFUSED = {
+    selector: resource_type
+    for selector, (resource_type, _) in _BUCKET_WRITE_SELECTORS.items()
+    if selector not in _BUCKET_SELECTORS
+}
+_OBJECT_READ_REFUSED = {
+    selector: resource_type
+    for selector, (resource_type, _) in _OBJECT_WRITE_SELECTORS.items()
+    if selector not in _OBJECT_SELECTORS | {"uploads"}
+}
+# A key's `uploads` is a `POST` too, but what a GET naming it gets is a 400 of its own, and after
+# the bucket is looked up: `NoSuchBucket` for the absent bucket, this for the public one's object
+# and for a key it does not have (same date). A HEAD naming it is the 405 the others are.
+_UPLOADS_ON_A_KEY = "Key is not expected for the GET method ?uploads subresource"
+# What a GET or a HEAD at each path reads as a selector, and so what a pair of them conflicts over:
+# `?acl&delete`, `?restore&location` and a key's `?uploads&acl` are each the conflict (same date).
+_BUCKET_READ_SELECTORS = _BUCKET_SELECTORS | frozenset(_BUCKET_READ_REFUSED)
+_OBJECT_READ_SELECTORS = _OBJECT_SELECTORS | frozenset(_OBJECT_READ_REFUSED) | {"uploads"}
 
 # The `Access-Control-Request-Method` values real's preflight accepts, case and all: any other is
 # "Invalid Access-Control-Request-Method: <value>" at 400 (same date, `put`, `Get`, `FOO`, `TRACE`,
@@ -1175,9 +1298,7 @@ def _cors_preflight(request: Request, message: str) -> Response:
     return _error("AccessForbidden", message, extra=_method_type(asked, "BUCKET"))
 
 
-def _refuse_write(
-    request: Request, bucket: str, method: str, resource: str, *, resolve: bool = True
-) -> Response:
+def _refuse_write(request: Request, bucket: str, method: str, *, resolve: bool = True) -> Response:
     """The 501 for a write, once the credential and, unless ``resolve`` is false, the bucket it
     names resolve.
 
@@ -1194,14 +1315,13 @@ def _refuse_write(
     if err is not None:
         return err
     if resolve and not _bucket_visible(auth.conn(request), bucket, visible):
-        return _error("NoSuchBucket", "The specified bucket does not exist", bucket)
-    return _error("NotImplemented", _WRITE_IS_NOT_SERVED + method, resource)
+        return _no_such_bucket(bucket)
+    return _error("NotImplemented", _WRITE_IS_NOT_SERVED + method)
 
 
 def _selector_refusal(
     request: Request,
     bucket: str,
-    resource: str,
     table: dict[str, tuple[str, frozenset[str]]],
     served_on_get: frozenset[str],
 ) -> Response | None:
@@ -1216,13 +1336,13 @@ def _selector_refusal(
     if not selected:
         return None
     if len(selected) > 1:
-        return _conflict(selected, resource)
+        return _conflict(selected)
     if selected == ["uploadId"] and "partNumber" in q:
         resource_type, writes = _UPLOAD_PART
     else:
         resource_type, writes = table[selected[0]]
     if request.method in writes:
-        return _refuse_write(request, bucket, request.method, resource)
+        return _refuse_write(request, bucket, request.method)
     return _error(
         "MethodNotAllowed",
         _METHOD_NOT_ALLOWED,
@@ -1241,11 +1361,12 @@ async def service_method_refusal(request: Request) -> Response:
     """The service root serves `ListBuckets` alone, and real answers `PUT`, `POST`, `DELETE` and
     `PATCH` there with one 405 naming `SERVICE`, each measured, and the same with a selector on
     `PATCH`, `POST` and `PUT`. A `HEAD` is the same 405, with or without `?acl` or `?versioning`
-    (measured 2026-09-23), and like any answer to a `HEAD` it goes out without its body; it is
-    declared here because a method no route here takes is answered by ``backlot.errors.s3`` as the
-    parse 400."""
+    (measured 2026-09-23), framed as ``_head`` frames every `HEAD` refusal; it is declared here
+    because a method no route here takes is answered by ``backlot.errors.s3`` as the parse 400."""
     if request.method == "OPTIONS":
         return _cors_preflight(request, _CORS_NO_BUCKET)
+    if request.method == "HEAD":
+        return _head(405, {"Allow": "GET"})
     return _error(
         "MethodNotAllowed",
         _METHOD_NOT_ALLOWED,
@@ -1265,9 +1386,7 @@ async def bucket_method_refusal(request: Request, bucket: str) -> Response:
     method = request.method
     if method == "OPTIONS":
         return _cors_preflight(request, _CORS_DISABLED)
-    by_selector = _selector_refusal(
-        request, bucket, f"/{bucket}", _BUCKET_WRITE_SELECTORS, _BUCKET_GETS
-    )
+    by_selector = _selector_refusal(request, bucket, _BUCKET_WRITE_SELECTORS, _BUCKET_GETS)
     if by_selector is not None:
         return by_selector
     if method == "PATCH":
@@ -1285,7 +1404,7 @@ async def bucket_method_refusal(request: Request, bucket: str) -> Response:
             "At least one of the pre-conditions you specified did not hold",
             extra="<Condition>Bucket POST must be of the enclosure-type multipart/form-data</Condition>",
         )
-    return _refuse_write(request, bucket, method, f"/{bucket}", resolve=method != "PUT")
+    return _refuse_write(request, bucket, method, resolve=method != "PUT")
 
 
 @router.api_route(
@@ -1299,9 +1418,7 @@ async def object_method_refusal(request: Request, bucket: str, key: str) -> Resp
     method = request.method
     if method == "OPTIONS":
         return _cors_preflight(request, _CORS_DISABLED)
-    by_selector = _selector_refusal(
-        request, bucket, f"/{bucket}/{key}", _OBJECT_WRITE_SELECTORS, frozenset()
-    )
+    by_selector = _selector_refusal(request, bucket, _OBJECT_WRITE_SELECTORS, frozenset())
     if by_selector is not None:
         return by_selector
     if method in ("PATCH", "POST"):
@@ -1311,4 +1428,4 @@ async def object_method_refusal(request: Request, bucket: str, key: str) -> Resp
             extra=_method_type(method, "OBJECT"),
             headers={"Allow": _ALLOW_OBJECT},
         )
-    return _refuse_write(request, bucket, method, f"/{bucket}/{key}")
+    return _refuse_write(request, bucket, method)

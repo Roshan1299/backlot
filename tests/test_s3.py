@@ -211,6 +211,34 @@ _REFUSAL_ROWS = [
     (f"{_KEY}?restore", "DELETE", 405, "MethodNotAllowed", ">RESTORE</", None),
     (f"{_KEY}?partNumber=1&uploadId=u", "PATCH", 405, "MethodNotAllowed", ">PART</", None),
     ("/s3/?acl", "PATCH", 405, "MethodNotAllowed", "<ResourceType>SERVICE</", "GET"),
+    # A GET naming a selector whose operations are all on another method, before the bucket.
+    ("/s3/eng-artifacts?delete", "GET", 405, "MethodNotAllowed", ">MULTI_OBJECT_DELETE</", None),
+    ("/s3/eng-artifacts?restore", "GET", 405, "MethodNotAllowed", ">RESTORE</", None),
+    ("/s3/no-such-bucket?delete", "GET", 405, "MethodNotAllowed", ">MULTI_OBJECT_DELETE</", None),
+    (f"{_KEY}?delete", "GET", 405, "MethodNotAllowed", ">MULTI_OBJECT_DELETE</", None),
+    (f"{_KEY}?encryption", "GET", 405, "MethodNotAllowed", ">OBJECT_ENCRYPTION</", None),
+    (f"{_KEY}?restore", "GET", 405, "MethodNotAllowed", ">RESTORE</", None),
+    (
+        f"{_KEY}?select",
+        "GET",
+        405,
+        "MethodNotAllowed",
+        "<Method>GET</Method><ResourceType>SELECT</",
+        None,
+    ),
+    (
+        "/s3/eng-artifacts?acl&delete",
+        "GET",
+        400,
+        "InvalidArgument",
+        "parameters: acl, delete",
+        None,
+    ),
+    (f"{_KEY}?uploads&acl", "GET", 400, "InvalidArgument", "parameters: acl, uploads", None),
+    # The write methods of the selectors that rows above refuse on a GET.
+    ("/s3/eng-artifacts?restore", "DELETE", 405, "MethodNotAllowed", ">RESTORE</", None),
+    (f"{_KEY}?delete", "PUT", 405, "MethodNotAllowed", ">MULTI_OBJECT_DELETE</", None),
+    (f"{_KEY}?encryption", "POST", 405, "MethodNotAllowed", ">OBJECT_ENCRYPTION</", None),
     (
         "/s3/eng-artifacts?acl&versioning",
         "PATCH",
@@ -244,8 +272,8 @@ def test_s3_a_method_this_router_does_not_serve_answers_reals_own_refusal(
 def test_s3_a_head_at_the_service_root_is_the_405_without_its_body(live_server, path):
     """Measured 2026-09-23, signed and unsigned, bare and with `?acl` and `?versioning`: real
     answers a `HEAD` at the service root 405 with `Allow: GET` and an empty `application/xml` body,
-    not the parse 400 a method S3 defines nothing for gets. The GET on the same path is the
-    listing, so the refusal is the method's."""
+    not the parse 400 a method S3 defines nothing for gets, and sends it chunked (2026-09-29). The
+    GET on the same path is the listing, so the refusal is the method's."""
     import httpx
 
     base_url, settings = live_server
@@ -257,6 +285,7 @@ def test_s3_a_head_at_the_service_root_is_the_405_without_its_body(live_server, 
         assert r.headers["allow"] == "GET"
         assert r.headers["content-type"] == "application/xml"
         assert r.content == b""
+        assert "content-length" not in r.headers and r.headers["transfer-encoding"] == "chunked"
     assert _signed(base_url, path, settings.admin_token).status_code == 200
 
 
@@ -266,8 +295,8 @@ def test_s3_every_selector_a_get_reads_has_an_answer_for_the_other_methods():
     selector."""
     from backlot.routers import s3 as s3_router
 
-    assert s3_router._BUCKET_SELECTORS <= set(s3_router._BUCKET_WRITE_SELECTORS)
-    assert s3_router._OBJECT_SELECTORS <= set(s3_router._OBJECT_WRITE_SELECTORS)
+    assert s3_router._BUCKET_READ_SELECTORS <= set(s3_router._BUCKET_WRITE_SELECTORS)
+    assert s3_router._OBJECT_READ_SELECTORS <= set(s3_router._OBJECT_WRITE_SELECTORS)
 
 
 _WRITE_ROWS = [
@@ -394,26 +423,36 @@ def test_s3_a_write_names_its_bucket_before_the_501_and_createbucket_names_none(
     assert present.status_code == 501 and "<Code>NotImplemented</Code>" in present.text
 
 
-def test_s3_a_write_on_a_bucket_the_caller_cannot_see_is_nosuchbucket(live_server):
-    """The write refusal reads the bucket, so it is scoped as a listing is: `people-vault` holds one
-    group-visible object, so an engineer is told it does not exist where the admin gets the 501.
-    CreateBucket reads no bucket and a method refusal comes first, so both answer the two callers
-    alike."""
+def test_s3_a_request_in_a_bucket_the_caller_cannot_see_is_nosuchbucket(live_server):
+    """A write and a read of a key both look the bucket up first, so each is scoped as a listing is:
+    `people-vault` holds one group-visible object, so an engineer is told the bucket does not exist
+    where the admin gets the write's 501 and the object itself. CreateBucket reads no bucket and a
+    method refusal comes first, so both answer the two callers alike."""
     base_url, settings = live_server
     tokens = {
         u["email"]: u["token"] for u in yaml.safe_load(settings.tokens_path.read_text())["users"]
     }
     scoped_token = tokens["ava@acme.com"]
-    for method, path in (
-        ("DELETE", "/s3/people-vault"),
-        ("POST", "/s3/people-vault?delete"),
-        ("PUT", "/s3/people-vault/x.txt"),
-        ("DELETE", "/s3/people-vault/x.txt?tagging"),
+    for method, path, admin_status in (
+        ("DELETE", "/s3/people-vault", 501),
+        ("POST", "/s3/people-vault?delete", 501),
+        ("PUT", "/s3/people-vault/x.txt", 501),
+        ("DELETE", "/s3/people-vault/x.txt?tagging", 501),
+        ("GET", "/s3/people-vault/comp/bands.csv", 200),
+        ("HEAD", "/s3/people-vault/comp/bands.csv", 200),
+        ("HEAD", "/s3/people-vault", 200),
     ):
         scoped = _signed(base_url, path, scoped_token, method=method)
         admin = _signed(base_url, path, settings.admin_token, method=method)
-        assert scoped.status_code == 404 and "<Code>NoSuchBucket</Code>" in scoped.text, path
-        assert admin.status_code == 501, path
+        assert scoped.status_code == 404, path
+        if method != "HEAD":
+            assert "<BucketName>people-vault</BucketName>" in scoped.text, path
+        assert admin.status_code == admin_status, path
+        # HeadBucket's ARN rides its 200 alone, so a caller who cannot see the bucket gets none.
+        assert "x-amz-bucket-arn" not in scoped.headers, path
+    # The same caller reads a bucket it can see.
+    visible = _signed(base_url, "/s3/eng-artifacts/runbooks/oncall.md", scoped_token)
+    assert visible.status_code == 200
     for method, status in (("PUT", 501), ("PATCH", 405)):
         scoped = _signed(base_url, "/s3/people-vault", scoped_token, method=method)
         admin = _signed(base_url, "/s3/people-vault", settings.admin_token, method=method)
@@ -429,21 +468,30 @@ def test_s3_a_write_on_a_bucket_the_caller_cannot_see_is_nosuchbucket(live_serve
         ("PATCH", "/s3/eng-artifacts?acl", "PUT"),
         ("POST", "/s3/eng-artifacts?tagging", "DELETE"),
         ("OPTIONS", _KEY, "DELETE"),
+        ("GET", "/s3/eng-artifacts?delete", "POST"),
+        ("GET", f"{_KEY}?encryption", "PUT"),
+        ("GET", "/s3/eng-artifacts?acl&versioning", None),
+        ("HEAD", "/s3/eng-artifacts?delete", "POST"),
+        ("HEAD", "/s3/eng-artifacts?acl", "PUT"),
+        ("HEAD", f"{_KEY}?select", "POST"),
+        ("HEAD", f"{_KEY}?acl&tagging", None),
     ],
 )
 def test_s3_the_method_is_refused_before_the_credential(live_server, method, path, write):
     """Measured: an unsigned request answers each of these as a signed one does, so real reaches
-    the method before it reads the credential. A write resolves the credential first, so the same
-    path unsigned under the method that writes there is the missing-signature refusal; the service
-    root has no such method."""
+    the method, and a selector a GET or a HEAD cannot take, before it reads the credential (the
+    selectors' rows 2026-09-29). A write resolves the credential first, so the same path unsigned
+    under the method that writes there is the missing-signature refusal; the service root and a
+    conflict have no such method."""
     import httpx
 
     base_url, settings = live_server
     unsigned = httpx.request(method, f"{base_url}{path}")
     signed = _signed(base_url, path, settings.admin_token, method=method)
     assert unsigned.status_code == signed.status_code != 403
-    code = re.search(r"<Code>([^<]+)</Code>", signed.text)[1]
-    assert f"<Code>{code}</Code>" in unsigned.text
+    if method != "HEAD":
+        code = re.search(r"<Code>([^<]+)</Code>", signed.text)[1]
+        assert f"<Code>{code}</Code>" in unsigned.text
     if write:
         refused = httpx.request(write, f"{base_url}{path}")
         assert refused.status_code == 403, write
@@ -471,33 +519,38 @@ def test_s3_unknown_access_key_rejected(live_server):
     assert e.value.code == 403 and b"InvalidAccessKeyId" in e.value.read()
 
 
-def test_s3_tampered_signature_rejected(live_server):
-    import urllib.request
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+@pytest.mark.parametrize(
+    "path, conflict",
+    [
+        ("/s3/eng-artifacts?list-type=2", False),
+        ("/s3/eng-artifacts?delete", False),
+        (f"{_KEY}?restore", False),
+        ("/s3/eng-artifacts?acl&versioning", True),
+        (f"{_KEY}?acl&tagging", True),
+    ],
+)
+def test_s3_tampered_signature_rejected(live_server, method, path, conflict):
+    """A signature that does not verify is the 403 ahead of a selector a GET or a HEAD cannot take,
+    where real answers an unsigned request's 405 first; a conflict comes before any signature is
+    checked (both measured 2026-09-29, `backlot.routers.s3._read_refusal`). The same request
+    signed as sent is not a 403."""
+    import httpx
 
     base_url, settings = live_server
-    url, headers = _sign_get(
-        base_url, "/s3/eng-artifacts?list-type=2", settings.admin_token, tamper=True
-    )
-    with pytest.raises(urllib.error.HTTPError) as e:
-        urllib.request.urlopen(urllib.request.Request(url, headers=headers))
-    assert e.value.code == 403 and b"SignatureDoesNotMatch" in e.value.read()
-
-
-def test_s3_missing_key_is_nosuchkey(live_server):
-    import urllib.request
-
-    base_url, settings = live_server
-    url, headers = _sign_get(base_url, "/s3/eng-artifacts/does/not/exist.md", settings.admin_token)
-    with pytest.raises(urllib.error.HTTPError) as e:
-        urllib.request.urlopen(urllib.request.Request(url, headers=headers))
-    assert e.value.code == 404 and b"NoSuchKey" in e.value.read()
+    url, headers = _sign_get(base_url, path, settings.admin_token, tamper=True, method=method)
+    r = httpx.request(method, url, headers=headers)
+    assert r.status_code == (400 if conflict else 403)
+    if method == "GET":
+        assert ("InvalidArgument" if conflict else "SignatureDoesNotMatch") in r.text
+    assert _signed(base_url, path, settings.admin_token, method=method).status_code != 403
 
 
 def test_s3_key_containing_a_question_mark_verifies(live_server):
     """`?` is a legal character in a key, and a client sends it as `%3F`. Starlette rebuilds
     `request.url` from the DECODED path, so for `/q%3Fx.txt` its `.query` is `x.txt` — a query the
     client never sent or signed. The verifier canonicalises the wire query string instead, and an
-    absent key with a `?` in it answers NoSuchKey like every other absent key, not
+    absent key with a `?` in it answers NoSuchKey like any absent key in a bucket that exists, not
     SignatureDoesNotMatch. Signed by botocore, the way boto3 sends it."""
     import urllib.request
 
@@ -520,8 +573,12 @@ def test_s3_unsatisfiable_range_is_416(live_server):
     )
     with pytest.raises(urllib.error.HTTPError) as e:
         urllib.request.urlopen(urllib.request.Request(url, headers=headers))
-    assert e.value.code == 416 and b"InvalidRange" in e.value.read()
+    body = e.value.read()
     total = len("Check dashboards, roll back, page on-call.")
+    assert e.value.code == 416 and b"<Code>InvalidRange</Code>" in body
+    # The range as sent and the object's size, which is what real names this refusal with.
+    members = f"<RangeRequested>bytes=99999-100000</RangeRequested><ActualObjectSize>{total}"
+    assert f"</Message>{members}</ActualObjectSize><RequestId>".encode() in body
     assert e.value.headers.get("Content-Range") == f"bytes */{total}"
     assert e.value.headers.get("Content-Type") == "application/xml"
 
@@ -1044,6 +1101,11 @@ def test_what_does_not_exist_is_reported_before_the_subresource_except_for_list_
     # a missing key rather than NoSuchKey, so Backlot refuses it before looking the key up.
     err = _refused(base_url, "/s3/eng-artifacts/no/such.md?uploadId=abc123", token)
     assert err.code == 501 and b"NotImplemented" in err.read()
+    # The bucket comes before all of that: a key in a bucket that does not exist is NoSuchBucket,
+    # with or without a selector, ListParts' and a key's `?uploads` included (measured 2026-09-29).
+    for query in ("", "?acl", "?uploadId=abc123", "?uploads"):
+        err = _refused(base_url, f"/s3/no-such-bucket/no/such.md{query}", token)
+        assert err.code == 404 and b"<Code>NoSuchBucket</Code>" in err.read(), query
 
 
 def test_head_with_a_subresource_names_what_a_get_serves_and_a_bare_head_still_answers(live_server):
@@ -1060,6 +1122,13 @@ def test_head_with_a_subresource_names_what_a_get_serves_and_a_bare_head_still_a
         ("/s3/no-such-bucket?location", "GET"),
         ("/s3/no-such-bucket?versioning", None),
         ("/s3/eng-artifacts/no/such.md?acl", None),
+        # The selectors a GET is refused for are 405s on a HEAD too (measured 2026-09-29).
+        ("/s3/eng-artifacts?delete", None),
+        ("/s3/no-such-bucket?restore", None),
+        (f"{OBJECT_PATH}?delete", None),
+        (f"{OBJECT_PATH}?encryption", None),
+        (f"{OBJECT_PATH}?select", None),
+        (f"{OBJECT_PATH}?uploads", None),
     ):
         err = _refused(base_url, path, token, method="HEAD")
         assert err.code == 405 and err.read() == b"", path
@@ -1071,6 +1140,149 @@ def test_head_with_a_subresource_names_what_a_get_serves_and_a_bare_head_still_a
             urllib.request.Request(url, headers=headers, method="HEAD")
         ) as r:
             assert r.status == 200, path
+
+
+# What each refusal names between its message and the request id pair: the member real names that
+# code with, and never a `Resource` (`backlot.routers.s3._error`). InvalidRange's pair is asserted
+# beside its 416 above.
+_MEMBER_ROWS = [
+    (
+        "GET",
+        "/s3/no-such-bucket?list-type=2",
+        404,
+        "NoSuchBucket",
+        "<BucketName>no-such-bucket</BucketName>",
+    ),
+    (
+        "GET",
+        "/s3/no-such-bucket/a/b.txt",
+        404,
+        "NoSuchBucket",
+        "<BucketName>no-such-bucket</BucketName>",
+    ),
+    (
+        "DELETE",
+        "/s3/no-such-bucket",
+        404,
+        "NoSuchBucket",
+        "<BucketName>no-such-bucket</BucketName>",
+    ),
+    (
+        "GET",
+        "/s3/eng-artifacts/does/not/exist.md",
+        404,
+        "NoSuchKey",
+        "<Key>does/not/exist.md</Key>",
+    ),
+    (
+        "GET",
+        "/s3/eng-artifacts?list-type=2&max-keys=-1",
+        400,
+        "InvalidArgument",
+        "<ArgumentName>maxKeys</ArgumentName><ArgumentValue>-1</ArgumentValue>",
+    ),
+    (
+        "GET",
+        "/s3/eng-artifacts?list-type=2&marker=x",
+        400,
+        "InvalidArgument",
+        "<ArgumentName>marker</ArgumentName>",
+    ),
+    (
+        "GET",
+        "/s3/eng-artifacts?acl&versioning",
+        400,
+        "InvalidArgument",
+        "<ArgumentName>ResourceType</ArgumentName><ArgumentValue>acl</ArgumentValue>",
+    ),
+    (
+        "GET",
+        "/s3/eng-artifacts?delete",
+        405,
+        "MethodNotAllowed",
+        "<Method>GET</Method><ResourceType>MULTI_OBJECT_DELETE</ResourceType>",
+    ),
+    ("GET", f"{OBJECT_PATH}?uploads", 400, "InvalidRequest", ""),
+    # This server's own refusals, which have no real body to copy.
+    ("GET", "/s3/eng-artifacts?versioning", 501, "NotImplemented", ""),
+    ("DELETE", "/s3/eng-artifacts", 501, "NotImplemented", ""),
+]
+
+
+@pytest.mark.parametrize(
+    "method, path, status, code, members",
+    _MEMBER_ROWS,
+    ids=[f"{r[0]}-{r[3]}-{r[1].rsplit('/', 1)[-1]}" for r in _MEMBER_ROWS],
+)
+def test_s3_a_refusal_names_what_it_refused_with_the_member_real_uses_for_its_code(
+    live_server, method, path, status, code, members
+):
+    """Measured 2026-09-29 against us-east-1: `BucketName` for NoSuchBucket, whether the path names
+    a key or not, the key alone as `Key` for NoSuchKey, the argument and no resource for
+    InvalidArgument, the method and the type for MethodNotAllowed, and nothing more for a key's GET
+    `?uploads`."""
+    base_url, settings = live_server
+    r = _signed(base_url, path, settings.admin_token, method=method)
+    assert r.status_code == status
+    named = re.search(r"<Code>([^<]+)</Code><Message>[^<]*</Message>(.*)<RequestId>", r.text)
+    assert (named[1], named[2]) == (code, members)
+
+
+# Every kind of answer a HEAD gets, the token it is sent with ("tampered": signed, then the
+# signature spoiled; None: unsigned), and the length it declares, which only an object's own
+# answers do.
+_HEAD_ROWS = [
+    ("/s3/eng-artifacts", "admin", {}, 200, None),
+    ("/s3/no-such-bucket", "admin", {}, 404, None),
+    ("/s3/eng-artifacts/no/such.md", "admin", {}, 404, None),
+    ("/s3/no-such-bucket/a/b.txt", "admin", {}, 404, None),
+    ("/s3/eng-artifacts?versioning", "admin", {}, 405, None),
+    ("/s3/eng-artifacts?acl&versioning", "admin", {}, 400, None),
+    (OBJECT_PATH, "admin", {"Range": "bytes=99999-"}, 416, None),
+    ("/s3/eng-artifacts", "tampered", {}, 403, None),
+    ("/s3/eng-artifacts", None, {}, 403, None),
+    (OBJECT_PATH, "tampered", {}, 403, None),
+    (OBJECT_PATH, None, {}, 403, None),
+    (OBJECT_PATH, "admin", {}, 200, len(OBJECT_TEXT)),
+    (OBJECT_PATH, "admin", {"Range": "bytes=0-9"}, 206, 10),
+]
+
+
+@pytest.mark.parametrize(
+    "path, token, headers, status, length",
+    _HEAD_ROWS,
+    ids=[f"{r[3]}-{r[1]}-{r[0].rsplit('/', 1)[-1]}" for r in _HEAD_ROWS],
+)
+def test_s3_a_head_is_sent_chunked_as_xml_unless_it_is_the_objects_own(
+    live_server, path, token, headers, status, length
+):
+    """Measured 2026-09-29 against us-east-1 over twenty-two `HEAD`s: every answer but an object's
+    200 and 206 goes out `Transfer-Encoding: chunked` with no `Content-Length`, as
+    `application/xml`, a bucket's 200 among them, where those two carry the length a GET would send
+    and the object's own type. Read off a real uvicorn server, since the framing is what it writes
+    (``backlot.routers.s3._head``); the service root's is asserted above."""
+    import httpx
+
+    base_url, settings = live_server
+    if token is None:
+        r = httpx.head(f"{base_url}{path}", headers=headers)
+    else:
+        url, signed = _sign_get(
+            base_url,
+            path,
+            settings.admin_token,
+            tamper=token == "tampered",
+            extra_headers=headers,
+            method="HEAD",
+        )
+        r = httpx.head(url, headers=signed)
+    assert r.status_code == status and r.content == b""
+    if length is None:
+        assert "content-length" not in r.headers and r.headers["transfer-encoding"] == "chunked"
+        assert r.headers["content-type"] == "application/xml"
+    else:
+        assert r.headers["content-length"] == str(length) and "transfer-encoding" not in r.headers
+        assert r.headers["content-type"] == "text/markdown"
 
 
 # ------------------------------------------------------------------------ ListMultipartUploads
@@ -1388,6 +1600,14 @@ def test_list_multipart_uploads_on_a_bucket_the_caller_cannot_see_is_no_such_buc
     assert _get_xml(base_url, "/s3/eng-artifacts?uploads", tokens["ava@acme.com"]).tag == (
         f"{NS}ListMultipartUploadsResult"
     )
+
+
+def test_boto3_head_bucket_reads_the_bucket_arn_and_that_it_is_no_access_point_alias(live_server):
+    """Measured 2026-09-29: real's HeadBucket 200 carries `x-amz-bucket-arn` and
+    `x-amz-access-point-alias` beside the region, which boto3 returns as its own keys."""
+    head = _boto3_client(live_server).head_bucket(Bucket="eng-artifacts")
+    assert head["BucketArn"] == "arn:aws:s3:::eng-artifacts"
+    assert head["BucketRegion"] == "us-east-1" and head["AccessPointAlias"] is False
 
 
 def test_boto3_list_multipart_uploads_is_an_empty_page_not_a_client_error(live_server):

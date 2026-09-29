@@ -352,15 +352,18 @@ virtual-hosted client looks for `acme-artifacts.localhost:8000` and finds nothin
 | `ListMultipartUploads` | Always the empty page, since data enters through `backlot import` and no upload is ever in progress. `prefix`, `delimiter` and `key-marker` are echoed, `max-uploads` and `encoding-type` validated and echoed, as real does |
 | `ListObjects` | The bare bucket GET, and what any `list-type` other than `2` selects. `prefix`, `delimiter`, `marker`, `max-keys`, `encoding-type`; `Marker` echoed, `NextMarker` under a delimiter, an `Owner` on every object |
 | `ListObjectsV2` | Selected by `list-type=2`. `prefix`, `delimiter`, `start-after`, `continuation-token`, `max-keys`, `encoding-type`; `KeyCount` and the continuation tokens, no `Owner` |
-| `GetObject` | `Range` |
+| `GetObject` | `Range`. A key in a bucket that does not exist, or that the caller cannot see, is `NoSuchBucket`, as on real |
 | `HeadObject` | |
 
 Any other sub-resource — `?versioning`, `?acl`, `?tagging`, `?uploadId` and the rest of what botocore
 declares at a bucket's or an object's path — is refused with `NotImplemented` (501), so a client gets
-an error to handle rather than the listing or the object's bytes parsed as something else. The one
-exception is `?session`: CreateSession is for directory buckets only and real S3 answers it with
-the listing on a general purpose bucket, so Backlot does too. Two sub-resources at once are
-`InvalidArgument`, as on real S3, and an unknown query key is ignored, as on real S3.
+an error to handle rather than the listing or the object's bytes parsed as something else. Two kinds
+are answered otherwise, as real answers them. `?session` is the listing: CreateSession is for
+directory buckets only and real S3 answers it with the listing on a general purpose bucket. A
+sub-resource whose operations are all on another method, `?delete` and a key's `?restore` and
+`?select` among them, is the 405 a GET or a HEAD naming it gets, and a key's `?uploads` on a GET is
+real's 400. Two sub-resources at once are `InvalidArgument`, as on real S3, and an unknown query key
+is ignored, as on real S3.
 
 A method no operation above serves answers what real answers: the 405 that names the method and
 whether the resource is a `BUCKET`, an `OBJECT` or the `SERVICE`, the 400 an `OPTIONS` without an
@@ -377,7 +380,9 @@ answers it with rather than a 405.
 
 Every call that reads or writes is SigV4-signed; see [auth.md](auth.md). The method refusals above
 are not, because real reaches the method before the credential: an unsigned `PATCH` and an unsigned
-`OPTIONS` answer what a signed one answers.
+`OPTIONS` answer what a signed one answers. Nor are the 405 a GET or a HEAD gets for a sub-resource
+and the conflict of two, though a signature that is sent and does not verify is refused ahead of
+the 405, as on real.
 
 ### Slack — `/slack/api`
 
