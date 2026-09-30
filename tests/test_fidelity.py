@@ -958,12 +958,12 @@ def _s3_error(code: str) -> str:
             },
             {"GetBucketCors": None, "GetObjectTagging": ("missing_operation", GAP)},
         ),
-        # Any other error is this server refusing what real answers: a 405 where real's is a 200,
-        # and a 400 where real's is that 404.
+        # Any other error is one real does not give: a 405 where real's is a 200, and a 404 of
+        # another code where real's is the 404 above.
         (
             {
                 "acl": (405, _s3_error("MethodNotAllowed")),
-                "cors": (400, _s3_error("InvalidRequest")),
+                "cors": (404, _s3_error("NoSuchBucket")),
             },
             {
                 "GetBucketAcl": ("unexpected_error", BREAKING),
