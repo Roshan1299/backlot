@@ -229,7 +229,7 @@ _REFUSAL_ROWS = [
     ("/s3/", "PATCH", 405, "MethodNotAllowed", "<ResourceType>SERVICE</", "GET"),
     ("/s3/", "PUT", 405, "MethodNotAllowed", "<ResourceType>SERVICE</", "GET"),
     ("/s3/", "OPTIONS", 400, "BadRequest", "Origin request header needed.", None),
-    # An empty `Origin` is none on all three paths (2026-09-30).
+    # An empty `Origin` is none on all three paths (``backlot.routers.s3._cors_preflight``).
     *[
         (path, "OPTIONS", 400, "BadRequest", "Origin request header needed.", None, {"Origin": ""})
         for path in ("/s3/eng-artifacts", _KEY, "/s3/")
@@ -736,7 +736,8 @@ _ANONYMOUS_ROWS = [
         404,
         "NoSuchBucket",
     ),
-    # Nor does an empty `Authorization` with no credential in the query (2026-09-30).
+    # Nor does an empty `Authorization` with no credential in the query
+    # (``backlot.auth.resolve_sigv4``).
     *[
         ("GET", f"/s3/eng-artifacts?list-type=2{query}", 404, "NoSuchBucket", {"Authorization": ""})
         for query in ("", "&X-Amz-Signature=00", "&AWSAccessKeyId=x")
@@ -3908,8 +3909,8 @@ _WRITE_CHECK_ROWS = [
         *_WROTE_POST,
     ),
     # Each algorithm's right value for the body, and the SDK's algorithm beside it, which has to
-    # name that algorithm, compared without case, or be empty, which is none (2026-09-29 and
-    # 2026-09-30).
+    # name that algorithm, compared without case, or be empty, which is none
+    # (``backlot.routers.s3._checksum_headers``).
     *[
         (
             *_DELETE,
@@ -3939,7 +3940,8 @@ _WRITE_CHECK_ROWS = [
         "",
     ),
     # An empty SDK algorithm beside a `Content-MD5` alone is none, and so the write; an empty
-    # `x-amz-trailer` is none too, so a named algorithm beside it is refused (2026-09-30).
+    # `x-amz-trailer` is none too, so a named algorithm beside it is refused
+    # (``_checksum_headers``).
     (
         *_DELETE,
         _GOOD_DELETE,

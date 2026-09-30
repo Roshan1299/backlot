@@ -327,11 +327,12 @@ on both sides, and real names the methods that sub-resource takes where Backlot 
 for the selectors its own `GET` at that path answers (`backlot.routers.s3._head_refusal`). A `GET`
 or a `HEAD` naming a selector no `GET` takes, `?delete` and a key's `?select` among them, is 405 on
 both sides too, and real names the write methods where Backlot sends no `Allow` at all
-(`backlot.routers.s3._BUCKET_READ_REFUSED`). The `s3` probe reads no response header, so neither
-difference is visible to the diff and a hand-written acknowledgement would come back as
-"acknowledged but no longer diverging" on the next run. `tests/test_s3.py` is the record: the
-`allow` column of `test_s3_a_method_this_router_does_not_serve_answers_reals_own_refusal` for the
-`GET`s, and the bucket configuration and object sub-resource tests for the `HEAD`s.
+(`backlot.routers.s3._BUCKET_READ_REFUSED`, `_OBJECT_READ_REFUSED`). The `s3` probe reads no
+response header, so neither difference is visible to the diff and a hand-written acknowledgement
+would come back as "acknowledged but no longer diverging" on the next run. `tests/test_s3.py` is the
+record: the `allow` column of
+`test_s3_a_method_this_router_does_not_serve_answers_reals_own_refusal` for the `GET`s, and the
+bucket configuration and object sub-resource tests for the `HEAD`s.
 
 Confluence is not yet fully covered: its reads now live in a v2 document whose paths are shaped
 differently from the v1 ones Backlot serves, so the eight reads Atlassian has removed from the v1

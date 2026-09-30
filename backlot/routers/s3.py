@@ -2,15 +2,15 @@
 
 Path-style endpoint for a client: ``http://<host>/s3`` (boto3: ``endpoint_url=".../s3"`` with
 ``addressing_style=path``; mirage: ``S3Config(endpoint_url=".../s3", path_style=True)``). Auth is
-AWS SigV4 or Signature Version 2, in the header or the query (``backlot.auth.resolve_sigv4``),
-against a per-caller access-key/secret derived from a bearer token; the admin/service token's key
-sees everything, a user's key is ACL-filtered, and an unsigned request is the anonymous caller's,
-who sees no bucket (``_auth``). A method this router does not serve, and a GET or a HEAD naming a
-selector it cannot take, is refused before the bucket and whether or not a credential is sent, as
-real refuses them, but after a signature that was sent and does not verify (``_method_refusal``,
-``_read_refusal``); a write resolves the credential and the bucket first. Responses are S3 XML
-(namespace ``http://s3.amazonaws.com/doc/2006-03-01/``) or raw object bytes; errors use the S3
-``<Error>`` envelope.
+AWS SigV4, SigV4a or Signature Version 2, in the header or the query
+(``backlot.auth.resolve_sigv4``), against a per-caller access-key/secret derived from a bearer
+token; the admin/service token's key sees everything, a user's key is ACL-filtered, and an unsigned
+request is the anonymous caller's, who sees no bucket (``_auth``). A method this router does not
+serve, and a GET or a HEAD naming a selector it cannot take, is refused before the bucket and
+whether or not a credential is sent, as real refuses them, but after a signature that was sent and
+does not verify (``_method_refusal``, ``_read_refusal``); a write resolves the credential and the
+bucket first. Responses are S3 XML (namespace ``http://s3.amazonaws.com/doc/2006-03-01/``) or raw
+object bytes; errors use the S3 ``<Error>`` envelope.
 
 S3 dispatches on the query string: ``?acl``, ``?versioning``, ``?tagging`` and the rest each select
 a different operation at the same path. Every one of a bucket's is answered, as real answers a
@@ -789,12 +789,12 @@ def _key_selected(q) -> list[str]:
     query string parameter" under `ResourceType` on a GET and with the 400 on a HEAD, and beside
     another selector it is the conflict (`acl, annotationName`), before the credential and the
     bucket (measured 2026-09-29). Not every front end of real's refuses it on a GET: asked one
-    address at a time, 81 of 92 addresses of `s3.us-east-1.amazonaws.com` refused it on every
-    request and the other 11 answered every one with the object, as if it were absent, and 90 HEADs
-    spread over whichever address each reached were all the 400 (same date). The refusal is what
-    most of them give and what a HEAD gets. At a bucket's path it is left to the listing, as real
-    leaves it. `partNumber` beside a selector other than `uploadId` is the conflict too
-    (`?partNumber=1&tagging` is "partNumber, tagging", same date); alone it is GetObject's
+    address of `s3.us-east-1.amazonaws.com` at a time on 2026-09-30, about four in five refused it
+    on every request and most of the rest answered every one with the object, as if it were absent,
+    while 90 HEADs spread over whichever address each reached were all the 400 (2026-09-29). The
+    refusal is what most of them give and what a HEAD gets. At a bucket's path it is left to the
+    listing, as real leaves it. `partNumber` beside a selector other than `uploadId` is the conflict
+    too (`?partNumber=1&tagging` is "partNumber, tagging", same date); alone it is GetObject's
     (``_part_refusal``), and beside `uploadId` UploadPart."""
     selected = _selected(q, _OBJECT_READ_SELECTORS)
     if "annotationName" in q and "annotation" not in q:
@@ -1209,13 +1209,13 @@ def _page(
     by_key, entries, is_truncated, group_successor)``: ``entries`` in key order, ``kind`` ``obj``
     or ``cp``, and ``group_successor`` set when the page ends on a group whose keys run on past it
     (both listings and ListObjectVersions page this way)."""
-    # The one SQL query that replaces the old 100k-row materialize: prefix + keyset (`key > after` /
-    # `key >= at`) + ACL all pushed down, walking idx_s3_key(bucket, key) directly in sorted order.
-    # Ask for one extra row so IsTruncated is a plain length check (and so we can tell, below,
-    # whether a trailing rolled-up group extends past this page) — no separate COUNT(*) query.
-    # `served` is what this page may hold: the echo is uncapped but what comes back is not. served=0
-    # is its own case — `rows` is empty after trimming, IsTruncated is false the way real answers
-    # it, and nothing below reads the overflow row.
+    # The one SQL query: prefix + keyset (`key > after` / `key >= at`) + ACL all pushed down,
+    # walking idx_s3_key(bucket, key) directly in sorted order. Ask for one extra row so IsTruncated
+    # is a plain length check (and so we can tell, below, whether a trailing rolled-up group extends
+    # past this page) — no separate COUNT(*) query. `served` is what this page may hold: the echo is
+    # uncapped but what comes back is not. served=0 is its own case — `rows` is empty after
+    # trimming, IsTruncated is false the way real answers it, and nothing below reads the overflow
+    # row.
     rows = (
         []
         if past_the_end
@@ -2830,9 +2830,9 @@ async def _selector_refusal(
     Two selectors are the conflict a GET gets, and a bucket's `partNumber` the 400 a GET gets
     (``_bucket_selected``), both before the credential. One is a write when the method is an
     operation of that selector, checked as real checks it when ``checks`` names the pair
-    (``_WRITE_CHECKS``), and otherwise the 405 naming the selector's type, whose `Allow` is `GET`
-    for a selector this server answers on a GET and absent otherwise — the line ``_head_refusal``
-    draws.
+    (``_WRITE_CHECKS``, ``_KEY_WRITE_CHECKS``), and otherwise the 405 naming the selector's type,
+    whose `Allow` is `GET` for a selector this server answers on a GET and absent otherwise — the
+    line ``_head_refusal`` draws.
     """
     if not selected:
         return None
