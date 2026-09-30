@@ -330,8 +330,9 @@ def test_s3_a_method_this_router_does_not_serve_answers_reals_own_refusal(
 def test_s3_a_head_at_the_service_root_is_the_405_without_its_body(live_server, path):
     """Measured 2026-09-23, signed and unsigned, bare and with `?acl` and `?versioning`: real
     answers a `HEAD` at the service root 405 with `Allow: GET` and an empty `application/xml` body,
-    not the parse 400 a method S3 defines nothing for gets, and sends it chunked (2026-09-29). The
-    GET on the same path is the listing, so the refusal is the method's."""
+    not the parse 400 a method S3 defines nothing for gets, and sends it chunked
+    (``backlot.routers.s3._head``). The GET on the same path is the listing, so the refusal is the
+    method's."""
     import httpx
 
     base_url, settings = live_server
@@ -561,11 +562,12 @@ def test_s3_a_request_in_a_bucket_the_caller_cannot_see_is_nosuchbucket(live_ser
     ],
 )
 def test_s3_the_method_is_refused_before_the_credential(live_server, method, path, write):
-    """Measured: an unsigned request answers each of these as a signed one does, so real answers
-    the method, and a selector a GET or a HEAD cannot take, whether or not a credential is sent
-    (the selectors' rows 2026-09-29). A write resolves the caller and the bucket first, so the same
-    path unsigned under the method that writes there names a bucket the anonymous caller cannot
-    see; the service root and a conflict have no such method."""
+    """The order ``backlot.routers.s3._method_refusal`` and ``backlot.routers.s3._read_refusal``
+    keep: an unsigned request answers each of these as a signed one does, the method and a selector
+    a GET or a HEAD cannot take coming ahead of the credential. The control is the same path
+    unsigned under the method that writes there, which resolves the caller and the bucket first and
+    so names a bucket the anonymous caller cannot see; the service root and a conflict have no such
+    method."""
     import httpx
 
     base_url, settings = live_server
@@ -697,8 +699,8 @@ def test_s3_tampered_signature_rejected(live_server, method, path, status):
         assert _signed(base_url, path, settings.admin_token, method=method).status_code != 403
 
 
-# An unsigned request is the anonymous caller's, who can see no bucket: each row is real's answer
-# for a name nobody owns, measured 2026-09-29, and the corpus's buckets get the same one here.
+# Each row is real's answer for a name nobody owns (2026-09-29), which every corpus bucket gets here
+# too, an unsigned request seeing no bucket (``backlot.routers.s3._auth``).
 _ANONYMOUS_ROWS = [
     ("GET", "/s3/eng-artifacts?list-type=2", 404, "NoSuchBucket"),
     ("GET", "/s3/eng-artifacts?location", 404, "NoSuchBucket"),
@@ -723,9 +725,9 @@ def test_s3_an_unsigned_request_is_an_anonymous_caller_who_sees_no_bucket(
     live_server, method, path, status, code
 ):
     """Every bucket gets the answer for one the caller cannot see (``backlot.routers.s3._auth``).
-    The listing's parses come first, as on real. CreateBucket names no bucket, and real's refusal
-    of an anonymous one is its own, and ListBuckets is real's 307 to the product page. The admin,
-    signed, reads the same bucket and the same list."""
+    The listing's parses come first, as on real. CreateBucket names no bucket, and real's refusal of
+    an anonymous one is its own, and ListBuckets is the 307 ``backlot.routers.s3.list_buckets``
+    describes. The admin, signed, reads the same bucket and the same list."""
     import httpx
 
     base_url, settings = live_server
@@ -826,7 +828,8 @@ def test_s3_unsatisfiable_range_is_416(live_server):
     # The range as sent and the object's size, which is what real names this refusal with.
     members = f"<RangeRequested>bytes=99999-100000</RangeRequested><ActualObjectSize>{total}"
     assert f"</Message>{members}</ActualObjectSize><RequestId>".encode() in body
-    # The size is named in the body alone: real sends no `Content-Range` beside it (2026-09-29).
+    # The size is named in the body alone, with no `Content-Range`
+    # (``backlot.routers.s3.object_get``).
     assert e.value.headers.get("Content-Range") is None
     assert e.value.headers.get("Content-Type") == "application/xml"
 
@@ -1202,9 +1205,9 @@ def _get_xml(base_url, path, token):
 
 
 def test_list_buckets_xml_shape(live_server):
-    """Real's bare ListBuckets: the owner as its 64-hex id alone, and each bucket its name, its
-    creation date and its ARN, which `max-directory-buckets`, not one of its parameters, leaves as
-    it is (measured 2026-09-29)."""
+    """The bare page ``backlot.routers.s3.list_buckets`` describes, the owner as its 64-hex id
+    alone; `max-directory-buckets`, not one of its parameters, leaves it as it is (measured
+    2026-09-29)."""
     base_url, settings = live_server
     for path in ("/s3/", "/s3/?max-directory-buckets=1"):
         root = _get_xml(base_url, path, settings.admin_token)
@@ -1232,11 +1235,10 @@ def _bucket_page(base_url, query, token):
 
 
 def test_list_buckets_pages_as_real_does_once_one_of_its_parameters_is_sent(live_server, tokens):
-    """Any of ListBuckets' four parameters, an empty one too, puts each bucket's region between its
-    date and its ARN; the prefix, sent, follows the buckets, an empty one included and escaped as
-    real escapes it, and then the continuation token of a truncated page, which a caller follows to
-    the end. Each parameter is read where it is first sent (measured 2026-09-29). A scoped caller
-    pages through the buckets it can see and no other."""
+    """The paging ``backlot.routers.s3.list_buckets`` describes, followed to the end: any of its
+    four parameters, an empty one too, puts each bucket's region in, the prefix follows the buckets
+    escaped as real escapes it, and a truncated page's continuation token resumes after it. A scoped
+    caller pages through the buckets it can see and no other."""
     from urllib.parse import quote
 
     base_url, settings = live_server
@@ -1643,8 +1645,8 @@ def test_a_bucket_configuration_is_what_real_answers_for_a_bucket_nobody_configu
     ],
 )
 def test_a_bucket_selector_at_a_key_is_the_buckets_own_answer(live_server, selector):
-    """Real answered these at a key it has and one it does not with the bucket's own answer, byte
-    for byte, the bucket named where the answer names one (measured 2026-09-29)."""
+    """The bucket's own answer, byte for byte, at a key it has and one it does not
+    (``backlot.routers.s3._KEY_BUCKET_SELECTORS``), the bucket named where the answer names one."""
     base_url, settings = live_server
     at_bucket = _signed(base_url, f"/s3/eng-artifacts?{selector}", settings.admin_token)
     for path in (OBJECT_PATH, "/s3/eng-artifacts/no/such.md"):
@@ -2139,8 +2141,8 @@ _OBJECT_ORDER_ROWS = [
     ("present", "partNumber=2", {}, 416, "InvalidPartNumber", _NO_SUCH_PART.format(2)),
     ("present", "partNumber=02", {}, 416, "InvalidPartNumber", _NO_SUCH_PART.format(2)),
     ("present", "partNumber=010000", {}, 416, "InvalidPartNumber", _NO_SUCH_PART.format(10000)),
-    # A `versionId` beside a selector whose operation takes none, `null` included, before the
-    # bucket and the credential, where `?acl` reads it after the bucket (2026-09-30).
+    # A `versionId` beside a selector whose operation takes none
+    # (``backlot.routers.s3._KEY_VERSIONLESS``).
     ("absent", "versioning&versionId=x", {}, 400, "InvalidArgument", _NO_VERSION_ID),
     ("tampered", "location&versionId=x", {}, 400, "InvalidArgument", _NO_VERSION_ID),
     ("present", "cors&versionId=x", {}, 400, "InvalidArgument", _NO_VERSION_ID),
@@ -2424,7 +2426,7 @@ def test_the_listing_location_and_object_still_answer_and_an_unknown_key_is_igno
         root = _get_xml(base_url, f"/s3/eng-artifacts{query}", token)
         assert root.tag == f"{NS}ListBucketResult", query
     assert _get_xml(base_url, "/s3/eng-artifacts?location", token).tag == f"{NS}LocationConstraint"
-    # At a key's path too, the bucket's own answer whatever the key (measured 2026-09-29).
+    # At a key's path too (``backlot.routers.s3._KEY_BUCKET_SELECTORS``).
     for path in (f"{OBJECT_PATH}?location", "/s3/eng-artifacts/no/such.md?location"):
         assert _get_xml(base_url, path, token).tag == f"{NS}LocationConstraint", path
     for query in ("", "?x-id=GetObject", "?foo=bar"):
@@ -2496,8 +2498,8 @@ def test_what_does_not_exist_is_reported_before_the_subresource_except_for_list_
     # a missing key rather than NoSuchKey, so Backlot answers it before looking the key up.
     err = _refused(base_url, "/s3/eng-artifacts/no/such.md?uploadId=abc123", token)
     assert err.code == 404 and b"<Code>NoSuchUpload</Code>" in err.read()
-    # The bucket comes before all of that: a key in a bucket that does not exist is NoSuchBucket,
-    # with or without a selector, ListParts' and a key's `?uploads` included (measured 2026-09-29).
+    # The bucket comes before all of that (``backlot.routers.s3.object_get``), with or without a
+    # selector, ListParts' and a key's `?uploads` included.
     for query in ("", "?acl", "?uploadId=abc123", "?uploads"):
         err = _refused(base_url, f"/s3/no-such-bucket/no/such.md{query}", token)
         assert err.code == 404 and b"<Code>NoSuchBucket</Code>" in err.read(), query
@@ -2518,16 +2520,17 @@ def test_head_with_a_subresource_names_what_a_get_serves_and_a_bare_head_still_a
         ("/s3/no-such-bucket?location", "GET"),
         ("/s3/no-such-bucket?versioning", "GET"),
         ("/s3/eng-artifacts/no/such.md?acl", "GET"),
-        # The selectors a GET is refused for are 405s on a HEAD too (measured 2026-09-29).
+        # The selectors a GET is refused for are 405s on a HEAD too
+        # (``backlot.routers.s3._read_refusal``).
         ("/s3/eng-artifacts?delete", None),
         ("/s3/no-such-bucket?restore", None),
         (f"{OBJECT_PATH}?delete", None),
         (f"{OBJECT_PATH}?encryption", None),
         (f"{OBJECT_PATH}?select", None),
         (f"{OBJECT_PATH}?uploads", None),
-        # A bucket's selectors at a key and two of an object's at a bucket, which the GET at the
-        # same path answers after the bucket (measured 2026-09-29); the bucket's are served at a
-        # key, `?logging` and `?versions` apart, which the GET there refuses.
+        # A bucket's selectors at a key (``backlot.routers.s3._KEY_BUCKET_SELECTORS``) and two of an
+        # object's at a bucket (``backlot.routers.s3._BUCKET_OBJECT_SELECTORS``), which the GET at
+        # the same path answers after the bucket.
         (f"{OBJECT_PATH}?versioning", "GET"),
         (f"{OBJECT_PATH}?location", "GET"),
         ("/s3/no-such-bucket/a.txt?website", "GET"),
@@ -2640,7 +2643,8 @@ _MEMBER_ROWS = [
         "InvalidArgument",
         "<ArgumentName>part-number-marker</ArgumentName><ArgumentValue>abc</ArgumentValue>",
     ),
-    # Two object selectors at a bucket's path, after the bucket (measured 2026-09-29).
+    # Two object selectors at a bucket's path, after the bucket
+    # (``backlot.routers.s3._BUCKET_OBJECT_SELECTORS``).
     (
         "GET",
         "/s3/eng-artifacts?torrent",
@@ -2749,10 +2753,9 @@ _MEMBER_ROWS = [
 def test_s3_a_refusal_names_what_it_refused_with_the_member_real_uses_for_its_code(
     live_server, method, path, status, code, members, headers
 ):
-    """Measured 2026-09-29 against us-east-1: `BucketName` for NoSuchBucket, whether the path names
-    a key or not, the key alone as `Key` for NoSuchKey, the argument and no resource for
-    InvalidArgument, the method and the type for MethodNotAllowed, and nothing more for a key's GET
-    `?uploads`; and none for a payload hash naming a trailer (2026-09-29)."""
+    """The member each code names, as ``backlot.routers.s3._error`` records it, whether the path
+    names a key or not; nothing more for a key's GET `?uploads`, and none for a payload hash naming
+    a trailer (2026-09-29)."""
     base_url, settings = live_server
     r = _signed(base_url, path, settings.admin_token, method=method, extra_headers=headers)
     assert r.status_code == status
@@ -3035,9 +3038,7 @@ _PARAMETER_ROWS = [
         )
         for method in ("PUT", "DELETE")
     ],
-    # A bucket's writes and a `versionId`: a bare `POST` is the 412 first, `PUT ?acl` and
-    # `POST ?restore` read it as a version after the bucket, and `DELETE ?acl` refuses it before
-    # (2026-09-30).
+    # A bucket's writes and a `versionId` (``backlot.routers.s3._VERSION_AFTER_THE_BUCKET``).
     (
         "POST",
         "/s3/eng-artifacts?versionId=x",
@@ -3432,7 +3433,7 @@ def test_s3_a_head_is_sent_chunked_as_xml_unless_it_is_the_objects_own(
     if length is None:
         assert "content-length" not in r.headers and r.headers["transfer-encoding"] == "chunked"
         assert r.headers["content-type"] == "application/xml"
-        # Nor a range: real's 416 names none, on a HEAD as on a GET (measured 2026-09-29).
+        # Nor a range, on a HEAD as on a GET (``backlot.routers.s3.object_get``).
         assert "content-range" not in r.headers
     else:
         assert r.headers["content-length"] == str(length) and "transfer-encoding" not in r.headers
@@ -3758,8 +3759,8 @@ def test_list_multipart_uploads_on_a_bucket_the_caller_cannot_see_is_no_such_buc
 
 
 def test_boto3_head_bucket_reads_the_bucket_arn_and_that_it_is_no_access_point_alias(live_server):
-    """Measured 2026-09-29: real's HeadBucket 200 carries `x-amz-bucket-arn` and
-    `x-amz-access-point-alias` beside the region, which boto3 returns as its own keys."""
+    """The two headers ``backlot.routers.s3.head_bucket`` sends beside the region, which boto3
+    returns as its own keys."""
     head = _boto3_client(live_server).head_bucket(Bucket="eng-artifacts")
     assert head["BucketArn"] == "arn:aws:s3:::eng-artifacts"
     assert head["BucketRegion"] == "us-east-1" and head["AccessPointAlias"] is False
@@ -4621,7 +4622,7 @@ _WRITE_CHECK_ROWS = [
         _BAD_KMS_FORMAT,
         "",
     ),
-    # A key's id is letters, digits and hyphens after `key/` (2026-09-30).
+    # A key's id after `key/` (``backlot.routers.s3._is_kms_key``).
     *[
         (
             "PUT",
@@ -4645,8 +4646,8 @@ _WRITE_CHECK_ROWS = [
         "BucketKeyEnabled must be 'true' or 'false'. Invalid value: maybe",
         "",
     ),
-    # What real took on to the key's account, which this server has none of, so what is left is
-    # the write: `TRUE` and a key id (2026-09-29 and 2026-09-30).
+    # Past everything ``backlot.routers.s3._object_encryption_refusal`` checks, the write: `TRUE`
+    # and a key id.
     *[
         (
             "PUT",
@@ -5105,10 +5106,10 @@ def test_s3_a_write_is_checked_once_the_bucket_is_one_the_caller_can_see(live_se
 
 
 def test_s3_an_encryption_write_signed_with_signature_version_2_is_refused_for_it(live_server):
-    """Real refused UpdateObjectEncryption signed with V2, with a body and without, where the same
-    request signed with V4 is checked for its body (2026-09-29). Signed here by hand: botocore's V2
-    signer leaves `?encryption` out of the string it signs, and real, which signs it, refused
-    botocore's signature as a mismatch."""
+    """The V2 refusal ``backlot.routers.s3._object_encryption_refusal`` makes first, with a body and
+    without, where V4 is checked for its body. Signed here by hand: botocore's V2 signer leaves
+    `?encryption` out of the string it signs, and real, which signs it, refused botocore's signature
+    as a mismatch (2026-09-29)."""
     import hmac as _hmac
 
     import httpx
@@ -6194,7 +6195,7 @@ _REFUSAL_ROWS_UNIT = [
             "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
         )
     ],
-    # The header's date: `x-amz-date` when one is sent, readable or not, and `Date` otherwise.
+    # The header's date, as ``backlot.auth._resolve_v4_header`` reads it.
     (
         "Date alone",
         {"date": _http_date(), "authorization": _v4(_UNKNOWN, _now())},
@@ -6341,7 +6342,8 @@ _REFUSAL_ROWS_UNIT = [
         f'Invalid credential date "{_now()[:8]}x". This date is not the same as X-Amz-Date: '
         f'"{_now()[:8]}".',
     ),
-    # A header that had to be signed and was not: after the scope, ahead of the key.
+    # A header that had to be signed and was not (``backlot.auth._unsigned``), where
+    # ``backlot.auth._resolve_v4_header`` puts it.
     (
         "x-amz-meta-foo unsigned",
         {"x-amz-date": _now(), "x-amz-meta-foo": "bar", "authorization": _v4(_UNKNOWN, _now())},
@@ -6872,7 +6874,7 @@ def test_a_signature_version_2_header_verifies_over_the_string_real_signs(
 ):
     """Date forms real read (``test_a_date_is_read_as_real_read_it`` has the rest), each signed as
     sent (the `StringToSign` real returned for a bad secret named each as sent, 2026-09-29); an
-    `x-amz-date` over a `Date`, signed among the `x-amz-*` lines with the date line empty; and the
+    `x-amz-date` over a `Date`, signed as ``backlot.auth._resolve_v2_header`` signs it; and the
     `Content-Type` and `x-amz-meta-*` lines real signs. Real served the RFC 1123, `-0000`, `+0900`
     and asctime forms, every `x-amz-date` row and the `x-amz-meta-*` one."""
     now = datetime(2026, 9, 29, 9, 5, tzinfo=timezone.utc)
@@ -7190,10 +7192,10 @@ def test_signature_version_2_signs_the_query_parameters_real_signs(where, name, 
 def test_signature_version_2_sorts_names_and_decodes_values_as_real_does(
     query, signed, amz, headers
 ):
-    """Measured 2026-09-29 at a key over a bad secret: the signed parameters sorted, a value decoded
-    where one is signed, a name sent twice signed once, and an `x-amz-*` parameter signed as a
-    header, lower-cased, over a header of its name. The mismatch names the string this server
-    signed, which is real's, over the path under the mount (``backlot.auth._verify_v2``)."""
+    """The strings ``backlot.sigv2._resource`` and ``backlot.sigv2._amz_headers`` build, with a
+    value decoded where one is signed and a name sent twice signed once (measured 2026-09-29 at a
+    key over a bad secret). The mismatch names the string this server signed, which is real's, over
+    the path under the mount (``backlot.auth._verify_v2``)."""
     path = "/s3/eng-artifacts/runbooks/oncall.md"
     date = _http_date()
     req, _ = _v2_request("GET", path, query, {"date": date, **headers}, secret="x" * 40)
@@ -7240,9 +7242,9 @@ def test_a_signature_version_2_mismatch_names_what_real_names():
 
 @pytest.mark.parametrize("algorithm", [V4, V4A])
 def test_a_lower_case_v4_scheme_is_v4_and_is_signed_as_sent(algorithm):
-    """Real reads `aws4-hmac-sha256` as V4, and `aws4-ecdsa-p256-sha256` as SigV4a, and names each
-    as sent on the first line of the string it signs, so a signature over the upper-case line is
-    the mismatch, named with the members a V4 mismatch has and SigV4a's scope, which has no region
+    """A lower-case scheme is V4 or SigV4a, matched without case (``backlot.auth.resolve_sigv4``)
+    and signed as sent (``backlot.auth._verify_v4``), so a signature over the upper-case line is the
+    mismatch, named with the members a V4 mismatch has and SigV4a's scope, which has no region
     (2026-09-29)."""
     amz_date = datetime.now(timezone.utc).strftime(AMZ_DATE_FORMAT)
     req = _header_auth_request(amz_date, algorithm=algorithm)
@@ -7438,9 +7440,9 @@ def test_the_payload_hash_is_the_one_a_v4_signature_covers(headers, query, paylo
 def test_signature_version_2_signs_the_path_under_the_mount_or_the_whole_path(
     signed_path, verifies
 ):
-    """A client signs what is under `/s3` (boto3's `auth_path`) or the whole of what it sends (a
-    signer handed the URL), and either verifies; a path that is neither — boto3's bucket paths carry
-    a slash their URL does not — is the mismatch, as it is on real (2026-09-29)."""
+    """Either path ``backlot.auth._verify_v2`` verifies, what is under `/s3` (boto3's `auth_path`)
+    or the whole of what was sent (a signer handed the URL), and a path that is neither, boto3's
+    bucket paths with their slash, is the mismatch."""
     import hmac as _hmac
 
     date = _http_date()
@@ -7455,8 +7457,8 @@ def test_signature_version_2_signs_the_path_under_the_mount_or_the_whole_path(
 
 def test_boto3_signing_with_signature_version_2_is_served_as_real_serves_it(live_server):
     """boto3's own V2 client, path-style: ListBuckets and an object's GET and HEAD are served, as
-    real served them, and a bucket's own operations are the mismatch real answered them with, since
-    boto3 signs the bucket with a slash its URL does not carry (2026-09-29)."""
+    real served them, and a bucket's own operations are the mismatch real answered them with
+    (2026-09-29), for the slash ``backlot.auth._verify_v2`` describes."""
     boto3 = pytest.importorskip("boto3")
     from botocore.config import Config
     from botocore.exceptions import ClientError
@@ -7546,10 +7548,9 @@ def test_signature_version_2_is_served_as_real_serves_it(live_server):
     ],
 )
 def test_a_request_with_no_credential_is_the_anonymous_callers(query):
-    """Real reads a request carrying no credential as an anonymous caller's, an `X-Amz-Signature`
-    without `X-Amz-Algorithm` and an `AWSAccessKeyId` without `Signature` among them: a public
-    bucket's listing answered the first, and a bucket's own owner was answered the second as no
-    credential is (2026-09-29)."""
+    """A request ``backlot.auth.resolve_sigv4`` reads as carrying no credential, an
+    `X-Amz-Signature` without `X-Amz-Algorithm` and an `AWSAccessKeyId` without `Signature` among
+    them, is the anonymous caller's."""
     caller, err = auth.resolve_sigv4(
         _request("GET", "/s3/eng-artifacts", query, {"host": "backlot"})
     )
@@ -7591,9 +7592,8 @@ def _version_entries(root) -> list[str]:
 def test_list_object_versions_is_each_key_as_its_one_null_version(
     big_bucket_client, big_bucket_settings
 ):
-    """No bucket here is versioned, so each key is one version, `null` and the latest, carrying the
-    V1 listing's fields and `Owner`: the shape real answered on a bucket of four keys, the elements
-    in its order (2026-09-29)."""
+    """Each key as its one version, in the shape ``backlot.routers.s3._list_object_versions``
+    records, the elements in real's order."""
     token = big_bucket_settings.admin_token
     root = _versions(big_bucket_client, "", token)
     assert root.tag == f"{{{S3NS}}}ListVersionsResult"
@@ -7645,10 +7645,8 @@ def test_list_object_versions_pages_by_its_markers_to_the_end(
     big_bucket_client, big_bucket_settings, extra
 ):
     """Following `NextKeyMarker` and `NextVersionIdMarker` a page at a time walks every entry once,
-    in key order, as real's four keys did: each truncated page names its last entry, a group
-    without a `NextVersionIdMarker`, each page echoes the markers it was sent, and the last one
-    names none (2026-09-29). Under `encoding-type=url` a marker comes back encoded and goes back
-    decoded."""
+    in key order, as ``backlot.routers.s3._list_object_versions`` records real's four keys doing.
+    Under `encoding-type=url` a marker comes back encoded and goes back decoded."""
     token = big_bucket_settings.admin_token
     whole = _version_entries(_versions(big_bucket_client, extra.lstrip("&"), token))
     walked, query, pages = [], "max-keys=1" + extra, 0
@@ -7682,9 +7680,9 @@ def test_list_object_versions_pages_by_its_markers_to_the_end(
 def test_list_object_versions_rolls_up_by_delimiter_and_encodes_under_url(
     big_bucket_client, big_bucket_settings
 ):
-    """Versions and then CommonPrefixes, each in key order; `Delimiter` present whenever one was
-    sent, an empty one included; under `encoding-type=url` every key, prefix, marker and the
-    delimiter encoded and `EncodingType` as sent (all as real answered, 2026-09-29)."""
+    """Versions and then CommonPrefixes, `Delimiter` and `EncodingType` as
+    ``backlot.routers.s3._list_object_versions`` records them, and every key, prefix, marker and the
+    delimiter encoded under `encoding-type=url`."""
     token = big_bucket_settings.admin_token
     rolled = _versions(big_bucket_client, "delimiter=/", token)
     assert _version_entries(rolled) == [
@@ -7753,10 +7751,11 @@ def test_list_object_versions_rolls_up_by_delimiter_and_encodes_under_url(
 def test_list_object_versions_reads_its_bounds_as_real_does(
     big_bucket_client, big_bucket_settings, query, entries, max_keys, truncated
 ):
-    """`max-keys` as the listing parses it, echoed uncapped; `key-marker` past a key, or past the
-    group holding it under a delimiter; `version-id-marker=null` where `key-marker` alone resumes,
-    and beside an empty `key-marker` a page of nothing; the listings' own parameters ignored (each
-    measured on real's four keys, 2026-09-29, the empty `key-marker` beside the marker included)."""
+    """The bounds ``backlot.routers.s3._versions_parse`` and
+    ``backlot.routers.s3._list_object_versions`` record: `max-keys` echoed uncapped, `key-marker`
+    past a key or its group, `version-id-marker=null` where `key-marker` alone resumes and beside an
+    empty `key-marker` a page of nothing; and the listings' own parameters ignored (measured on
+    real's four keys, 2026-09-29)."""
     root = _versions(big_bucket_client, query, big_bucket_settings.admin_token)
     whole = ["100%.csv", "a b.txt", "a+b.txt", "run books/x.txt", "zz.txt", "한글/x.txt"]
     assert _version_entries(root) == (whole if entries is None else entries)

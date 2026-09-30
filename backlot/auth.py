@@ -877,8 +877,7 @@ def _resolve_v2_query(
         return None, SigV4Refusal("AccessDenied", message)
     raw = qs["Expires"]
     match = re.fullmatch(r"([+-]?)([0-9]+)", raw)
-    # Leading zeros come off before the value is read, as they do for `max-keys`, so a run of them
-    # never reaches `int()`, which refuses past 4300 digits.
+    # Leading zeros come off before the value is read, for the reason ``_long`` gives.
     digits = match[2].lstrip("0") or "0" if match else ""
     expires = int(digits) * (-1 if match[1] == "-" else 1) if match and len(digits) <= 19 else None
     if expires is None or not -_LONG <= expires < _INT32:
