@@ -53,6 +53,21 @@ operation an ACL states.
 A JSON body is the bare `application/json` on every Confluence route served — the 200s, the 404s,
 the 400, 403 and 405 measured. The charset Jira names is Jira's alone.
 
+A `HEAD` is the `GET` with the body left off, and declares the length that body would have had on
+every 200 but `search`'s. An `OPTIONS` is a 404 in the `errors` list the 405 uses, except on
+`search`, which answers by `Accept` as JAX-RS does: its WADL for `*/*`, `application/xml` or no
+`Accept` at all, and 204 for `application/json` or `text/html`, naming its three methods either way.
+A path no route serves is JAX-RS's own 404 — JSON when the caller asks for `application/json` by
+name, the `<status>` XML document otherwise — and a path below `space/` or `content/`, or anything
+under `/wiki` outside the API mount, is the product's HTML 404 page instead; a caller with no
+credential is sent from `/wiki/…` outside `/wiki/rest` to log in. An operation Confluence publishes
+that no route here serves refuses a caller with no credential with a served route's 403, or from a
+few services with `Current user not permitted to use Confluence`, and a caller whose credential
+resolves gets the 404 an unserved path gets. Every answer Confluence itself gives carries
+`atl-request-id`, `atl-traceid` (the same value without its dashes), `x-confluence-request-time`,
+`x-content-type-options` and `x-xss-protection`, and what the content and space services' routes
+answer adds the three headers that say the v1 REST API is deprecated.
+
 ### Fireflies — `/fireflies/graphql`
 
 **GraphQL only**, one `POST`. Root `Query` fields:
@@ -254,14 +269,43 @@ credential, an unparseable range and a mistyped `fields` mask, though `$.xgafv` 
 it and an `alt` naming a format other than `json` suppresses the wrap altogether — the format is
 matched without regard to case and an empty `alt=` names none, so `alt=JSON`, `alt=Json` and
 `alt=` each ask for the JSON the default serves rather than for a format of their own. An empty
-`callback=` is no
-callback; a repeated one is answered through the first name where `$.xgafv` is answered through the
-last; and a POST ignores the parameter outright, as real does, since JSONP is what a `<script>`
-element fetches and a `<script>` element issues a GET. A SUCCESS body is wrapped and indented on
-the `/sheets/v4` routes only; the other four families honour `callback` on their errors and not yet
-on their 200s. Measured against the live Sheets, Docs, Drive, Gmail and Slides APIs on 2026-09-15,
-2026-09-16 and 2026-09-17: the wrap, the indent and the charset first, the suppression across the
-four non-Sheets families next, and the escape set and the case-insensitive `alt` last.
+`callback=` is no callback, and a POST ignores the parameter outright, as real does, since JSONP is
+what a `<script>` element fetches and a `<script>` element issues a GET. A SUCCESS body is wrapped
+and indented on the `/sheets/v4` routes only; the other four families honour `callback` on their
+errors and not yet on their 200s. Measured against the live Sheets, Docs, Drive, Gmail and Slides
+APIs on 2026-09-15, 2026-09-16 and 2026-09-17: the wrap, the indent and the charset first, the
+suppression across the four non-Sheets families next, and the escape set and the case-insensitive
+`alt` last.
+
+**A repeated query parameter is read from the end real reads it from**, which is the first for some
+parameters and the last for others. The first repeat decides `fields`, `q`, `pageSize`, `pageToken`
+and `orderBy` on Drive's `files.list`, `fields` on `files.get` and `about`, and `mimeType` on
+`files.export`, and on Sheets `fields` and `prettyPrint`, as it decides `callback` and `alt`; the
+last decides `$.xgafv`, `majorDimension`, `valueRenderOption` and `includeGridData`. An empty first
+repeat is read as the empty value, not skipped. Gmail's `q`, `pageToken` and `maxResults` are read
+here from the last, and which end real reads is unmeasured. On a Sheets success, `prettyPrint` is
+compact at `false` and `0` and at none of the eighteen other spellings measured, `FALSE`, `no` and
+`f` among them. Measured against the live Drive, Sheets and Gmail APIs, each pair sent both ways
+round: `callback`, `alt` and the Sheets `$.xgafv` between 2026-09-15 and 2026-09-17,
+`includeGridData` and the Gmail `$.xgafv` on 2026-09-22, and the rest on 2026-09-23.
+
+**A typed query parameter is parsed in every repeat, and every value it cannot read is refused in
+one 400**: the message joins theirs with newlines and `details` carries a `google.rpc.BadRequest`
+field violation for each, a parameter's repeats together and in query order, on Sheets'
+`majorDimension`, `valueRenderOption`, `dateTimeRenderOption`, `includeGridData` and
+`excludeTablesInBandedRanges`, Drive's `pageSize` and the booleans each served Drive method declares
+(`supportsAllDrives`, `includeItemsFromAllDrives`, `acknowledgeAbuse`, `useDomainAdminAccess` and
+the two deprecated team-drive ones) alike, and a JSON body's enums and `includeGridData` carry the
+same `details`. A typed refusal comes after the credential check and before the file or spreadsheet
+is looked up. On Drive's `files.list`, one `pageSize` outside 1-1000 is refused with the range
+sentence (1-100 on `permissions.list` and `drives.list`), while a repeated one is read from the
+first and never range-checked; a `pageToken` it did not issue is 400 `Invalid Value`; and the
+refusals come in the order `pageSize`, `orderBy`, `q`, `pageToken`, `fields`. A blank `fields` on
+`files.list` or `files.get` answers `{}`. `files.export` refuses a format the file's type does not
+export to, the empty `mimeType=` among them, with `The requested conversion is not supported.`,
+matching the format without regard to case, refuses an absent `mimeType` ahead of looking the file
+up, and serves an export under the `mimeType` exactly as sent, with no `charset`. Measured against
+the live Drive and Sheets APIs on 2026-09-23, and the export's `Content-Type` on 2026-09-30.
 
 ### HubSpot — `/hubspot/crm/v3` `/hubspot/crm/v4`
 
@@ -297,6 +341,32 @@ upper-case — as real's is on every route and status measured, except where rea
 different type altogether: the RFC 7807 refusals (a type-conversion 400, the 405, the 415) are
 `application/problem+json;charset=UTF-8`, and the gateway's 403 for a bearer it cannot read as a
 Connect token is the bare `application/json`.
+
+A trailing slash is not part of a path on either product, and a run of slashes inside one is a
+single slash — both spellings answer what the canonical one answers, though a refusal echoes the
+path with its trailing slash kept. A `HEAD` is the `GET` with the body left off and declares no
+length but on Jira's 401 to an unauthenticated caller, which is where Jira parts from Confluence. An
+`OPTIONS` is 200 for a caller whose credential resolves, with an empty `text/html` body, an empty
+`Accept-Patch`, an `Allow` naming the methods the vendor serves at that route — the `PUT` and
+`DELETE` on an issue among them, which Backlot does not serve — and a quota of its own; anyone else
+gets Jira's 401. A `PATCH` never reaches either product: the gateway answers 400 on Jira and 405 on
+Confluence. Nor does a method the CDN refuses itself: `TRACE` and `CONNECT` are its 405, and any
+other method it does not pass on is its 403 or 400 by how the method is spelled. A path no route
+serves is RFC 7807 at 404 with `No endpoint <METHOD> <path>.` where Jira publishes nothing at it; at
+an operation it publishes and no route here serves, a `Content-Type` the operation does not take is
+its 415 for any caller the gateway lets through, and after that a caller with no credential gets
+Jira's 401 `Client must be authenticated to access this resource.` where the operation will not run
+anonymously (`backlot/data/jira_unserved.json`), and otherwise that 404, the gap the baseline
+acknowledges. That is under `/atlassian/rest` only: outside the two API mounts the site is its web
+app, `/browse` at 200, the root a redirect to log in or to `/jira/for-you`, and Jira's own not-found
+page for the rest. Every answer past the CDN carries `atl-request-id`, `atl-traceid`,
+`x-content-type-options` and `x-xss-protection`, and Jira's own answers add `x-arequestid`,
+`cache-control` and `timing-allow-origin`, which the gateway's refusals (the Connect-token 403, a
+`PATCH`) do not carry; a caller whose credential resolves also gets its own `x-aaccountid`, and the
+burst quota's four (`ratelimit`, `ratelimit-policy`, `x-ratelimit-limit`, `x-ratelimit-remaining`)
+where a route answers or an `OPTIONS` asks at one, counted per method and route. An anonymous
+request carries none of those five, and the no-endpoint 404, a 405 and an unserved operation's 415
+carry the account id alone.
 
 ### Linear — `/linear/graphql`
 
