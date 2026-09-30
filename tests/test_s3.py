@@ -5144,7 +5144,7 @@ def test_the_crcs_s3_checks_a_delete_with_are_the_standard_ones(crc, check):
     assert s3_router._reflected_crc(b"123456789", getattr(s3_router, crc)).hex() == check
 
 
-# --- the SigV4 verifier (backlot/sigv4.py) — S3 is its only caller ------------------------------------
+# --- the SigV4 verifier (backlot/sigv4.py) — S3 is its only caller --------------------------------
 botocore = pytest.importorskip("botocore")
 from botocore.auth import S3SigV4Auth  # noqa: E402
 from botocore.awsrequest import AWSRequest  # noqa: E402

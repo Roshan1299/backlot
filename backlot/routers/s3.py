@@ -659,7 +659,8 @@ _TRAILERS = frozenset(
 
 
 def _trailer_refusal(request: Request, head: bool = False) -> Response | None:
-    """The 400 for a payload hash in ``_TRAILERS`` on an operation that takes no upload, or ``None``."""
+    """The 400 for a payload hash in ``_TRAILERS`` on an operation that takes no upload, or
+    ``None``."""
     if auth.signed_payload_hash(request) not in _TRAILERS:
         return None
     if head:

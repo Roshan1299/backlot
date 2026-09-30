@@ -897,7 +897,8 @@ def _resolve_v2_query(
 
 
 def _java_time(milliseconds: int) -> str:
-    """An instant as real names a V2 query's `Expires`, Julian before 1582 (``_GREGORIAN_CUTOVER``)."""
+    """An instant as real names a V2 query's `Expires`, Julian before 1582
+    (``_GREGORIAN_CUTOVER``)."""
     seconds = milliseconds // 1000
     if seconds >= _GREGORIAN_CUTOVER:
         return (_EPOCH + timedelta(seconds=seconds)).strftime(_SERVER_TIME)

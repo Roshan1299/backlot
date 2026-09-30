@@ -278,7 +278,8 @@ def _zone(text: str) -> int | None:
 
 
 def _moment(fields: dict[str, int | str]) -> datetime | None:
-    """The instant ``fields`` name, each number carried over its range as a lenient calendar does."""
+    """The instant ``fields`` name, each number carried over its range as a lenient calendar
+    does."""
     try:
         numbers = {name: int(fields[name]) for name in _NUMBERS if name in fields}
     except ValueError:
