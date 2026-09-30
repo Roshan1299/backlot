@@ -1987,89 +1987,59 @@ _NO_SUCH_PART = (
     "</PartNumberRequested><ActualPartCount>1</ActualPartCount>"
 )
 _NO_BUCKET = "The specified bucket does not exist"
+# The answers the rows below repeat.
+_ANNOTATION_COUNT_RANGE = (400, "InvalidArgument", _ANNOTATION_RANGE)
+_ANNOTATION_COUNT_PARSE = (400, "InvalidArgument", _ANNOTATION_PARSE)
+_BUCKET_ABSENT = (404, "NoSuchBucket", _NO_BUCKET)
+_SIGNATURE_MISMATCH = (403, "SignatureDoesNotMatch", _MISMATCH)
+_VERSION_ID_REFUSED = (400, "InvalidArgument", _NO_VERSION_ID)
+_VERSION_ID_EMPTY = (400, "InvalidArgument", _VERSION_EMPTY)
+_BAD_ATTRIBUTE = (400, "InvalidArgument", _BAD_NAME)
+_VERSION_ID_INVALID = (400, "InvalidArgument", _BAD_VERSION)
+_ARGUMENT_00 = (400, "InvalidArgument", "<ArgumentValue>00<")
+_ARGUMENT_ETAG = (400, "InvalidArgument", "<ArgumentValue>etag<")
+_ARGUMENT_EMPTY = (400, "InvalidArgument", "<ArgumentValue></ArgumentValue>")
+_PART_OUT_OF_RANGE = (400, "InvalidArgument", _PART_RANGE)
+_PART_BESIDE_RANGE = (400, "InvalidRequest", _PART_AND_RANGE)
+_KEY_MISSING = (404, "NoSuchKey", "<Key>no/such.md</Key>")
+_PART_2_MISSING = (416, "InvalidPartNumber", _NO_SUCH_PART.format(2))
+_NULL_VERSION_MISSING = (404, "NoSuchVersion", "<VersionId>null</VersionId>")
+_CHECKSUM_MODE_REFUSED = (400, "InvalidRequest", _BAD_CHECKSUM_MODE)
+
 # Where each of an object's refusals sits against the bucket and the credential, as real answered
 # (2026-09-29, us-east-1): at a key in a bucket that does not exist (`absent`), at the object over a
 # bad secret (`tampered`), at the object signed (`present`) and at a key the bucket does not hold
 # (`missing`), two refusals at once among them; the query, the headers, and the status, code and
 # message fragment.
 _OBJECT_ORDER_ROWS = [
-    (
-        "absent",
-        "annotation&max-annotation-results=0",
-        {},
-        400,
-        "InvalidArgument",
-        _ANNOTATION_RANGE,
-    ),
-    (
-        "tampered",
-        "annotation&max-annotation-results=0",
-        {},
-        400,
-        "InvalidArgument",
-        _ANNOTATION_RANGE,
-    ),
-    (
-        "absent",
-        "annotation&max-annotation-results=abc",
-        {},
-        400,
-        "InvalidArgument",
-        _ANNOTATION_PARSE,
-    ),
-    (
-        "tampered",
-        "annotation&max-annotation-results=abc",
-        {},
-        400,
-        "InvalidArgument",
-        _ANNOTATION_PARSE,
-    ),
-    ("absent", "annotation&continuation-token=garbage", {}, 404, "NoSuchBucket", _NO_BUCKET),
-    (
-        "tampered",
-        "annotation&continuation-token=garbage",
-        {},
-        403,
-        "SignatureDoesNotMatch",
-        _MISMATCH,
-    ),
-    ("absent", "annotation&annotationName=", {}, 404, "NoSuchBucket", _NO_BUCKET),
-    ("tampered", "annotation&annotationName=", {}, 403, "SignatureDoesNotMatch", _MISMATCH),
-    ("absent", "torrent&versionId=garbage", {}, 400, "InvalidArgument", _NO_VERSION_ID),
-    ("tampered", "torrent&versionId=garbage", {}, 400, "InvalidArgument", _NO_VERSION_ID),
-    ("absent", "versionId=", {}, 400, "InvalidArgument", _VERSION_EMPTY),
-    ("tampered", "versionId=", {}, 400, "InvalidArgument", _VERSION_EMPTY),
-    ("absent", "tagging&versionId=", {}, 400, "InvalidArgument", _VERSION_EMPTY),
-    ("absent", "versionId=garbage", {}, 404, "NoSuchBucket", _NO_BUCKET),
-    ("tampered", "versionId=garbage", {}, 403, "SignatureDoesNotMatch", _MISMATCH),
-    ("absent", "versionId=null", {}, 404, "NoSuchBucket", _NO_BUCKET),
-    ("tampered", "versionId=null", {}, 403, "SignatureDoesNotMatch", _MISMATCH),
-    (
-        "absent",
-        "attributes",
-        {"x-amz-object-attributes": "garbage"},
-        400,
-        "InvalidArgument",
-        _BAD_NAME,
-    ),
-    (
-        "tampered",
-        "attributes",
-        {"x-amz-object-attributes": "garbage"},
-        400,
-        "InvalidArgument",
-        _BAD_NAME,
-    ),
-    ("absent", "attributes", {}, 404, "NoSuchBucket", _NO_BUCKET),
-    ("absent", "acl", {}, 404, "NoSuchBucket", _NO_BUCKET),
-    ("absent", "tagging", {}, 404, "NoSuchBucket", _NO_BUCKET),
-    ("absent", "legal-hold", {}, 404, "NoSuchBucket", _NO_BUCKET),
-    ("absent", "retention", {}, 404, "NoSuchBucket", _NO_BUCKET),
-    ("absent", "torrent", {}, 404, "NoSuchBucket", _NO_BUCKET),
-    ("absent", "annotation", {}, 404, "NoSuchBucket", _NO_BUCKET),
-    ("present", "legal-hold&versionId=garbage", {}, 400, "InvalidArgument", _BAD_VERSION),
-    ("present", "attributes&versionId=garbage", {}, 400, "InvalidArgument", _BAD_VERSION),
+    ("absent", "annotation&max-annotation-results=0", {}, *_ANNOTATION_COUNT_RANGE),
+    ("tampered", "annotation&max-annotation-results=0", {}, *_ANNOTATION_COUNT_RANGE),
+    ("absent", "annotation&max-annotation-results=abc", {}, *_ANNOTATION_COUNT_PARSE),
+    ("tampered", "annotation&max-annotation-results=abc", {}, *_ANNOTATION_COUNT_PARSE),
+    ("absent", "annotation&continuation-token=garbage", {}, *_BUCKET_ABSENT),
+    ("tampered", "annotation&continuation-token=garbage", {}, *_SIGNATURE_MISMATCH),
+    ("absent", "annotation&annotationName=", {}, *_BUCKET_ABSENT),
+    ("tampered", "annotation&annotationName=", {}, *_SIGNATURE_MISMATCH),
+    ("absent", "torrent&versionId=garbage", {}, *_VERSION_ID_REFUSED),
+    ("tampered", "torrent&versionId=garbage", {}, *_VERSION_ID_REFUSED),
+    ("absent", "versionId=", {}, *_VERSION_ID_EMPTY),
+    ("tampered", "versionId=", {}, *_VERSION_ID_EMPTY),
+    ("absent", "tagging&versionId=", {}, *_VERSION_ID_EMPTY),
+    ("absent", "versionId=garbage", {}, *_BUCKET_ABSENT),
+    ("tampered", "versionId=garbage", {}, *_SIGNATURE_MISMATCH),
+    ("absent", "versionId=null", {}, *_BUCKET_ABSENT),
+    ("tampered", "versionId=null", {}, *_SIGNATURE_MISMATCH),
+    ("absent", "attributes", {"x-amz-object-attributes": "garbage"}, *_BAD_ATTRIBUTE),
+    ("tampered", "attributes", {"x-amz-object-attributes": "garbage"}, *_BAD_ATTRIBUTE),
+    ("absent", "attributes", {}, *_BUCKET_ABSENT),
+    ("absent", "acl", {}, *_BUCKET_ABSENT),
+    ("absent", "tagging", {}, *_BUCKET_ABSENT),
+    ("absent", "legal-hold", {}, *_BUCKET_ABSENT),
+    ("absent", "retention", {}, *_BUCKET_ABSENT),
+    ("absent", "torrent", {}, *_BUCKET_ABSENT),
+    ("absent", "annotation", {}, *_BUCKET_ABSENT),
+    ("present", "legal-hold&versionId=garbage", {}, *_VERSION_ID_INVALID),
+    ("present", "attributes&versionId=garbage", {}, *_VERSION_ID_INVALID),
     (
         "present",
         "annotation&annotationName=x&max-annotation-results=abc",
@@ -2082,17 +2052,13 @@ _OBJECT_ORDER_ROWS = [
         "present",
         "annotation&max-annotation-results=abc&continuation-token=garbage",
         {},
-        400,
-        "InvalidArgument",
-        _ANNOTATION_PARSE,
+        *_ANNOTATION_COUNT_PARSE,
     ),
     (
         "present",
         "annotation&max-annotation-results=0&continuation-token=garbage",
         {},
-        400,
-        "InvalidArgument",
-        _ANNOTATION_RANGE,
+        *_ANNOTATION_COUNT_RANGE,
     ),
     (
         "present",
@@ -2110,30 +2076,9 @@ _OBJECT_ORDER_ROWS = [
         "InvalidArgument",
         "<ArgumentValue>-01<",
     ),
-    (
-        "present",
-        "annotation&max-annotation-results=00",
-        {},
-        400,
-        "InvalidArgument",
-        "<ArgumentValue>00<",
-    ),
-    (
-        "present",
-        "attributes",
-        {"x-amz-object-attributes": "etag"},
-        400,
-        "InvalidArgument",
-        "<ArgumentValue>etag<",
-    ),
-    (
-        "present",
-        "attributes",
-        {"x-amz-object-attributes": ""},
-        400,
-        "InvalidArgument",
-        "<ArgumentValue></ArgumentValue>",
-    ),
+    ("present", "annotation&max-annotation-results=00", {}, *_ARGUMENT_00),
+    ("present", "attributes", {"x-amz-object-attributes": "etag"}, *_ARGUMENT_ETAG),
+    ("present", "attributes", {"x-amz-object-attributes": ""}, *_ARGUMENT_EMPTY),
     # GetObject's `partNumber`: after the bucket and before the key, a `Range` beside it first and
     # a `versionId` before that, and a part the object does not have after the key.
     (
@@ -2145,76 +2090,41 @@ _OBJECT_ORDER_ROWS = [
         _PART_RANGE
         + "</Message><ArgumentName>partNumber</ArgumentName><ArgumentValue></ArgumentValue>",
     ),
-    ("present", "partNumber=00", {}, 400, "InvalidArgument", "<ArgumentValue>00<"),
+    ("present", "partNumber=00", {}, *_ARGUMENT_00),
     ("present", "partNumber=%201", {}, 400, "InvalidArgument", "<ArgumentValue> 1<"),
     ("present", "partNumber=1.0", {}, 400, "InvalidArgument", "<ArgumentValue>1.0<"),
     ("present", "partNumber=-1", {}, 400, "InvalidArgument", "<ArgumentValue>-1<"),
     ("present", "partNumber=10001", {}, 400, "InvalidArgument", "<ArgumentValue>10001<"),
-    ("missing", "partNumber=abc", {}, 400, "InvalidArgument", _PART_RANGE),
-    ("absent", "partNumber=abc", {}, 404, "NoSuchBucket", _NO_BUCKET),
-    ("tampered", "partNumber=abc", {}, 403, "SignatureDoesNotMatch", _MISMATCH),
-    ("present", "partNumber=1", {"Range": "bytes=0-1"}, 400, "InvalidRequest", _PART_AND_RANGE),
-    ("present", "partNumber=1", {"Range": ""}, 400, "InvalidRequest", _PART_AND_RANGE),
-    ("present", "partNumber=abc", {"Range": "bytes=0-1"}, 400, "InvalidRequest", _PART_AND_RANGE),
-    ("missing", "partNumber=1", {"Range": "bytes=0-1"}, 400, "InvalidRequest", _PART_AND_RANGE),
-    ("absent", "partNumber=1", {"Range": "bytes=0-1"}, 404, "NoSuchBucket", _NO_BUCKET),
-    (
-        "present",
-        "partNumber=1&versionId=garbage",
-        {"Range": "bytes=0-1"},
-        400,
-        "InvalidArgument",
-        _BAD_VERSION,
-    ),
-    ("present", "partNumber=abc&versionId=garbage", {}, 400, "InvalidArgument", _BAD_VERSION),
-    ("present", "partNumber=abc&versionId=", {}, 400, "InvalidArgument", _VERSION_EMPTY),
-    ("missing", "partNumber=2", {}, 404, "NoSuchKey", "<Key>no/such.md</Key>"),
-    ("present", "partNumber=2", {}, 416, "InvalidPartNumber", _NO_SUCH_PART.format(2)),
-    ("present", "partNumber=02", {}, 416, "InvalidPartNumber", _NO_SUCH_PART.format(2)),
+    ("missing", "partNumber=abc", {}, *_PART_OUT_OF_RANGE),
+    ("absent", "partNumber=abc", {}, *_BUCKET_ABSENT),
+    ("tampered", "partNumber=abc", {}, *_SIGNATURE_MISMATCH),
+    ("present", "partNumber=1", {"Range": "bytes=0-1"}, *_PART_BESIDE_RANGE),
+    ("present", "partNumber=1", {"Range": ""}, *_PART_BESIDE_RANGE),
+    ("present", "partNumber=abc", {"Range": "bytes=0-1"}, *_PART_BESIDE_RANGE),
+    ("missing", "partNumber=1", {"Range": "bytes=0-1"}, *_PART_BESIDE_RANGE),
+    ("absent", "partNumber=1", {"Range": "bytes=0-1"}, *_BUCKET_ABSENT),
+    ("present", "partNumber=1&versionId=garbage", {"Range": "bytes=0-1"}, *_VERSION_ID_INVALID),
+    ("present", "partNumber=abc&versionId=garbage", {}, *_VERSION_ID_INVALID),
+    ("present", "partNumber=abc&versionId=", {}, *_VERSION_ID_EMPTY),
+    ("missing", "partNumber=2", {}, *_KEY_MISSING),
+    ("present", "partNumber=2", {}, *_PART_2_MISSING),
+    ("present", "partNumber=02", {}, *_PART_2_MISSING),
     ("present", "partNumber=010000", {}, 416, "InvalidPartNumber", _NO_SUCH_PART.format(10000)),
     # A `versionId` beside a selector whose operation takes none
     # (``backlot.routers.s3._KEY_VERSIONLESS``).
-    ("absent", "versioning&versionId=x", {}, 400, "InvalidArgument", _NO_VERSION_ID),
-    ("tampered", "location&versionId=x", {}, 400, "InvalidArgument", _NO_VERSION_ID),
-    ("present", "cors&versionId=x", {}, 400, "InvalidArgument", _NO_VERSION_ID),
-    ("present", "logging&versionId=x", {}, 400, "InvalidArgument", _NO_VERSION_ID),
-    ("present", "uploads&versionId=x", {}, 400, "InvalidArgument", _NO_VERSION_ID),
-    ("present", "uploadId=u&versionId=null", {}, 400, "InvalidArgument", _NO_VERSION_ID),
-    ("present", "versioning&versionId=null", {}, 400, "InvalidArgument", _NO_VERSION_ID),
-    ("absent", "acl&versionId=x", {}, 404, "NoSuchBucket", _NO_BUCKET),
+    ("absent", "versioning&versionId=x", {}, *_VERSION_ID_REFUSED),
+    ("tampered", "location&versionId=x", {}, *_VERSION_ID_REFUSED),
+    ("present", "cors&versionId=x", {}, *_VERSION_ID_REFUSED),
+    ("present", "logging&versionId=x", {}, *_VERSION_ID_REFUSED),
+    ("present", "uploads&versionId=x", {}, *_VERSION_ID_REFUSED),
+    ("present", "uploadId=u&versionId=null", {}, *_VERSION_ID_REFUSED),
+    ("present", "versioning&versionId=null", {}, *_VERSION_ID_REFUSED),
+    ("absent", "acl&versionId=x", {}, *_BUCKET_ABSENT),
     # `x-amz-object-attributes` read as `_attribute_names` reads it.
-    (
-        "present",
-        "attributes",
-        {"x-amz-object-attributes": ",ETag"},
-        400,
-        "InvalidArgument",
-        "<ArgumentValue></ArgumentValue>",
-    ),
-    (
-        "present",
-        "attributes",
-        {"x-amz-object-attributes": "ETag,,ObjectSize"},
-        400,
-        "InvalidArgument",
-        "<ArgumentValue></ArgumentValue>",
-    ),
-    (
-        "absent",
-        "attributes",
-        {"x-amz-object-attributes": "ETag, ,ObjectSize"},
-        400,
-        "InvalidArgument",
-        "<ArgumentValue></ArgumentValue>",
-    ),
-    (
-        "tampered",
-        "attributes",
-        {"x-amz-object-attributes": "etag,garbage"},
-        400,
-        "InvalidArgument",
-        "<ArgumentValue>etag<",
-    ),
+    ("present", "attributes", {"x-amz-object-attributes": ",ETag"}, *_ARGUMENT_EMPTY),
+    ("present", "attributes", {"x-amz-object-attributes": "ETag,,ObjectSize"}, *_ARGUMENT_EMPTY),
+    ("absent", "attributes", {"x-amz-object-attributes": "ETag, ,ObjectSize"}, *_ARGUMENT_EMPTY),
+    ("tampered", "attributes", {"x-amz-object-attributes": "etag,garbage"}, *_ARGUMENT_ETAG),
     (
         "present",
         "attributes",
@@ -2223,14 +2133,7 @@ _OBJECT_ORDER_ROWS = [
         "InvalidArgument",
         "<ArgumentValue>garbage<",
     ),
-    (
-        "present",
-        "attributes",
-        {"x-amz-object-attributes": "ETag, etag"},
-        400,
-        "InvalidArgument",
-        "<ArgumentValue>etag<",
-    ),
+    ("present", "attributes", {"x-amz-object-attributes": "ETag, etag"}, *_ARGUMENT_ETAG),
     (
         "present",
         "attributes",
@@ -2239,65 +2142,23 @@ _OBJECT_ORDER_ROWS = [
         "InvalidRequest",
         "either missing or empty",
     ),
-    ("absent", "attributes", {"x-amz-object-attributes": ","}, 404, "NoSuchBucket", _NO_BUCKET),
-    (
-        "tampered",
-        "attributes",
-        {"x-amz-object-attributes": ",,"},
-        403,
-        "SignatureDoesNotMatch",
-        _MISMATCH,
-    ),
+    ("absent", "attributes", {"x-amz-object-attributes": ","}, *_BUCKET_ABSENT),
+    ("tampered", "attributes", {"x-amz-object-attributes": ",,"}, *_SIGNATURE_MISMATCH),
     # A key the bucket does not hold, asked for by version or by part.
-    ("missing", "versionId=null", {}, 404, "NoSuchVersion", "<VersionId>null</VersionId>"),
-    ("missing", "partNumber=1", {}, 404, "NoSuchKey", "<Key>no/such.md</Key>"),
-    (
-        "missing",
-        "partNumber=1&versionId=null",
-        {},
-        404,
-        "NoSuchVersion",
-        "<VersionId>null</VersionId>",
-    ),
+    ("missing", "versionId=null", {}, *_NULL_VERSION_MISSING),
+    ("missing", "partNumber=1", {}, *_KEY_MISSING),
+    ("missing", "partNumber=1&versionId=null", {}, *_NULL_VERSION_MISSING),
     # A checksum mode other than `ENABLED`: after the bucket, the credential, the version, the
     # part's refusals and a range or a part the object lacks, and ahead of a missing key.
-    ("present", "", {"x-amz-checksum-mode": "garbage"}, 400, "InvalidRequest", _BAD_CHECKSUM_MODE),
-    ("present", "", {"x-amz-checksum-mode": ""}, 400, "InvalidRequest", _BAD_CHECKSUM_MODE),
-    ("missing", "", {"x-amz-checksum-mode": "garbage"}, 400, "InvalidRequest", _BAD_CHECKSUM_MODE),
-    (
-        "missing",
-        "versionId=null",
-        {"x-amz-checksum-mode": "garbage"},
-        400,
-        "InvalidRequest",
-        _BAD_CHECKSUM_MODE,
-    ),
-    ("absent", "", {"x-amz-checksum-mode": "garbage"}, 404, "NoSuchBucket", _NO_BUCKET),
-    ("tampered", "", {"x-amz-checksum-mode": "garbage"}, 403, "SignatureDoesNotMatch", _MISMATCH),
-    (
-        "present",
-        "versionId=garbage",
-        {"x-amz-checksum-mode": "garbage"},
-        400,
-        "InvalidArgument",
-        _BAD_VERSION,
-    ),
-    (
-        "present",
-        "partNumber=abc",
-        {"x-amz-checksum-mode": "garbage"},
-        400,
-        "InvalidArgument",
-        _PART_RANGE,
-    ),
-    (
-        "present",
-        "partNumber=2",
-        {"x-amz-checksum-mode": "garbage"},
-        416,
-        "InvalidPartNumber",
-        _NO_SUCH_PART.format(2),
-    ),
+    ("present", "", {"x-amz-checksum-mode": "garbage"}, *_CHECKSUM_MODE_REFUSED),
+    ("present", "", {"x-amz-checksum-mode": ""}, *_CHECKSUM_MODE_REFUSED),
+    ("missing", "", {"x-amz-checksum-mode": "garbage"}, *_CHECKSUM_MODE_REFUSED),
+    ("missing", "versionId=null", {"x-amz-checksum-mode": "garbage"}, *_CHECKSUM_MODE_REFUSED),
+    ("absent", "", {"x-amz-checksum-mode": "garbage"}, *_BUCKET_ABSENT),
+    ("tampered", "", {"x-amz-checksum-mode": "garbage"}, *_SIGNATURE_MISMATCH),
+    ("present", "versionId=garbage", {"x-amz-checksum-mode": "garbage"}, *_VERSION_ID_INVALID),
+    ("present", "partNumber=abc", {"x-amz-checksum-mode": "garbage"}, *_PART_OUT_OF_RANGE),
+    ("present", "partNumber=2", {"x-amz-checksum-mode": "garbage"}, *_PART_2_MISSING),
     (
         "present",
         "",
@@ -2310,9 +2171,7 @@ _OBJECT_ORDER_ROWS = [
         "present",
         "partNumber=1",
         {"x-amz-checksum-mode": "garbage", "Range": "bytes=0-1"},
-        400,
-        "InvalidRequest",
-        _PART_AND_RANGE,
+        *_PART_BESIDE_RANGE,
     ),
 ]
 
@@ -2596,31 +2455,17 @@ def test_head_with_a_subresource_names_what_a_get_serves_and_a_bare_head_still_a
             assert r.status == 200, path
 
 
+# The answers the rows below repeat.
+_NO_BUCKET_NAMED = (404, "NoSuchBucket", "<BucketName>no-such-bucket</BucketName>")
+_INVALID_REQUEST = (400, "InvalidRequest", "")
+
 # What each refusal names between its message and the request id pair: the member real names that
 # code with, and never a `Resource` (`backlot.routers.s3._error`). InvalidRange's pair is asserted
 # beside its 416 above.
 _MEMBER_ROWS = [
-    (
-        "GET",
-        "/s3/no-such-bucket?list-type=2",
-        404,
-        "NoSuchBucket",
-        "<BucketName>no-such-bucket</BucketName>",
-    ),
-    (
-        "GET",
-        "/s3/no-such-bucket/a/b.txt",
-        404,
-        "NoSuchBucket",
-        "<BucketName>no-such-bucket</BucketName>",
-    ),
-    (
-        "DELETE",
-        "/s3/no-such-bucket",
-        404,
-        "NoSuchBucket",
-        "<BucketName>no-such-bucket</BucketName>",
-    ),
+    ("GET", "/s3/no-such-bucket?list-type=2", *_NO_BUCKET_NAMED),
+    ("GET", "/s3/no-such-bucket/a/b.txt", *_NO_BUCKET_NAMED),
+    ("DELETE", "/s3/no-such-bucket", *_NO_BUCKET_NAMED),
     (
         "GET",
         "/s3/eng-artifacts/does/not/exist.md",
@@ -2656,7 +2501,7 @@ _MEMBER_ROWS = [
         "MethodNotAllowed",
         "<Method>GET</Method><ResourceType>MULTI_OBJECT_DELETE</ResourceType>",
     ),
-    ("GET", f"{OBJECT_PATH}?uploads", 400, "InvalidRequest", ""),
+    ("GET", f"{OBJECT_PATH}?uploads", *_INVALID_REQUEST),
     ("GET", f"{OBJECT_PATH}?uploadId=abc123", 404, "NoSuchUpload", "<UploadId>abc123</UploadId>"),
     ("GET", "/s3/eng-artifacts/no/such.md?uploadId=", 404, "NoSuchUpload", "<UploadId></UploadId>"),
     (
@@ -2666,7 +2511,7 @@ _MEMBER_ROWS = [
         "InvalidArgument",
         "<ArgumentName>max-parts</ArgumentName><ArgumentValue>abc</ArgumentValue>",
     ),
-    ("GET", "/s3/eng-artifacts?partNumber=1", 400, "InvalidRequest", ""),
+    ("GET", "/s3/eng-artifacts?partNumber=1", *_INVALID_REQUEST),
     (
         "GET",
         "/s3/eng-artifacts/runbooks/oncall.md?uploadId=x&part-number-marker=abc",
@@ -2683,22 +2528,10 @@ _MEMBER_ROWS = [
         "MethodNotAllowed",
         "<Method>GET</Method><ResourceType>TORRENT</ResourceType>",
     ),
-    ("GET", "/s3/eng-artifacts?uploadId=x", 400, "InvalidRequest", ""),
-    ("POST", "/s3/eng-artifacts?uploadId=x", 400, "InvalidRequest", ""),
-    (
-        "GET",
-        "/s3/no-such-bucket?torrent",
-        404,
-        "NoSuchBucket",
-        "<BucketName>no-such-bucket</BucketName>",
-    ),
-    (
-        "DELETE",
-        "/s3/no-such-bucket?uploadId=x",
-        404,
-        "NoSuchBucket",
-        "<BucketName>no-such-bucket</BucketName>",
-    ),
+    ("GET", "/s3/eng-artifacts?uploadId=x", *_INVALID_REQUEST),
+    ("POST", "/s3/eng-artifacts?uploadId=x", *_INVALID_REQUEST),
+    ("GET", "/s3/no-such-bucket?torrent", *_NO_BUCKET_NAMED),
+    ("DELETE", "/s3/no-such-bucket?uploadId=x", *_NO_BUCKET_NAMED),
     # The bucket selectors real answers at a key's path are the bucket's own operations, whatever
     # the key, and name the bucket; `?logging` and `?versions` are 400s of their own there.
     (
@@ -2716,14 +2549,8 @@ _MEMBER_ROWS = [
         "<BucketName>eng-artifacts</BucketName>",
     ),
     ("GET", "/s3/eng-artifacts/runbooks/oncall.md?logging", 400, "NoLoggingStatusForKey", ""),
-    ("GET", "/s3/eng-artifacts/runbooks/oncall.md?versions", 400, "InvalidRequest", ""),
-    (
-        "GET",
-        "/s3/no-such-bucket/a.txt?versioning",
-        404,
-        "NoSuchBucket",
-        "<BucketName>no-such-bucket</BucketName>",
-    ),
+    ("GET", "/s3/eng-artifacts/runbooks/oncall.md?versions", *_INVALID_REQUEST),
+    ("GET", "/s3/no-such-bucket/a.txt?versioning", *_NO_BUCKET_NAMED),
     # This server's own refusal, which has no real body to copy.
     ("DELETE", "/s3/eng-artifacts", 501, "NotImplemented", ""),
     # A payload hash naming a trailer, on an operation that takes no upload: after the bucket and
@@ -2916,39 +2743,41 @@ def _argued(name, value=None):
     return f"<ArgumentName>{name}</ArgumentName>{value}"
 
 
+# The answers the rows below repeat.
+_VERSION_ID_X = (400, _NO_VERSION_ID, _argued("versionId", "x"))
+_BAD_VERSION_ID_X = (400, _BAD_VERSION, _argued("versionId", "x"))
+_MAX_KEYS_ABC = (
+    400,
+    "Provided max-keys not an integer or within integer range",
+    _argued("max-keys", "abc"),
+)
+_WEBSITE_V = (400, _NO_WEBSITE_VALUE, _argued("website", "v"))
+_PARAMETER_NO_BUCKET = (404, _NO_BUCKET, "<BucketName>no-such-bucket</BucketName>")
+_ANNOTATION_NAME_UNEXPECTED = (
+    400,
+    "Unexpected query string parameter",
+    _argued("ResourceType", "annotationName"),
+)
+_MARKER_WITHOUT_KEY = (
+    400,
+    "A version-id marker cannot be specified without a key marker.",
+    _argued("version-id-marker", "x"),
+)
+_BOGUS_ENCODING = (
+    400,
+    "Invalid Encoding Method specified in Request",
+    _argued("encoding-type", "bogus"),
+)
+
 # A query parameter real refuses, and which of two it refuses when both are sent: the request, and
 # the status, code, message and members of real's answer (measured 2026-09-29 against us-east-1).
 _PARAMETER_ROWS = [
     # `versionId` at a bucket's path, on each operation there.
-    ("GET", "/s3/eng-artifacts?versionId=x", 400, _NO_VERSION_ID, _argued("versionId", "x")),
-    (
-        "GET",
-        "/s3/eng-artifacts?list-type=2&versionId=x",
-        400,
-        _NO_VERSION_ID,
-        _argued("versionId", "x"),
-    ),
-    (
-        "GET",
-        "/s3/eng-artifacts?session&versionId=x",
-        400,
-        _NO_VERSION_ID,
-        _argued("versionId", "x"),
-    ),
-    (
-        "GET",
-        "/s3/eng-artifacts?versions&versionId=x",
-        400,
-        _NO_VERSION_ID,
-        _argued("versionId", "x"),
-    ),
-    (
-        "GET",
-        "/s3/eng-artifacts?uploads&versionId=x",
-        400,
-        _NO_VERSION_ID,
-        _argued("versionId", "x"),
-    ),
+    ("GET", "/s3/eng-artifacts?versionId=x", *_VERSION_ID_X),
+    ("GET", "/s3/eng-artifacts?list-type=2&versionId=x", *_VERSION_ID_X),
+    ("GET", "/s3/eng-artifacts?session&versionId=x", *_VERSION_ID_X),
+    ("GET", "/s3/eng-artifacts?versions&versionId=x", *_VERSION_ID_X),
+    ("GET", "/s3/eng-artifacts?uploads&versionId=x", *_VERSION_ID_X),
     (
         "GET",
         "/s3/eng-artifacts?versioning&versionId=",
@@ -2963,37 +2792,13 @@ _PARAMETER_ROWS = [
         _NO_VERSION_ID,
         _argued("versionId", "null"),
     ),
-    ("GET", "/s3/eng-artifacts?acl&versionId=x", 400, _BAD_VERSION, _argued("versionId", "x")),
-    (
-        "GET",
-        "/s3/no-such-bucket?versioning&versionId=x",
-        400,
-        _NO_VERSION_ID,
-        _argued("versionId", "x"),
-    ),
-    (
-        "PUT",
-        "/s3/no-such-bucket?versioning&versionId=x",
-        400,
-        _NO_VERSION_ID,
-        _argued("versionId", "x"),
-    ),
-    ("DELETE", "/s3/no-such-bucket?versionId=x", 400, _NO_VERSION_ID, _argued("versionId", "x")),
+    ("GET", "/s3/eng-artifacts?acl&versionId=x", *_BAD_VERSION_ID_X),
+    ("GET", "/s3/no-such-bucket?versioning&versionId=x", *_VERSION_ID_X),
+    ("PUT", "/s3/no-such-bucket?versioning&versionId=x", *_VERSION_ID_X),
+    ("DELETE", "/s3/no-such-bucket?versionId=x", *_VERSION_ID_X),
     # What comes before it, and what after.
-    (
-        "GET",
-        "/s3/eng-artifacts?max-keys=abc&versionId=x",
-        400,
-        "Provided max-keys not an integer or within integer range",
-        _argued("max-keys", "abc"),
-    ),
-    (
-        "GET",
-        "/s3/eng-artifacts?versions&versionId=x&max-keys=abc",
-        400,
-        "Provided max-keys not an integer or within integer range",
-        _argued("max-keys", "abc"),
-    ),
+    ("GET", "/s3/eng-artifacts?max-keys=abc&versionId=x", *_MAX_KEYS_ABC),
+    ("GET", "/s3/eng-artifacts?versions&versionId=x&max-keys=abc", *_MAX_KEYS_ABC),
     (
         "GET",
         "/s3/eng-artifacts?uploads&max-uploads=abc&versionId=x",
@@ -3022,51 +2827,21 @@ _PARAMETER_ROWS = [
         "Object must have a valid key name.",
         "",
     ),
-    ("GET", "/s3/eng-artifacts?versionId=x&delete", 400, _NO_VERSION_ID, _argued("versionId", "x")),
-    (
-        "GET",
-        "/s3/eng-artifacts?versionId=x&website=v",
-        400,
-        _NO_VERSION_ID,
-        _argued("versionId", "x"),
-    ),
-    (
-        "GET",
-        "/s3/eng-artifacts?versionId=x&max-keys=-1",
-        400,
-        _NO_VERSION_ID,
-        _argued("versionId", "x"),
-    ),
-    (
-        "GET",
-        "/s3/eng-artifacts?versionId=x&encoding-type=bogus",
-        400,
-        _NO_VERSION_ID,
-        _argued("versionId", "x"),
-    ),
+    ("GET", "/s3/eng-artifacts?versionId=x&delete", *_VERSION_ID_X),
+    ("GET", "/s3/eng-artifacts?versionId=x&website=v", *_VERSION_ID_X),
+    ("GET", "/s3/eng-artifacts?versionId=x&max-keys=-1", *_VERSION_ID_X),
+    ("GET", "/s3/eng-artifacts?versionId=x&encoding-type=bogus", *_VERSION_ID_X),
     # A valued `website`, at a bucket's path and a key's.
-    ("GET", "/s3/no-such-bucket?website=v", 400, _NO_WEBSITE_VALUE, _argued("website", "v")),
-    ("PUT", "/s3/no-such-bucket?website=v", 400, _NO_WEBSITE_VALUE, _argued("website", "v")),
+    ("GET", "/s3/no-such-bucket?website=v", *_WEBSITE_V),
+    ("PUT", "/s3/no-such-bucket?website=v", *_WEBSITE_V),
     # A key's writes read a valued `website` before the bucket too; an empty one is the write's
     # (2026-09-30).
     *[
-        (
-            method,
-            "/s3/no-such-bucket/k.txt?website=v",
-            400,
-            _NO_WEBSITE_VALUE,
-            _argued("website", "v"),
-        )
+        (method, "/s3/no-such-bucket/k.txt?website=v", *_WEBSITE_V)
         for method in ("PUT", "DELETE", "POST", "PATCH")
     ],
     *[
-        (
-            method,
-            "/s3/no-such-bucket/k.txt?website=",
-            404,
-            _NO_BUCKET,
-            "<BucketName>no-such-bucket</BucketName>",
-        )
+        (method, "/s3/no-such-bucket/k.txt?website=", *_PARAMETER_NO_BUCKET)
         for method in ("PUT", "DELETE")
     ],
     # A bucket's writes and a `versionId` (``backlot.routers.s3._VERSION_AFTER_THE_BUCKET``).
@@ -3078,53 +2853,17 @@ _PARAMETER_ROWS = [
         "<Condition>Bucket POST must be of the enclosure-type multipart/form-data</Condition>",
     ),
     *[
-        (
-            method,
-            f"/s3/no-such-bucket?{selector}&versionId=x",
-            404,
-            _NO_BUCKET,
-            "<BucketName>no-such-bucket</BucketName>",
-        )
+        (method, f"/s3/no-such-bucket?{selector}&versionId=x", *_PARAMETER_NO_BUCKET)
         for method, selector in (("PUT", "acl"), ("POST", "restore"))
     ],
     *[
-        (
-            method,
-            f"/s3/eng-artifacts?{selector}&versionId=x",
-            400,
-            _BAD_VERSION,
-            _argued("versionId", "x"),
-        )
+        (method, f"/s3/eng-artifacts?{selector}&versionId=x", *_BAD_VERSION_ID_X)
         for method, selector in (("PUT", "acl"), ("POST", "restore"))
     ],
-    (
-        "DELETE",
-        "/s3/no-such-bucket?acl&versionId=x",
-        400,
-        _NO_VERSION_ID,
-        _argued("versionId", "x"),
-    ),
-    (
-        "GET",
-        "/s3/eng-artifacts/no/such.md?website=v",
-        400,
-        _NO_WEBSITE_VALUE,
-        _argued("website", "v"),
-    ),
-    (
-        "GET",
-        "/s3/no-such-bucket?website=v&website",
-        400,
-        _NO_WEBSITE_VALUE,
-        _argued("website", "v"),
-    ),
-    (
-        "GET",
-        "/s3/no-such-bucket?website=v&max-keys=abc",
-        400,
-        _NO_WEBSITE_VALUE,
-        _argued("website", "v"),
-    ),
+    ("DELETE", "/s3/no-such-bucket?acl&versionId=x", *_VERSION_ID_X),
+    ("GET", "/s3/eng-artifacts/no/such.md?website=v", *_WEBSITE_V),
+    ("GET", "/s3/no-such-bucket?website=v&website", *_WEBSITE_V),
+    ("GET", "/s3/no-such-bucket?website=v&max-keys=abc", *_WEBSITE_V),
     (
         "GET",
         "/s3/no-such-bucket?website=v&versioning",
@@ -3133,20 +2872,8 @@ _PARAMETER_ROWS = [
         _argued("ResourceType", "versioning"),
     ),
     # `annotationName` at a key without `annotation`.
-    (
-        "GET",
-        "/s3/eng-artifacts/runbooks/oncall.md?annotationName=v",
-        400,
-        "Unexpected query string parameter",
-        _argued("ResourceType", "annotationName"),
-    ),
-    (
-        "GET",
-        "/s3/no-such-bucket/k.txt?annotationName=v",
-        400,
-        "Unexpected query string parameter",
-        _argued("ResourceType", "annotationName"),
-    ),
+    ("GET", "/s3/eng-artifacts/runbooks/oncall.md?annotationName=v", *_ANNOTATION_NAME_UNEXPECTED),
+    ("GET", "/s3/no-such-bucket/k.txt?annotationName=v", *_ANNOTATION_NAME_UNEXPECTED),
     (
         "GET",
         "/s3/eng-artifacts/runbooks/oncall.md?annotationName=v&acl",
@@ -3162,20 +2889,8 @@ _PARAMETER_ROWS = [
         _argued("ResourceType", "annotationName"),
     ),
     # ListObjectVersions' own, before the bucket and after it.
-    (
-        "GET",
-        "/s3/no-such-bucket?versions&max-keys=abc",
-        400,
-        "Provided max-keys not an integer or within integer range",
-        _argued("max-keys", "abc"),
-    ),
-    (
-        "GET",
-        "/s3/no-such-bucket?versions&version-id-marker=x",
-        400,
-        "A version-id marker cannot be specified without a key marker.",
-        _argued("version-id-marker", "x"),
-    ),
+    ("GET", "/s3/no-such-bucket?versions&max-keys=abc", *_MAX_KEYS_ABC),
+    ("GET", "/s3/no-such-bucket?versions&version-id-marker=x", *_MARKER_WITHOUT_KEY),
     (
         "GET",
         "/s3/no-such-bucket?versions&key-marker=a&version-id-marker=",
@@ -3183,13 +2898,7 @@ _PARAMETER_ROWS = [
         "A version-id marker cannot be empty.",
         _argued("version-id-marker", ""),
     ),
-    (
-        "GET",
-        "/s3/no-such-bucket?versions&key-marker=a&version-id-marker=x",
-        404,
-        "The specified bucket does not exist",
-        "<BucketName>no-such-bucket</BucketName>",
-    ),
+    ("GET", "/s3/no-such-bucket?versions&key-marker=a&version-id-marker=x", *_PARAMETER_NO_BUCKET),
     (
         "GET",
         "/s3/eng-artifacts?versions&key-marker=a&version-id-marker=x",
@@ -3204,20 +2913,8 @@ _PARAMETER_ROWS = [
         _BAD_VERSION,
         _argued("version-id-marker", "NULL"),
     ),
-    (
-        "GET",
-        "/s3/no-such-bucket?versions&encoding-type=bogus",
-        404,
-        "The specified bucket does not exist",
-        "<BucketName>no-such-bucket</BucketName>",
-    ),
-    (
-        "GET",
-        "/s3/eng-artifacts?versions&encoding-type=bogus",
-        400,
-        "Invalid Encoding Method specified in Request",
-        _argued("encoding-type", "bogus"),
-    ),
+    ("GET", "/s3/no-such-bucket?versions&encoding-type=bogus", *_PARAMETER_NO_BUCKET),
+    ("GET", "/s3/eng-artifacts?versions&encoding-type=bogus", *_BOGUS_ENCODING),
     (
         "GET",
         "/s3/eng-artifacts?versions&encoding-type=",
@@ -3225,13 +2922,7 @@ _PARAMETER_ROWS = [
         "Invalid Encoding Method specified in Request",
         _argued("encoding-type", ""),
     ),
-    (
-        "GET",
-        "/s3/no-such-bucket?versions&max-keys=-1",
-        404,
-        "The specified bucket does not exist",
-        "<BucketName>no-such-bucket</BucketName>",
-    ),
+    ("GET", "/s3/no-such-bucket?versions&max-keys=-1", *_PARAMETER_NO_BUCKET),
     (
         "GET",
         "/s3/eng-artifacts?versions&max-keys=-1",
@@ -3239,47 +2930,19 @@ _PARAMETER_ROWS = [
         "max-keys cannot be negative",
         _argued("max-keys"),
     ),
-    (
-        "GET",
-        "/s3/eng-artifacts?versions&max-keys=abc&encoding-type=bogus",
-        400,
-        "Provided max-keys not an integer or within integer range",
-        _argued("max-keys", "abc"),
-    ),
+    ("GET", "/s3/eng-artifacts?versions&max-keys=abc&encoding-type=bogus", *_MAX_KEYS_ABC),
     (
         "GET",
         "/s3/eng-artifacts?versions&encoding-type=bogus&version-id-marker=x",
-        400,
-        "A version-id marker cannot be specified without a key marker.",
-        _argued("version-id-marker", "x"),
+        *_MARKER_WITHOUT_KEY,
     ),
-    (
-        "GET",
-        "/s3/eng-artifacts?versions&max-keys=abc&version-id-marker=x",
-        400,
-        "Provided max-keys not an integer or within integer range",
-        _argued("max-keys", "abc"),
-    ),
-    (
-        "GET",
-        "/s3/eng-artifacts?versions&max-keys=-1&encoding-type=bogus",
-        400,
-        "Invalid Encoding Method specified in Request",
-        _argued("encoding-type", "bogus"),
-    ),
-    (
-        "GET",
-        "/s3/eng-artifacts?versions&max-keys=-1&version-id-marker=x",
-        400,
-        "A version-id marker cannot be specified without a key marker.",
-        _argued("version-id-marker", "x"),
-    ),
+    ("GET", "/s3/eng-artifacts?versions&max-keys=abc&version-id-marker=x", *_MAX_KEYS_ABC),
+    ("GET", "/s3/eng-artifacts?versions&max-keys=-1&encoding-type=bogus", *_BOGUS_ENCODING),
+    ("GET", "/s3/eng-artifacts?versions&max-keys=-1&version-id-marker=x", *_MARKER_WITHOUT_KEY),
     (
         "GET",
         "/s3/eng-artifacts?versions&key-marker=a.txt&version-id-marker=garbage&max-keys=abc",
-        400,
-        "Provided max-keys not an integer or within integer range",
-        _argued("max-keys", "abc"),
+        *_MAX_KEYS_ABC,
     ),
     (
         "GET",
@@ -3291,9 +2954,7 @@ _PARAMETER_ROWS = [
     (
         "GET",
         "/s3/eng-artifacts?versions&key-marker=a.txt&version-id-marker=&max-keys=abc",
-        400,
-        "Provided max-keys not an integer or within integer range",
-        _argued("max-keys", "abc"),
+        *_MAX_KEYS_ABC,
     ),
     (
         "GET",
@@ -3997,77 +3658,69 @@ def _encryption(arn=None, bucket_key=None, kind="SSE-KMS") -> bytes:
     return f"<ObjectEncryption><{kind}>{inner}</{kind}></ObjectEncryption>".encode()
 
 
+# The requests and answers the rows below repeat.
+_RESTORE = ("POST", "/s3/eng-artifacts?restore")
+_NO_USER_KEY = (400, "UserKeyMustBeSpecified", _USER_KEY, "")
+_NO_SUCH_BUCKET = (
+    404,
+    "NoSuchBucket",
+    "The specified bucket does not exist",
+    "<BucketName>no-such-bucket</BucketName>",
+)
+_DELETE = ("POST", "/s3/eng-artifacts?delete")
+_NO_CHECKSUM = (400, "InvalidRequest", _MISSING_CHECKSUM, "")
+_EMPTY_BODY = (400, "MissingRequestBodyError", "Request Body is empty", "")
+_GARBAGE_MD5 = (400, "InvalidDigest", _BAD_MD5, "<Content-MD5>garbage</Content-MD5>")
+_BAD_CRC32 = (400, "InvalidRequest", "Value for x-amz-checksum-crc32 header is invalid.", "")
+_BAD_ALGORITHM = (
+    400,
+    "InvalidRequest",
+    "The algorithm type you specified in x-amz-checksum- header is invalid.",
+    "",
+)
+_SDK_WITHOUT_CHECKSUM = (400, "InvalidRequest", _SDK_ALONE, "")
+_NOT_WELL_FORMED = (400, "MalformedXML", _MALFORMED, "")
+_WROTE_POST = (501, "NotImplemented", _WRITTEN + "POST", "")
+_DELETE_AT_KEY = ("POST", "/s3/eng-artifacts/runbooks/oncall.md?delete")
+_ENCRYPT = ("PUT", "/s3/eng-artifacts/runbooks/oncall.md?encryption")
+_ENCRYPT_MISSING = ("PUT", "/s3/eng-artifacts/no/such.md?encryption")
+_ENCRYPTION_MD5_MISMATCH = (
+    400,
+    "BadDigest",
+    "The Content-MD5 you specified did not match what we received.",
+    f"<CalculatedDigest>{_md5(b'<ObjectEncryption><SSE-S3/></ObjectEncryption>')}</CalculatedDigest><ExpectedDigest>{_md5(b'o')}</ExpectedDigest>",
+)
+_NO_SUCH_KEY = (
+    404,
+    "NoSuchKey",
+    "The specified key does not exist.",
+    "<Key>eng-artifacts/no/such.md</Key>",
+)
+_NO_KMS_ARN = (400, "InvalidRequest", f"{_KMS} target kms key arn.", "")
+_BAD_KMS = (400, "InvalidRequest", _BAD_KMS_FORMAT, "")
+_WROTE_PUT = (501, "NotImplemented", _WRITTEN + "PUT", "")
+_PUT_NEW = ("PUT", _NEW)
+_LENGTH_REQUIRED = (411, "MissingContentLength", _NO_LENGTH, "")
+_TRAILER_REFUSAL = (400, "InvalidRequest", _TRAILER_REFUSED, "")
+_PUT_TAGGING = ("PUT", "/s3/eng-artifacts/runbooks/oncall.md?tagging")
+_DELETE_OBJECT = ("DELETE", "/s3/eng-artifacts/runbooks/oncall.md")
+
 # The request, and real's answer: status, code, message and members (measured 2026-09-29 on a
 # bucket this account created, the public bucket, and a name nobody owns). A row whose answer is
 # 501 is one real performed, which is the write this server does not do.
 _WRITE_CHECK_ROWS = [
     # A bucket's `POST ?restore`.
-    ("POST", "/s3/eng-artifacts?restore", None, {}, 400, "UserKeyMustBeSpecified", _USER_KEY, ""),
-    (
-        "POST",
-        "/s3/eng-artifacts?restore",
-        b"<RestoreRequest><Days>1</Days></RestoreRequest>",
-        {},
-        400,
-        "UserKeyMustBeSpecified",
-        _USER_KEY,
-        "",
-    ),
-    (
-        "POST",
-        "/s3/no-such-bucket?restore",
-        None,
-        {},
-        404,
-        "NoSuchBucket",
-        "The specified bucket does not exist",
-        "<BucketName>no-such-bucket</BucketName>",
-    ),
+    (*_RESTORE, None, {}, *_NO_USER_KEY),
+    (*_RESTORE, b"<RestoreRequest><Days>1</Days></RestoreRequest>", {}, *_NO_USER_KEY),
+    ("POST", "/s3/no-such-bucket?restore", None, {}, *_NO_SUCH_BUCKET),
     # DeleteObjects, at a bucket's path: the headers.
-    ("POST", "/s3/eng-artifacts?delete", None, {}, 400, "InvalidRequest", _MISSING_CHECKSUM, ""),
+    (*_DELETE, None, {}, *_NO_CHECKSUM),
+    (*_DELETE, _GOOD_DELETE, {}, *_NO_CHECKSUM),
+    (*_DELETE, None, {"Content-MD5": _md5(b"")}, *_EMPTY_BODY),
+    (*_DELETE, None, {"x-amz-checksum-crc32": "AAAAAA=="}, *_EMPTY_BODY),
+    (*_DELETE, None, {"Content-MD5": "garbage"}, *_GARBAGE_MD5),
     (
-        "POST",
-        "/s3/eng-artifacts?delete",
-        _GOOD_DELETE,
-        {},
-        400,
-        "InvalidRequest",
-        _MISSING_CHECKSUM,
-        "",
-    ),
-    (
-        "POST",
-        "/s3/eng-artifacts?delete",
-        None,
-        {"Content-MD5": _md5(b"")},
-        400,
-        "MissingRequestBodyError",
-        "Request Body is empty",
-        "",
-    ),
-    (
-        "POST",
-        "/s3/eng-artifacts?delete",
-        None,
-        {"x-amz-checksum-crc32": "AAAAAA=="},
-        400,
-        "MissingRequestBodyError",
-        "Request Body is empty",
-        "",
-    ),
-    (
-        "POST",
-        "/s3/eng-artifacts?delete",
-        None,
-        {"Content-MD5": "garbage"},
-        400,
-        "InvalidDigest",
-        "The Content-MD5 you specified was invalid.",
-        "<Content-MD5>garbage</Content-MD5>",
-    ),
-    (
-        "POST",
-        "/s3/eng-artifacts?delete",
+        *_DELETE,
         _GOOD_DELETE,
         {"Content-MD5": _b64(b"x" * 15)},
         400,
@@ -4076,8 +3729,7 @@ _WRITE_CHECK_ROWS = [
         f"<Content-MD5>{_b64(b'x' * 15)}</Content-MD5>",
     ),
     (
-        "POST",
-        "/s3/eng-artifacts?delete",
+        *_DELETE,
         _GOOD_DELETE,
         {"Content-MD5": ""},
         400,
@@ -4085,40 +3737,12 @@ _WRITE_CHECK_ROWS = [
         "The Content-MD5 you specified was invalid.",
         "<Content-MD5></Content-MD5>",
     ),
-    (
-        "POST",
-        "/s3/eng-artifacts?delete",
-        _GOOD_DELETE,
-        {"x-amz-checksum-crc32": "garbage"},
-        400,
-        "InvalidRequest",
-        "Value for x-amz-checksum-crc32 header is invalid.",
-        "",
-    ),
-    (
-        "POST",
-        "/s3/eng-artifacts?delete",
-        _GOOD_DELETE,
-        {"x-amz-checksum-crc32": _b64(b"xxx")},
-        400,
-        "InvalidRequest",
-        "Value for x-amz-checksum-crc32 header is invalid.",
-        "",
-    ),
-    (
-        "POST",
-        "/s3/eng-artifacts?delete",
-        _GOOD_DELETE,
-        {"x-amz-checksum-crc32": ""},
-        400,
-        "InvalidRequest",
-        "Value for x-amz-checksum-crc32 header is invalid.",
-        "",
-    ),
+    (*_DELETE, _GOOD_DELETE, {"x-amz-checksum-crc32": "garbage"}, *_BAD_CRC32),
+    (*_DELETE, _GOOD_DELETE, {"x-amz-checksum-crc32": _b64(b"xxx")}, *_BAD_CRC32),
+    (*_DELETE, _GOOD_DELETE, {"x-amz-checksum-crc32": ""}, *_BAD_CRC32),
     *[
         (
-            "POST",
-            "/s3/eng-artifacts?delete",
+            *_DELETE,
             _GOOD_DELETE,
             {f"x-amz-checksum-{name}": "garbage"},
             400,
@@ -4137,59 +3761,13 @@ _WRITE_CHECK_ROWS = [
             "xxhash3",
         )
     ],
+    (*_DELETE, _GOOD_DELETE, {"x-amz-checksum-foo": "abc"}, *_BAD_ALGORITHM),
+    (*_DELETE, None, {"x-amz-checksum-foo": "x"}, *_BAD_ALGORITHM),
+    (*_DELETE, _GOOD_DELETE, {"x-amz-checksum-type": "FULL_OBJECT"}, *_NO_CHECKSUM),
+    (*_DELETE, _GOOD_DELETE, {"x-amz-checksum-algorithm": "CRC32"}, *_NO_CHECKSUM),
+    (*_DELETE, _GOOD_DELETE, {"x-amz-sdk-checksum-algorithm": "CRC32"}, *_SDK_WITHOUT_CHECKSUM),
     (
-        "POST",
-        "/s3/eng-artifacts?delete",
-        _GOOD_DELETE,
-        {"x-amz-checksum-foo": "abc"},
-        400,
-        "InvalidRequest",
-        "The algorithm type you specified in x-amz-checksum- header is invalid.",
-        "",
-    ),
-    (
-        "POST",
-        "/s3/eng-artifacts?delete",
-        None,
-        {"x-amz-checksum-foo": "x"},
-        400,
-        "InvalidRequest",
-        "The algorithm type you specified in x-amz-checksum- header is invalid.",
-        "",
-    ),
-    (
-        "POST",
-        "/s3/eng-artifacts?delete",
-        _GOOD_DELETE,
-        {"x-amz-checksum-type": "FULL_OBJECT"},
-        400,
-        "InvalidRequest",
-        _MISSING_CHECKSUM,
-        "",
-    ),
-    (
-        "POST",
-        "/s3/eng-artifacts?delete",
-        _GOOD_DELETE,
-        {"x-amz-checksum-algorithm": "CRC32"},
-        400,
-        "InvalidRequest",
-        _MISSING_CHECKSUM,
-        "",
-    ),
-    (
-        "POST",
-        "/s3/eng-artifacts?delete",
-        _GOOD_DELETE,
-        {"x-amz-sdk-checksum-algorithm": "CRC32"},
-        400,
-        "InvalidRequest",
-        "x-amz-sdk-checksum-algorithm specified, but no corresponding x-amz-checksum-* or x-amz-trailer headers were found.",
-        "",
-    ),
-    (
-        "POST",
-        "/s3/eng-artifacts?delete",
+        *_DELETE,
         _GOOD_DELETE,
         {
             "x-amz-checksum-crc32": _b64(zlib.crc32(_GOOD_DELETE).to_bytes(4, "big")),
@@ -4201,35 +3779,13 @@ _WRITE_CHECK_ROWS = [
         "",
     ),
     # ... and the pairs among them.
+    (*_DELETE, None, {"x-amz-checksum-crc32": "garbage"}, *_BAD_CRC32),
+    (*_DELETE, b"garbage", {"x-amz-checksum-crc32": "garbage"}, *_BAD_CRC32),
     (
-        "POST",
-        "/s3/eng-artifacts?delete",
-        None,
-        {"x-amz-checksum-crc32": "garbage"},
-        400,
-        "InvalidRequest",
-        "Value for x-amz-checksum-crc32 header is invalid.",
-        "",
-    ),
-    (
-        "POST",
-        "/s3/eng-artifacts?delete",
-        b"garbage",
-        {"x-amz-checksum-crc32": "garbage"},
-        400,
-        "InvalidRequest",
-        "Value for x-amz-checksum-crc32 header is invalid.",
-        "",
-    ),
-    (
-        "POST",
-        "/s3/eng-artifacts?delete",
+        *_DELETE,
         _GOOD_DELETE,
         {"x-amz-checksum-crc32": "garbage", "Content-MD5": "garbage"},
-        400,
-        "InvalidRequest",
-        "Value for x-amz-checksum-crc32 header is invalid.",
-        "",
+        *_BAD_CRC32,
     ),
     (
         "POST",
@@ -4246,23 +3802,11 @@ _WRITE_CHECK_ROWS = [
         "/s3/no-such-bucket?delete",
         _GOOD_DELETE,
         {"Content-MD5": "garbage"},
-        404,
-        "NoSuchBucket",
-        "The specified bucket does not exist",
-        "<BucketName>no-such-bucket</BucketName>",
+        *_NO_SUCH_BUCKET,
     ),
     # The body.
     *[
-        (
-            "POST",
-            "/s3/eng-artifacts?delete",
-            body,
-            {"Content-MD5": _md5(body)},
-            400,
-            "MalformedXML",
-            _MALFORMED,
-            "",
-        )
+        (*_DELETE, body, {"Content-MD5": _md5(body)}, *_NOT_WELL_FORMED)
         for body in (
             b"<Delete/>",
             b"<Delete><Object><Key>k</Key><VersionId>a</VersionId><VersionId>b</VersionId></Object></Delete>",
@@ -4279,43 +3823,25 @@ _WRITE_CHECK_ROWS = [
             b"garbage",
         )
     ],
+    (*_DELETE, b"garbage", {"Content-MD5": _md5(b"other")}, *_NOT_WELL_FORMED),
     (
-        "POST",
-        "/s3/eng-artifacts?delete",
-        b"garbage",
-        {"Content-MD5": _md5(b"other")},
-        400,
-        "MalformedXML",
-        _MALFORMED,
-        "",
-    ),
-    (
-        "POST",
-        "/s3/eng-artifacts?delete",
+        *_DELETE,
         b"<Delete><Object><Key></Key></Object></Delete>",
         {"Content-MD5": _md5(b"other")},
-        400,
-        "UserKeyMustBeSpecified",
-        _USER_KEY,
-        "",
+        *_NO_USER_KEY,
     ),
     (
-        "POST",
-        "/s3/eng-artifacts?delete",
+        *_DELETE,
         b"<Delete><Object><Key>x</Key></Object><Object><Key></Key></Object></Delete>",
         {
             "Content-MD5": _md5(
                 b"<Delete><Object><Key>x</Key></Object><Object><Key></Key></Object></Delete>"
             )
         },
-        400,
-        "UserKeyMustBeSpecified",
-        _USER_KEY,
-        "",
+        *_NO_USER_KEY,
     ),
     (
-        "POST",
-        "/s3/eng-artifacts?delete",
+        *_DELETE,
         _GOOD_DELETE,
         {"Content-MD5": _md5(b"other")},
         400,
@@ -4324,8 +3850,7 @@ _WRITE_CHECK_ROWS = [
         f"<CalculatedDigest>{_md5(_GOOD_DELETE)}</CalculatedDigest><ExpectedDigest>{_md5(b'other')}</ExpectedDigest>",
     ),
     (
-        "POST",
-        "/s3/eng-artifacts?delete",
+        *_DELETE,
         _GOOD_DELETE,
         {
             "x-amz-checksum-crc32": _b64(zlib.crc32(_GOOD_DELETE).to_bytes(4, "big")),
@@ -4338,8 +3863,7 @@ _WRITE_CHECK_ROWS = [
     ),
     *[
         (
-            "POST",
-            "/s3/eng-artifacts?delete",
+            *_DELETE,
             _GOOD_DELETE,
             {f"x-amz-checksum-{name}": _b64(b"x" * width)},
             400,
@@ -4362,16 +3886,7 @@ _WRITE_CHECK_ROWS = [
     ],
     # What real performed.
     *[
-        (
-            "POST",
-            "/s3/eng-artifacts?delete",
-            body,
-            {"Content-MD5": _md5(body)},
-            501,
-            "NotImplemented",
-            "A method you provided writes to the corpus, which this server does not implement: POST",
-            "",
-        )
+        (*_DELETE, body, {"Content-MD5": _md5(body)}, *_WROTE_POST)
         for body in (
             _GOOD_DELETE,
             b'<Delete xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Object><Key>k</Key></Object></Delete>',
@@ -4384,31 +3899,23 @@ _WRITE_CHECK_ROWS = [
         )
     ],
     (
-        "POST",
-        "/s3/eng-artifacts?delete",
+        *_DELETE,
         _GOOD_DELETE,
         {
             "x-amz-checksum-crc32": _b64(zlib.crc32(_GOOD_DELETE).to_bytes(4, "big")),
             "x-amz-checksum-type": "FULL_OBJECT",
         },
-        501,
-        "NotImplemented",
-        "A method you provided writes to the corpus, which this server does not implement: POST",
-        "",
+        *_WROTE_POST,
     ),
     # Each algorithm's right value for the body, and the SDK's algorithm beside it, which has to
     # name that algorithm, compared without case, or be empty, which is none (2026-09-29 and
     # 2026-09-30).
     *[
         (
-            "POST",
-            "/s3/eng-artifacts?delete",
+            *_DELETE,
             _GOOD_DELETE,
             {f"x-amz-checksum-{name}": _b64(_right_checksum(name, _GOOD_DELETE)), **sdk},
-            501,
-            "NotImplemented",
-            "A method you provided writes to the corpus, which this server does not implement: POST",
-            "",
+            *_WROTE_POST,
         )
         for name, sdk in [
             *((name, {}) for name in _CHECKSUM_NAMES),
@@ -4420,8 +3927,7 @@ _WRITE_CHECK_ROWS = [
         ]
     ],
     (
-        "POST",
-        "/s3/eng-artifacts?delete",
+        *_DELETE,
         _GOOD_DELETE,
         {
             "x-amz-checksum-crc32": _b64(zlib.crc32(_GOOD_DELETE).to_bytes(4, "big")),
@@ -4435,102 +3941,31 @@ _WRITE_CHECK_ROWS = [
     # An empty SDK algorithm beside a `Content-MD5` alone is none, and so the write; an empty
     # `x-amz-trailer` is none too, so a named algorithm beside it is refused (2026-09-30).
     (
-        "POST",
-        "/s3/eng-artifacts?delete",
+        *_DELETE,
         _GOOD_DELETE,
         {"Content-MD5": _md5(_GOOD_DELETE), "x-amz-sdk-checksum-algorithm": ""},
-        501,
-        "NotImplemented",
-        "A method you provided writes to the corpus, which this server does not implement: POST",
-        "",
+        *_WROTE_POST,
     ),
     (
-        "POST",
-        "/s3/eng-artifacts?delete",
+        *_DELETE,
         _GOOD_DELETE,
         {
             "Content-MD5": _md5(_GOOD_DELETE),
             "x-amz-sdk-checksum-algorithm": "CRC32",
             "x-amz-trailer": "",
         },
-        400,
-        "InvalidRequest",
-        _SDK_ALONE,
-        "",
+        *_SDK_WITHOUT_CHECKSUM,
     ),
     # A key's `POST ?delete` is the bucket's DeleteObjects, whatever the key.
-    (
-        "POST",
-        "/s3/eng-artifacts/runbooks/oncall.md?delete",
-        None,
-        {},
-        400,
-        "InvalidRequest",
-        _MISSING_CHECKSUM,
-        "",
-    ),
-    (
-        "POST",
-        "/s3/eng-artifacts/no/such.md?delete",
-        None,
-        {},
-        400,
-        "InvalidRequest",
-        _MISSING_CHECKSUM,
-        "",
-    ),
-    (
-        "POST",
-        "/s3/eng-artifacts/runbooks/oncall.md?delete",
-        b"<x/>",
-        {"Content-MD5": _md5(b"<x/>")},
-        400,
-        "MalformedXML",
-        _MALFORMED,
-        "",
-    ),
+    (*_DELETE_AT_KEY, None, {}, *_NO_CHECKSUM),
+    ("POST", "/s3/eng-artifacts/no/such.md?delete", None, {}, *_NO_CHECKSUM),
+    (*_DELETE_AT_KEY, b"<x/>", {"Content-MD5": _md5(b"<x/>")}, *_NOT_WELL_FORMED),
     # A key's `PUT ?encryption`.
-    (
-        "PUT",
-        "/s3/eng-artifacts/runbooks/oncall.md?encryption",
-        None,
-        {},
-        400,
-        "MissingRequestBodyError",
-        "Request Body is empty",
-        "",
-    ),
-    (
-        "PUT",
-        "/s3/eng-artifacts/no/such.md?encryption",
-        None,
-        {},
-        400,
-        "MissingRequestBodyError",
-        "Request Body is empty",
-        "",
-    ),
-    (
-        "PUT",
-        "/s3/eng-artifacts/runbooks/oncall.md?encryption",
-        None,
-        {"Content-MD5": "garbage"},
-        400,
-        "InvalidDigest",
-        "The Content-MD5 you specified was invalid.",
-        "<Content-MD5>garbage</Content-MD5>",
-    ),
+    (*_ENCRYPT, None, {}, *_EMPTY_BODY),
+    (*_ENCRYPT_MISSING, None, {}, *_EMPTY_BODY),
+    (*_ENCRYPT, None, {"Content-MD5": "garbage"}, *_GARBAGE_MD5),
     *[
-        (
-            "PUT",
-            "/s3/eng-artifacts/runbooks/oncall.md?encryption",
-            body,
-            {},
-            400,
-            "MalformedXML",
-            _MALFORMED,
-            "",
-        )
+        (*_ENCRYPT, body, {}, *_NOT_WELL_FORMED)
         for body in (
             b"<x/>",
             b"garbage",
@@ -4544,69 +3979,24 @@ _WRITE_CHECK_ROWS = [
             b"<ObjectEncryption><SSE-S3><x/></SSE-S3></ObjectEncryption>",
         )
     ],
+    (*_ENCRYPT_MISSING, b"<ObjectEncryption/>", {}, *_NOT_WELL_FORMED),
+    (*_ENCRYPT, b"<x/>", {"Content-MD5": _md5(b"o")}, *_NOT_WELL_FORMED),
     (
-        "PUT",
-        "/s3/eng-artifacts/no/such.md?encryption",
-        b"<ObjectEncryption/>",
-        {},
-        400,
-        "MalformedXML",
-        _MALFORMED,
-        "",
-    ),
-    (
-        "PUT",
-        "/s3/eng-artifacts/runbooks/oncall.md?encryption",
-        b"<x/>",
-        {"Content-MD5": _md5(b"o")},
-        400,
-        "MalformedXML",
-        _MALFORMED,
-        "",
-    ),
-    (
-        "PUT",
-        "/s3/eng-artifacts/runbooks/oncall.md?encryption",
+        *_ENCRYPT,
         b"<ObjectEncryption><SSE-S3/></ObjectEncryption>",
         {"Content-MD5": _md5(b"o")},
-        400,
-        "BadDigest",
-        "The Content-MD5 you specified did not match what we received.",
-        f"<CalculatedDigest>{_md5(b'<ObjectEncryption><SSE-S3/></ObjectEncryption>')}</CalculatedDigest><ExpectedDigest>{_md5(b'o')}</ExpectedDigest>",
+        *_ENCRYPTION_MD5_MISMATCH,
     ),
     (
-        "PUT",
-        "/s3/eng-artifacts/no/such.md?encryption",
+        *_ENCRYPT_MISSING,
         b"<ObjectEncryption><SSE-S3/></ObjectEncryption>",
         {"Content-MD5": _md5(b"o")},
-        400,
-        "BadDigest",
-        "The Content-MD5 you specified did not match what we received.",
-        f"<CalculatedDigest>{_md5(b'<ObjectEncryption><SSE-S3/></ObjectEncryption>')}</CalculatedDigest><ExpectedDigest>{_md5(b'o')}</ExpectedDigest>",
+        *_ENCRYPTION_MD5_MISMATCH,
     ),
+    (*_ENCRYPT_MISSING, b"<ObjectEncryption><SSE-S3/></ObjectEncryption>", {}, *_NO_SUCH_KEY),
+    (*_ENCRYPT_MISSING, _encryption("arn:aws:kms:us-east-1:111111111111:key/x"), {}, *_NO_SUCH_KEY),
     (
-        "PUT",
-        "/s3/eng-artifacts/no/such.md?encryption",
-        b"<ObjectEncryption><SSE-S3/></ObjectEncryption>",
-        {},
-        404,
-        "NoSuchKey",
-        "The specified key does not exist.",
-        "<Key>eng-artifacts/no/such.md</Key>",
-    ),
-    (
-        "PUT",
-        "/s3/eng-artifacts/no/such.md?encryption",
-        _encryption("arn:aws:kms:us-east-1:111111111111:key/x"),
-        {},
-        404,
-        "NoSuchKey",
-        "The specified key does not exist.",
-        "<Key>eng-artifacts/no/such.md</Key>",
-    ),
-    (
-        "PUT",
-        "/s3/eng-artifacts/runbooks/oncall.md?encryption",
+        *_ENCRYPT,
         b"<ObjectEncryption><SSE-S3/></ObjectEncryption>",
         {},
         400,
@@ -4614,30 +4004,11 @@ _WRITE_CHECK_ROWS = [
         "Target encryption type 'SSE-S3' is not supported.",
         "",
     ),
-    (
-        "PUT",
-        "/s3/eng-artifacts/runbooks/oncall.md?encryption",
-        _encryption(""),
-        {},
-        400,
-        "InvalidRequest",
-        f"{_KMS} target kms key arn.",
-        "",
-    ),
-    (
-        "PUT",
-        "/s3/eng-artifacts/runbooks/oncall.md?encryption",
-        _encryption("", "maybe"),
-        {},
-        400,
-        "InvalidRequest",
-        f"{_KMS} target kms key arn.",
-        "",
-    ),
+    (*_ENCRYPT, _encryption(""), {}, *_NO_KMS_ARN),
+    (*_ENCRYPT, _encryption("", "maybe"), {}, *_NO_KMS_ARN),
     *[
         (
-            "PUT",
-            "/s3/eng-artifacts/runbooks/oncall.md?encryption",
+            *_ENCRYPT,
             _encryption(arn, bucket_key),
             {},
             400,
@@ -4661,43 +4032,15 @@ _WRITE_CHECK_ROWS = [
             ("arn:aws:kms:us-east-1:111111111111:key/", None, "resource cannot be empty"),
         )
     ],
-    (
-        "PUT",
-        "/s3/eng-artifacts/runbooks/oncall.md?encryption",
-        _encryption("arn:aws:kms:us-east-1:111111111111:alias/x", "maybe"),
-        {},
-        400,
-        "InvalidRequest",
-        _BAD_KMS_FORMAT,
-        "",
-    ),
-    (
-        "PUT",
-        "/s3/eng-artifacts/runbooks/oncall.md?encryption",
-        _encryption("arn:aws:s3:::x"),
-        {},
-        400,
-        "InvalidRequest",
-        _BAD_KMS_FORMAT,
-        "",
-    ),
+    (*_ENCRYPT, _encryption("arn:aws:kms:us-east-1:111111111111:alias/x", "maybe"), {}, *_BAD_KMS),
+    (*_ENCRYPT, _encryption("arn:aws:s3:::x"), {}, *_BAD_KMS),
     # A key's id after `key/` (``backlot.routers.s3._is_kms_key``).
     *[
-        (
-            "PUT",
-            "/s3/eng-artifacts/runbooks/oncall.md?encryption",
-            _encryption(f"arn:aws:kms:us-east-1:111111111111:{resource}"),
-            {},
-            400,
-            "InvalidRequest",
-            _BAD_KMS_FORMAT,
-            "",
-        )
+        (*_ENCRYPT, _encryption(f"arn:aws:kms:us-east-1:111111111111:{resource}"), {}, *_BAD_KMS)
         for resource in ("key:abc", "key/abc/def", "key/abc:def", "keys/abc", "key/a b")
     ],
     (
-        "PUT",
-        "/s3/eng-artifacts/runbooks/oncall.md?encryption",
+        *_ENCRYPT,
         _encryption("arn:aws:kms:us-east-1:111111111111:key/x", "maybe"),
         {},
         400,
@@ -4708,16 +4051,7 @@ _WRITE_CHECK_ROWS = [
     # Past everything ``backlot.routers.s3._object_encryption_refusal`` checks, the write: `TRUE`
     # and a key id.
     *[
-        (
-            "PUT",
-            "/s3/eng-artifacts/runbooks/oncall.md?encryption",
-            _encryption(arn, bucket_key),
-            {},
-            501,
-            "NotImplemented",
-            "A method you provided writes to the corpus, which this server does not implement: PUT",
-            "",
-        )
+        (*_ENCRYPT, _encryption(arn, bucket_key), {}, *_WROTE_PUT)
         for arn, bucket_key in (
             ("arn:aws:kms:us-east-1:111111111111:key/x", "TRUE"),
             ("arn:aws:kms:us-east-1:111111111111:key/abc", None),
@@ -4726,16 +4060,7 @@ _WRITE_CHECK_ROWS = [
     ],
     # PutObject: a `Content-MD5` that is not one ahead of every checksum header.
     *[
-        (
-            "PUT",
-            _NEW,
-            b"hello",
-            {"Content-MD5": "garbage", **extra},
-            400,
-            "InvalidDigest",
-            _BAD_MD5,
-            "<Content-MD5>garbage</Content-MD5>",
-        )
+        (*_PUT_NEW, b"hello", {"Content-MD5": "garbage", **extra}, *_GARBAGE_MD5)
         for extra in (
             {},
             {"x-amz-checksum-crc32": "garbage"},
@@ -4749,7 +4074,7 @@ _WRITE_CHECK_ROWS = [
     # Its checksum headers, ahead of an aws-chunked payload hash and of a payload hash that the body
     # does not match.
     *[
-        ("PUT", _NEW, b"hello", {**extra, **sha}, 400, "InvalidRequest", message, "")
+        (*_PUT_NEW, b"hello", {**extra, **sha}, 400, "InvalidRequest", message, "")
         for extra, message in (
             (
                 {"x-amz-checksum-foo": "AAAAAA=="},
@@ -4773,33 +4098,14 @@ _WRITE_CHECK_ROWS = [
     ],
     # An aws-chunked payload hash with no decoded length, trailer's and signed alike.
     *[
-        (
-            "PUT",
-            _NEW,
-            b"hello",
-            {"x-amz-content-sha256": sha},
-            411,
-            "MissingContentLength",
-            _NO_LENGTH,
-            "",
-        )
+        (*_PUT_NEW, b"hello", {"x-amz-content-sha256": sha}, *_LENGTH_REQUIRED)
         for sha in (_TRAILER, "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
     ],
-    (
-        "PUT",
-        _NEW,
-        b"",
-        {"x-amz-content-sha256": _TRAILER},
-        411,
-        "MissingContentLength",
-        _NO_LENGTH,
-        "",
-    ),
+    (*_PUT_NEW, b"", {"x-amz-content-sha256": _TRAILER}, *_LENGTH_REQUIRED),
     # An aws-chunked body naming its checksum in `x-amz-trailer`, which real wrote, and the same
     # without the `x-amz-trailer` the algorithm needs.
     (
-        "PUT",
-        _NEW,
+        *_PUT_NEW,
         _chunked(b"hello world"),
         {
             "x-amz-content-sha256": _TRAILER,
@@ -4808,14 +4114,10 @@ _WRITE_CHECK_ROWS = [
             "x-amz-trailer": "x-amz-checksum-crc32",
             "x-amz-sdk-checksum-algorithm": "CRC32",
         },
-        501,
-        "NotImplemented",
-        _WRITTEN + "PUT",
-        "",
+        *_WROTE_PUT,
     ),
     (
-        "PUT",
-        _NEW,
+        *_PUT_NEW,
         _chunked(b"hello world"),
         {
             "x-amz-content-sha256": _TRAILER,
@@ -4823,17 +4125,13 @@ _WRITE_CHECK_ROWS = [
             "x-amz-decoded-content-length": "11",
             "x-amz-sdk-checksum-algorithm": "CRC32",
         },
-        400,
-        "InvalidRequest",
-        _SDK_ALONE,
-        "",
+        *_SDK_WITHOUT_CHECKSUM,
     ),
     # A payload hash the body does not match, ahead of a `Content-MD5` or a checksum it does not
     # match, an empty body too; a right one, in either case, is the write.
     *[
         (
-            "PUT",
-            _NEW,
+            *_PUT_NEW,
             body,
             {"x-amz-content-sha256": _ZEROS, **extra},
             400,
@@ -4848,16 +4146,7 @@ _WRITE_CHECK_ROWS = [
         )
     ],
     *[
-        (
-            "PUT",
-            _NEW,
-            b"hello",
-            {"x-amz-content-sha256": sha},
-            501,
-            "NotImplemented",
-            _WRITTEN + "PUT",
-            "",
-        )
+        (*_PUT_NEW, b"hello", {"x-amz-content-sha256": sha}, *_WROTE_PUT)
         for sha in (
             hashlib.sha256(b"hello").hexdigest(),
             hashlib.sha256(b"hello").hexdigest().upper(),
@@ -4867,8 +4156,7 @@ _WRITE_CHECK_ROWS = [
     # A `Content-MD5` the body does not match, named in hex, ahead of a checksum it does not match.
     *[
         (
-            "PUT",
-            _NEW,
+            *_PUT_NEW,
             b"hello",
             {"Content-MD5": _md5(b"other"), **extra},
             400,
@@ -4880,8 +4168,7 @@ _WRITE_CHECK_ROWS = [
         for extra in ({}, {"x-amz-checksum-crc32": _crc32(b"other")})
     ],
     (
-        "PUT",
-        _NEW,
+        *_PUT_NEW,
         b"hello",
         {"x-amz-checksum-crc32": _crc32(b"other")},
         400,
@@ -4890,7 +4177,7 @@ _WRITE_CHECK_ROWS = [
         "",
     ),
     *[
-        ("PUT", _NEW, b"hello", extra, 501, "NotImplemented", _WRITTEN + "PUT", "")
+        (*_PUT_NEW, b"hello", extra, *_WROTE_PUT)
         for extra in (
             {"Content-MD5": _md5(b"hello"), "x-amz-checksum-crc32": _crc32(b"hello")},
             {"x-amz-sdk-checksum-algorithm": "crc32", "x-amz-checksum-crc32": _crc32(b"hello")},
@@ -4898,23 +4185,13 @@ _WRITE_CHECK_ROWS = [
     ],
     # The bucket comes first.
     *[
-        (
-            "PUT",
-            path,
-            b"hello",
-            {"x-amz-content-sha256": sha},
-            404,
-            "NoSuchBucket",
-            "The specified bucket does not exist",
-            "<BucketName>no-such-bucket</BucketName>",
-        )
+        ("PUT", path, b"hello", {"x-amz-content-sha256": sha}, *_NO_SUCH_BUCKET)
         for path in ("/s3/no-such-bucket/k.txt", "/s3/no-such-bucket/k.txt?tagging")
         for sha in (_ZEROS, _TRAILER)
     ],
     # DeleteObjects checks the payload hash after its body, its keys and its digests.
     (
-        "POST",
-        "/s3/eng-artifacts?delete",
+        *_DELETE,
         _GOOD_DELETE,
         {"x-amz-content-sha256": _ZEROS, "Content-MD5": _md5(_GOOD_DELETE)},
         400,
@@ -4922,38 +4199,15 @@ _WRITE_CHECK_ROWS = [
         *_sha_mismatch(_GOOD_DELETE),
     ),
     (
-        "POST",
-        "/s3/eng-artifacts?delete",
+        *_DELETE,
         b"<x/>",
         {"x-amz-content-sha256": _ZEROS, "Content-MD5": _md5(b"<x/>")},
-        400,
-        "MalformedXML",
-        _MALFORMED,
-        "",
+        *_NOT_WELL_FORMED,
     ),
+    (*_DELETE, b"", {"x-amz-content-sha256": _ZEROS, "Content-MD5": _md5(b"")}, *_EMPTY_BODY),
+    (*_DELETE, _GOOD_DELETE, {"x-amz-content-sha256": _ZEROS}, *_NO_CHECKSUM),
     (
-        "POST",
-        "/s3/eng-artifacts?delete",
-        b"",
-        {"x-amz-content-sha256": _ZEROS, "Content-MD5": _md5(b"")},
-        400,
-        "MissingRequestBodyError",
-        "Request Body is empty",
-        "",
-    ),
-    (
-        "POST",
-        "/s3/eng-artifacts?delete",
-        _GOOD_DELETE,
-        {"x-amz-content-sha256": _ZEROS},
-        400,
-        "InvalidRequest",
-        _MISSING_CHECKSUM,
-        "",
-    ),
-    (
-        "POST",
-        "/s3/eng-artifacts?delete",
+        *_DELETE,
         _GOOD_DELETE,
         {"x-amz-content-sha256": _ZEROS, "Content-MD5": _md5(b"other")},
         400,
@@ -4963,63 +4217,32 @@ _WRITE_CHECK_ROWS = [
         f"<ExpectedDigest>{_md5(b'other')}</ExpectedDigest>",
     ),
     (
-        "POST",
-        "/s3/eng-artifacts?delete",
+        *_DELETE,
         _GOOD_DELETE,
         {"x-amz-content-sha256": _ZEROS, "Content-MD5": "garbage"},
-        400,
-        "InvalidDigest",
-        _BAD_MD5,
-        "<Content-MD5>garbage</Content-MD5>",
+        *_GARBAGE_MD5,
     ),
     (
-        "POST",
-        "/s3/eng-artifacts?delete",
+        *_DELETE,
         b"<Delete><Object><Key></Key></Object></Delete>",
         {
             "x-amz-content-sha256": _ZEROS,
             "Content-MD5": _md5(b"<Delete><Object><Key></Key></Object></Delete>"),
         },
-        400,
-        "UserKeyMustBeSpecified",
-        _USER_KEY,
-        "",
+        *_NO_USER_KEY,
     ),
     (
-        "POST",
-        "/s3/eng-artifacts?delete",
+        *_DELETE,
         _GOOD_DELETE,
         {"x-amz-content-sha256": _TRAILER, "Content-MD5": _md5(_GOOD_DELETE)},
-        400,
-        "InvalidRequest",
-        _TRAILER_REFUSED,
-        "",
+        *_TRAILER_REFUSAL,
     ),
     # UpdateObjectEncryption: after the schema and a `Content-MD5` the body does not match, ahead of
     # the key.
+    (*_ENCRYPT, b"<x/>", {"x-amz-content-sha256": _ZEROS}, *_NOT_WELL_FORMED),
+    (*_ENCRYPT, b"", {"x-amz-content-sha256": _ZEROS}, *_EMPTY_BODY),
     (
-        "PUT",
-        "/s3/eng-artifacts/runbooks/oncall.md?encryption",
-        b"<x/>",
-        {"x-amz-content-sha256": _ZEROS},
-        400,
-        "MalformedXML",
-        _MALFORMED,
-        "",
-    ),
-    (
-        "PUT",
-        "/s3/eng-artifacts/runbooks/oncall.md?encryption",
-        b"",
-        {"x-amz-content-sha256": _ZEROS},
-        400,
-        "MissingRequestBodyError",
-        "Request Body is empty",
-        "",
-    ),
-    (
-        "PUT",
-        "/s3/eng-artifacts/runbooks/oncall.md?encryption",
+        *_ENCRYPT,
         _encryption(kind="SSE-S3"),
         {"x-amz-content-sha256": _ZEROS, "Content-MD5": _md5(b"other")},
         400,
@@ -5047,8 +4270,7 @@ _WRITE_CHECK_ROWS = [
     # payload hash once the bucket is found, a `DELETE` does not, and the tagging and the `DELETE`
     # refuse a trailer's.
     (
-        "PUT",
-        "/s3/eng-artifacts/runbooks/oncall.md?tagging",
+        *_PUT_TAGGING,
         b"<Tagging><TagSet/></Tagging>",
         {"x-amz-content-sha256": _ZEROS},
         400,
@@ -5065,29 +4287,15 @@ _WRITE_CHECK_ROWS = [
         *_sha_mismatch(b"<VersioningConfiguration/>"),
     ),
     (
-        "PUT",
-        "/s3/eng-artifacts/runbooks/oncall.md?tagging",
+        *_PUT_TAGGING,
         b"<Tagging><TagSet/></Tagging>",
         {"x-amz-content-sha256": _TRAILER},
-        400,
-        "InvalidRequest",
-        _TRAILER_REFUSED,
-        "",
+        *_TRAILER_REFUSAL,
     ),
-    (
-        "DELETE",
-        "/s3/eng-artifacts/runbooks/oncall.md",
-        None,
-        {"x-amz-content-sha256": _TRAILER},
-        400,
-        "InvalidRequest",
-        _TRAILER_REFUSED,
-        "",
-    ),
+    (*_DELETE_OBJECT, None, {"x-amz-content-sha256": _TRAILER}, *_TRAILER_REFUSAL),
     *[
         (
-            "DELETE",
-            "/s3/eng-artifacts/runbooks/oncall.md",
+            *_DELETE_OBJECT,
             body,
             {"x-amz-content-sha256": sha},
             501,
@@ -5097,16 +4305,7 @@ _WRITE_CHECK_ROWS = [
         )
         for body, sha in ((b"hello", _ZEROS), (None, "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"))
     ],
-    (
-        "POST",
-        "/s3/eng-artifacts?restore",
-        b"<RestoreRequest/>",
-        {"x-amz-content-sha256": _ZEROS},
-        400,
-        "UserKeyMustBeSpecified",
-        _USER_KEY,
-        "",
-    ),
+    (*_RESTORE, b"<RestoreRequest/>", {"x-amz-content-sha256": _ZEROS}, *_NO_USER_KEY),
 ]
 
 
@@ -5492,6 +4691,11 @@ def _now(minutes: int = 0) -> str:
     return (datetime.now(timezone.utc) + timedelta(minutes=minutes)).strftime(AMZ_DATE_FORMAT)
 
 
+def _dated(authorization: str, minutes: int = 0) -> dict[str, str]:
+    """A V4 header's two headers: its `x-amz-date`, ``minutes`` from now, and the header itself."""
+    return {"x-amz-date": _now(minutes), "authorization": authorization}
+
+
 def _v4(
     akid: str,
     date: str,
@@ -5609,6 +4813,52 @@ def _presign(date: str, expires="3600", credential=None, algorithm=V4, **extra) 
     )
 
 
+# The answers the rows below repeat.
+_TWO_MECHANISMS = ("InvalidArgument", _ONE_MECHANISM)
+_UNSUPPORTED_SCHEME = ("InvalidArgument", "Unsupported Authorization Type")
+_NOT_ONE_SPACE = ("InvalidArgument", _NO_SPACE)
+_DATELESS = ("AccessDenied", _NO_DATE)
+_TOO_SKEWED = ("RequestTimeTooSkewed", _SKEWED)
+_WRONG_SERVICE = (
+    "AuthorizationHeaderMalformed",
+    _MALFORMED + 'incorrect service "ec2". This endpoint belongs to "s3".',
+)
+_WRONG_TERMINAL = (
+    "AuthorizationHeaderMalformed",
+    _MALFORMED + 'incorrect terminal "aws5_request". This endpoint uses "aws4_request".',
+)
+_SCOPE_DATE_DIFFERS = (
+    "AuthorizationHeaderMalformed",
+    _MALFORMED + "Invalid credential date. Date is not the same as X-Amz-Date.",
+)
+_UNKNOWN_KEY = ("InvalidAccessKeyId", _NO_KEY)
+_BAD_QUERY_ALGORITHM = (
+    "AuthorizationQueryParametersError",
+    'X-Amz-Algorithm only supports "AWS4-HMAC-SHA256 and AWS4-ECDSA-P256-SHA256"',
+)
+_NEGATIVE_EXPIRES = ("AuthorizationQueryParametersError", "X-Amz-Expires must be non-negative")
+_OVER_A_WEEK = ("AuthorizationQueryParametersError", _WEEK)
+_EXPIRED = ("AccessDenied", "Request has expired")
+_HEADER_WRONG_REGION = ("AuthorizationHeaderMalformed", _MALFORMED + _WRONG_REGION)
+_QUERY_WRONG_REGION = ("AuthorizationQueryParametersError", _QUERY_CREDENTIAL + _WRONG_REGION)
+_V2_MALFORMED = ("InvalidArgument", _V2_FORMAT)
+_V2_QUERY_INCOMPLETE = ("AccessDenied", _V2_QUERY_PARAMETERS)
+_PAYLOAD_HASH_MISSING = ("InvalidRequest", _NO_PAYLOAD_HASH, ())
+_GARBAGE_PAYLOAD_HASH = ("InvalidArgument", _BAD_PAYLOAD_HASH, _hashed("garbage"))
+_INTERNAL_500 = ("InternalError", _INTERNAL, ())
+_EMPTY_SCOPE_DATE = (
+    "AuthorizationHeaderMalformed",
+    _MALFORMED + 'incorrect date format "". ' + _DATE_FORMAT,
+    (),
+)
+_META_NOT_SIGNED = ("AccessDenied", _NOT_SIGNED, _not_signed("x-amz-meta-foo"))
+_DATE_NOT_SIGNED = ("AccessDenied", _NOT_SIGNED, _not_signed("x-amz-date"))
+_NO_REGION_SET_QUERY = (
+    "AuthorizationQueryParametersError",
+    "SigV4a query auth requires a non empty x-amz-region-set parameter.",
+    (),
+)
+
 # One fault each, and each pair whose order was measured (2026-09-29, us-east-1).
 _REFUSAL_ROWS_UNIT = [
     (
@@ -5621,99 +4871,47 @@ _REFUSAL_ROWS_UNIT = [
     ),
     # An empty header beside either query form, a valid presign and a bad algorithm alike
     # (``backlot.auth.resolve_sigv4`` has the measurement).
-    (
-        "empty header and a presign",
-        {"authorization": ""},
-        _presign(_now()),
-        "InvalidArgument",
-        _ONE_MECHANISM,
-    ),
+    ("empty header and a presign", {"authorization": ""}, _presign(_now()), *_TWO_MECHANISMS),
     (
         "empty header and X-Amz-Algorithm",
         {"authorization": ""},
         _query(X_Amz_Algorithm="zz"),
-        "InvalidArgument",
-        _ONE_MECHANISM,
+        *_TWO_MECHANISMS,
     ),
     (
         "empty header and Signature",
         {"authorization": ""},
         _query(Signature="abc", AWSAccessKeyId=AK, Expires="9999999999"),
-        "InvalidArgument",
-        _ONE_MECHANISM,
+        *_TWO_MECHANISMS,
     ),
-    (
-        "bearer",
-        {"authorization": "Bearer abc"},
-        "",
-        "InvalidArgument",
-        "Unsupported Authorization Type",
-    ),
-    (
-        "sha512",
-        {"authorization": "AWS4-HMAC-SHA512 Credential=x"},
-        "",
-        "InvalidArgument",
-        "Unsupported Authorization Type",
-    ),
-    (
-        "no space",
-        {"authorization": "AWS4-HMAC-SHA256"},
-        "",
-        "InvalidArgument",
-        "Authorization header is invalid -- one and only one ' ' (space) required",
-    ),
-    (
-        "no space before scheme",
-        {"authorization": "AWS4-HMAC-SHA512"},
-        "",
-        "InvalidArgument",
-        "Authorization header is invalid -- one and only one ' ' (space) required",
-    ),
-    ("no date", {"authorization": _v4(_UNKNOWN, _now())}, "", "AccessDenied", _NO_DATE),
-    (
-        "bad date",
-        {"x-amz-date": "garbage", "authorization": _v4(_UNKNOWN, _now())},
-        "",
-        "AccessDenied",
-        _NO_DATE,
-    ),
-    (
-        "date before parts",
-        {"authorization": "AWS4-HMAC-SHA256 nonsense"},
-        "",
-        "AccessDenied",
-        _NO_DATE,
-    ),
+    ("bearer", {"authorization": "Bearer abc"}, "", *_UNSUPPORTED_SCHEME),
+    ("sha512", {"authorization": "AWS4-HMAC-SHA512 Credential=x"}, "", *_UNSUPPORTED_SCHEME),
+    ("no space", {"authorization": "AWS4-HMAC-SHA256"}, "", *_NOT_ONE_SPACE),
+    ("no space before scheme", {"authorization": "AWS4-HMAC-SHA512"}, "", *_NOT_ONE_SPACE),
+    ("no date", {"authorization": _v4(_UNKNOWN, _now())}, "", *_DATELESS),
+    ("bad date", {"x-amz-date": "garbage", "authorization": _v4(_UNKNOWN, _now())}, "", *_DATELESS),
+    ("date before parts", {"authorization": "AWS4-HMAC-SHA256 nonsense"}, "", *_DATELESS),
     (
         "skew first",
-        {"x-amz-date": _now(-30), "authorization": _v4(_UNKNOWN, _now(-30))},
+        _dated(_v4(_UNKNOWN, _now(-30)), -30),
         "",
-        "RequestTimeTooSkewed",
-        _SKEWED,
+        *_TOO_SKEWED,
     ),
     (
         "skew before parts",
-        {"x-amz-date": _now(-30), "authorization": "AWS4-HMAC-SHA256 nonsense"},
+        _dated("AWS4-HMAC-SHA256 nonsense", -30),
         "",
-        "RequestTimeTooSkewed",
-        _SKEWED,
+        *_TOO_SKEWED,
     ),
     (
         "skew before scope",
-        {
-            "x-amz-date": _now(-30),
-            "authorization": (
-                f"AWS4-HMAC-SHA256 Credential={AK}/garbage, SignedHeaders=host, Signature=00"
-            ),
-        },
+        _dated(f"AWS4-HMAC-SHA256 Credential={AK}/garbage, SignedHeaders=host, Signature=00", -30),
         "",
-        "RequestTimeTooSkewed",
-        _SKEWED,
+        *_TOO_SKEWED,
     ),
     (
         "no parts",
-        {"x-amz-date": _now(), "authorization": "AWS4-HMAC-SHA256 nonsense"},
+        _dated("AWS4-HMAC-SHA256 nonsense"),
         "",
         "AuthorizationHeaderMalformed",
         _MALFORMED + "the authorization header requires three components: Credential, "
@@ -5721,50 +4919,40 @@ _REFUSAL_ROWS_UNIT = [
     ),
     (
         "scope",
-        {
-            "x-amz-date": _now(),
-            "authorization": (
-                f"AWS4-HMAC-SHA256 Credential={AK}/garbage, SignedHeaders=host, Signature=00"
-            ),
-        },
+        _dated(f"AWS4-HMAC-SHA256 Credential={AK}/garbage, SignedHeaders=host, Signature=00"),
         "",
         "AuthorizationHeaderMalformed",
         _MALFORMED + _SHAPE,
     ),
     (
         "service",
-        {"x-amz-date": _now(), "authorization": _v4(_UNKNOWN, _now(), service="ec2")},
+        _dated(_v4(_UNKNOWN, _now(), service="ec2")),
         "",
-        "AuthorizationHeaderMalformed",
-        _MALFORMED + 'incorrect service "ec2". This endpoint belongs to "s3".',
+        *_WRONG_SERVICE,
     ),
     (
         "terminal",
-        {"x-amz-date": _now(), "authorization": _v4(AK, _now(), terminal="aws5_request")},
+        _dated(_v4(AK, _now(), terminal="aws5_request")),
         "",
-        "AuthorizationHeaderMalformed",
-        _MALFORMED + 'incorrect terminal "aws5_request". This endpoint uses "aws4_request".',
+        *_WRONG_TERMINAL,
     ),
     (
         "scope date",
-        {"x-amz-date": _now(), "authorization": _v4(_UNKNOWN, "20200101")},
+        _dated(_v4(_UNKNOWN, "20200101")),
         "",
-        "AuthorizationHeaderMalformed",
-        _MALFORMED + "Invalid credential date. Date is not the same as X-Amz-Date.",
+        *_SCOPE_DATE_DIFFERS,
     ),
     (
         "unknown key",
-        {"x-amz-date": _now(), "authorization": _v4(_UNKNOWN, _now())},
+        _dated(_v4(_UNKNOWN, _now())),
         "",
-        "InvalidAccessKeyId",
-        _NO_KEY,
+        *_UNKNOWN_KEY,
     ),
     (
         "query algorithm",
         {},
         _query(X_Amz_Algorithm="AWS4-HMAC-SHA512", X_Amz_Signature="00"),
-        "AuthorizationQueryParametersError",
-        'X-Amz-Algorithm only supports "AWS4-HMAC-SHA256 and AWS4-ECDSA-P256-SHA256"',
+        *_BAD_QUERY_ALGORITHM,
     ),
     (
         "query parameters",
@@ -5788,20 +4976,8 @@ _REFUSAL_ROWS_UNIT = [
         "AuthorizationQueryParametersError",
         "X-Amz-Expires should be a number",
     ),
-    (
-        "query negative",
-        {},
-        _presign(_now(60), expires="-1"),
-        "AuthorizationQueryParametersError",
-        "X-Amz-Expires must be non-negative",
-    ),
-    (
-        "query a week",
-        {},
-        _presign(_now(-60 * 24 * 9), expires="604801"),
-        "AuthorizationQueryParametersError",
-        _WEEK,
-    ),
+    ("query negative", {}, _presign(_now(60), expires="-1"), *_NEGATIVE_EXPIRES),
+    ("query a week", {}, _presign(_now(-60 * 24 * 9), expires="604801"), *_OVER_A_WEEK),
     (
         "not yet valid",
         {},
@@ -5809,13 +4985,7 @@ _REFUSAL_ROWS_UNIT = [
         "AccessDenied",
         "Request is not yet valid",
     ),
-    (
-        "expiry first",
-        {},
-        _presign(_now(-600), expires="60", credential="garbage"),
-        "AccessDenied",
-        "Request has expired",
-    ),
+    ("expiry first", {}, _presign(_now(-600), expires="60", credential="garbage"), *_EXPIRED),
     (
         "query credential",
         {},
@@ -5843,93 +5013,82 @@ _REFUSAL_ROWS_UNIT = [
         "query key",
         {},
         _presign(_now(), credential=f"{_UNKNOWN}/{_now()[:8]}/us-east-1/s3/aws4_request"),
-        "InvalidAccessKeyId",
-        _NO_KEY,
+        *_UNKNOWN_KEY,
     ),
     # The region, which is the one this server presents, header and query alike.
     (
         "region",
-        {"x-amz-date": _now(), "authorization": _v4(AK, _now(), region="us-west-2")},
+        _dated(_v4(AK, _now(), region="us-west-2")),
         "",
-        "AuthorizationHeaderMalformed",
-        _MALFORMED + _WRONG_REGION,
+        *_HEADER_WRONG_REGION,
     ),
     (
         "region in capitals",
-        {"x-amz-date": _now(), "authorization": _v4(AK, _now(), region="US-EAST-1")},
+        _dated(_v4(AK, _now(), region="US-EAST-1")),
         "",
         "AuthorizationHeaderMalformed",
         _MALFORMED + "the region 'US-EAST-1' is wrong; expecting 'us-east-1'",
     ),
     (
         "region empty",
-        {"x-amz-date": _now(), "authorization": _v4(AK, _now(), region="")},
+        _dated(_v4(AK, _now(), region="")),
         "",
         "AuthorizationHeaderMalformed",
         _MALFORMED + _NO_REGION,
     ),
     (
         "region before the key",
-        {"x-amz-date": _now(), "authorization": _v4(_UNKNOWN, _now(), region="us-west-2")},
+        _dated(_v4(_UNKNOWN, _now(), region="us-west-2")),
         "",
-        "AuthorizationHeaderMalformed",
-        _MALFORMED + _WRONG_REGION,
+        *_HEADER_WRONG_REGION,
     ),
     (
         "region before the service",
-        {"x-amz-date": _now(), "authorization": _v4(AK, _now(), service="ec2", region="us-west-2")},
+        _dated(_v4(AK, _now(), service="ec2", region="us-west-2")),
         "",
-        "AuthorizationHeaderMalformed",
-        _MALFORMED + _WRONG_REGION,
+        *_HEADER_WRONG_REGION,
     ),
     (
         "region before the scope date",
-        {"x-amz-date": _now(), "authorization": _v4(AK, "20200101", region="us-west-2")},
+        _dated(_v4(AK, "20200101", region="us-west-2")),
         "",
-        "AuthorizationHeaderMalformed",
-        _MALFORMED + _WRONG_REGION,
+        *_HEADER_WRONG_REGION,
     ),
     (
         "skew before the region",
-        {"x-amz-date": _now(-30), "authorization": _v4(AK, _now(-30), region="us-west-2")},
+        _dated(_v4(AK, _now(-30), region="us-west-2"), -30),
         "",
-        "RequestTimeTooSkewed",
-        _SKEWED,
+        *_TOO_SKEWED,
     ),
     (
         "date before the region",
         {"authorization": _v4(AK, _now(), region="us-west-2")},
         "",
-        "AccessDenied",
-        _NO_DATE,
+        *_DATELESS,
     ),
     (
         "query region",
         {},
         _presign(_now(), credential=f"{AK}/{_now()[:8]}/us-west-2/s3/aws4_request"),
-        "AuthorizationQueryParametersError",
-        _QUERY_CREDENTIAL + _WRONG_REGION,
+        *_QUERY_WRONG_REGION,
     ),
     (
         "query region before the key",
         {},
         _presign(_now(), credential=f"{_UNKNOWN}/{_now()[:8]}/us-west-2/s3/aws4_request"),
-        "AuthorizationQueryParametersError",
-        _QUERY_CREDENTIAL + _WRONG_REGION,
+        *_QUERY_WRONG_REGION,
     ),
     (
         "query region before the service",
         {},
         _presign(_now(), credential=f"{AK}/{_now()[:8]}/us-west-2/ec2/aws4_request"),
-        "AuthorizationQueryParametersError",
-        _QUERY_CREDENTIAL + _WRONG_REGION,
+        *_QUERY_WRONG_REGION,
     ),
     (
         "query region before the scope date",
         {},
         _presign(_now(), credential=f"{AK}/20200101/us-west-2/s3/aws4_request"),
-        "AuthorizationQueryParametersError",
-        _QUERY_CREDENTIAL + _WRONG_REGION,
+        *_QUERY_WRONG_REGION,
     ),
     (
         "query expiry before the region",
@@ -5937,8 +5096,7 @@ _REFUSAL_ROWS_UNIT = [
         _presign(
             _now(-120), expires="60", credential=f"{AK}/{_now(-120)[:8]}/us-west-2/s3/aws4_request"
         ),
-        "AccessDenied",
-        "Request has expired",
+        *_EXPIRED,
     ),
     (
         "query a week before the region",
@@ -5946,8 +5104,7 @@ _REFUSAL_ROWS_UNIT = [
         _presign(
             _now(), expires="604801", credential=f"{AK}/{_now()[:8]}/us-west-2/s3/aws4_request"
         ),
-        "AuthorizationQueryParametersError",
-        _WEEK,
+        *_OVER_A_WEEK,
     ),
     (
         "query region empty",
@@ -5957,63 +5114,35 @@ _REFUSAL_ROWS_UNIT = [
         _QUERY_CREDENTIAL + _NO_REGION,
     ),
     # Signature Version 2 in the header, one fault at a time and the pairs measured.
-    (
-        "v2 no colon",
-        {"date": _http_date(), "authorization": "AWS garbage"},
-        "",
-        "InvalidArgument",
-        _V2_FORMAT,
-    ),
+    ("v2 no colon", {"date": _http_date(), "authorization": "AWS garbage"}, "", *_V2_MALFORMED),
     (
         "v2 empty signature",
         {"date": _http_date(), "authorization": f"AWS {AK}:"},
         "",
-        "InvalidArgument",
-        _V2_FORMAT,
+        *_V2_MALFORMED,
     ),
-    (
-        "v2 two colons",
-        {"date": _http_date(), "authorization": f"AWS {AK}:a:b"},
-        "",
-        "InvalidArgument",
-        _V2_FORMAT,
-    ),
-    (
-        "v2 format before the date",
-        {"authorization": "AWS garbage"},
-        "",
-        "InvalidArgument",
-        _V2_FORMAT,
-    ),
+    ("v2 two colons", {"date": _http_date(), "authorization": f"AWS {AK}:a:b"}, "", *_V2_MALFORMED),
+    ("v2 format before the date", {"authorization": "AWS garbage"}, "", *_V2_MALFORMED),
     (
         "v2 two spaces",
         {"date": _http_date(), "authorization": f"AWS  {AK}:abc"},
         "",
-        "InvalidArgument",
-        _NO_SPACE,
+        *_NOT_ONE_SPACE,
     ),
-    ("v2 no date", {"authorization": f"AWS {_UNKNOWN}:abc"}, "", "AccessDenied", _NO_DATE),
-    ("v2 empty key after the date", {"authorization": "AWS :abc"}, "", "AccessDenied", _NO_DATE),
-    (
-        "v2 bad date",
-        {"date": "garbage", "authorization": f"AWS {_UNKNOWN}:abc"},
-        "",
-        "AccessDenied",
-        _NO_DATE,
-    ),
+    ("v2 no date", {"authorization": f"AWS {_UNKNOWN}:abc"}, "", *_DATELESS),
+    ("v2 empty key after the date", {"authorization": "AWS :abc"}, "", *_DATELESS),
+    ("v2 bad date", {"date": "garbage", "authorization": f"AWS {_UNKNOWN}:abc"}, "", *_DATELESS),
     (
         "v2 x-amz-date read over Date",
         {"x-amz-date": "garbage", "date": _http_date(), "authorization": f"AWS {_UNKNOWN}:abc"},
         "",
-        "AccessDenied",
-        _NO_DATE,
+        *_DATELESS,
     ),
     (
         "v2 skew before the key",
         {"date": _http_date(-30), "authorization": f"AWS {_UNKNOWN}:abc"},
         "",
-        "RequestTimeTooSkewed",
-        _SKEWED,
+        *_TOO_SKEWED,
     ),
     (
         "v2 x-amz-date skewed over Date",
@@ -6023,36 +5152,31 @@ _REFUSAL_ROWS_UNIT = [
             "authorization": f"AWS {_UNKNOWN}:abc",
         },
         "",
-        "RequestTimeTooSkewed",
-        _SKEWED,
+        *_TOO_SKEWED,
     ),
     (
         "v2 unknown key",
         {"date": _http_date(), "authorization": f"AWS {_UNKNOWN}:abc"},
         "",
-        "InvalidAccessKeyId",
-        _NO_KEY,
+        *_UNKNOWN_KEY,
     ),
     (
         "v2 beside X-Amz-Algorithm",
         {"authorization": "AWS garbage"},
         "X-Amz-Algorithm=x",
-        "InvalidArgument",
-        _ONE_MECHANISM,
+        *_TWO_MECHANISMS,
     ),
     (
         "v2 beside Signature",
         {"date": _http_date(), "authorization": f"AWS {AK}:abc"},
         "Signature=abc",
-        "InvalidArgument",
-        _ONE_MECHANISM,
+        *_TWO_MECHANISMS,
     ),
     (
         "v4 beside Signature",
         {"authorization": "AWS4-HMAC-SHA256 x"},
         "Signature=abc",
-        "InvalidArgument",
-        _ONE_MECHANISM,
+        *_TWO_MECHANISMS,
     ),
     # And in the query.
     (
@@ -6064,22 +5188,19 @@ _REFUSAL_ROWS_UNIT = [
             Expires="9999999999",
             X_Amz_Algorithm="AWS4-HMAC-SHA256",
         ),
-        "InvalidArgument",
-        _ONE_MECHANISM,
+        *_TWO_MECHANISMS,
     ),
     (
         "v2 query without Expires",
         {},
         _query(Signature="abc", AWSAccessKeyId=_UNKNOWN),
-        "AccessDenied",
-        _V2_QUERY_PARAMETERS,
+        *_V2_QUERY_INCOMPLETE,
     ),
     (
         "v2 query without a key",
         {},
         _query(Signature="abc", Expires=_epoch(60)),
-        "AccessDenied",
-        _V2_QUERY_PARAMETERS,
+        *_V2_QUERY_INCOMPLETE,
     ),
     (
         "v2 query Expires a word",
@@ -6113,29 +5234,25 @@ _REFUSAL_ROWS_UNIT = [
         "v2 query expiry before the key",
         {},
         _query(Signature="abc", AWSAccessKeyId=_UNKNOWN, Expires=_epoch(-2)),
-        "AccessDenied",
-        "Request has expired",
+        *_EXPIRED,
     ),
     (
         "v2 query Expires -1",
         {},
         _query(Signature="abc", AWSAccessKeyId=_UNKNOWN, Expires="-1"),
-        "AccessDenied",
-        "Request has expired",
+        *_EXPIRED,
     ),
     (
         "v2 query Expires with a leading zero",
         {},
         _query(Signature="abc", AWSAccessKeyId=_UNKNOWN, Expires="0" + _epoch(60)),
-        "InvalidAccessKeyId",
-        _NO_KEY,
+        *_UNKNOWN_KEY,
     ),
     (
         "v2 query unknown key",
         {},
         _query(Signature="abc", AWSAccessKeyId=_UNKNOWN, Expires=_epoch(60)),
-        "InvalidAccessKeyId",
-        _NO_KEY,
+        *_UNKNOWN_KEY,
     ),
     # The header's `x-amz-content-sha256`, after its one space and its scheme and ahead of its date.
     (
@@ -6146,46 +5263,37 @@ _REFUSAL_ROWS_UNIT = [
             "authorization": _v4(_UNKNOWN, _now()),
         },
         "",
-        "InvalidRequest",
-        _NO_PAYLOAD_HASH,
-        (),
+        *_PAYLOAD_HASH_MISSING,
     ),
     (
         "payload hash before the date",
         {"x-amz-content-sha256": None, "authorization": _v4(_UNKNOWN, _now())},
         "",
-        "InvalidRequest",
-        _NO_PAYLOAD_HASH,
-        (),
+        *_PAYLOAD_HASH_MISSING,
     ),
     (
         "payload hash before the parts",
         {"x-amz-content-sha256": None, "authorization": "AWS4-HMAC-SHA256 nonsense"},
         "",
-        "InvalidRequest",
-        _NO_PAYLOAD_HASH,
-        (),
+        *_PAYLOAD_HASH_MISSING,
     ),
     (
         "scheme before the payload hash",
         {"x-amz-content-sha256": None, "authorization": "Bearer abc"},
         "",
-        "InvalidArgument",
-        "Unsupported Authorization Type",
+        *_UNSUPPORTED_SCHEME,
     ),
     (
         "one space before the payload hash",
         {"x-amz-content-sha256": None, "authorization": "AWS4-HMAC-SHA256"},
         "",
-        "InvalidArgument",
-        _NO_SPACE,
+        *_NOT_ONE_SPACE,
     ),
     (
         "v2 reads no payload hash",
         {"x-amz-content-sha256": None, "date": _http_date(), "authorization": f"AWS {_UNKNOWN}:a"},
         "",
-        "InvalidAccessKeyId",
-        _NO_KEY,
+        *_UNKNOWN_KEY,
     ),
     *[
         (
@@ -6206,9 +5314,7 @@ _REFUSAL_ROWS_UNIT = [
             "authorization": _v4(AK, _now(-30)),
         },
         "",
-        "InvalidArgument",
-        _BAD_PAYLOAD_HASH,
-        _hashed("garbage"),
+        *_GARBAGE_PAYLOAD_HASH,
     ),
     (
         "payload hash before the region",
@@ -6218,9 +5324,7 @@ _REFUSAL_ROWS_UNIT = [
             "authorization": _v4(AK, _now(), region="us-west-2"),
         },
         "",
-        "InvalidArgument",
-        _BAD_PAYLOAD_HASH,
-        _hashed("garbage"),
+        *_GARBAGE_PAYLOAD_HASH,
     ),
     *[
         (
@@ -6231,8 +5335,7 @@ _REFUSAL_ROWS_UNIT = [
                 "authorization": _v4(_UNKNOWN, _now()),
             },
             "",
-            "InvalidAccessKeyId",
-            _NO_KEY,
+            *_UNKNOWN_KEY,
         )
         for value in (
             "A" * 64,
@@ -6245,79 +5348,67 @@ _REFUSAL_ROWS_UNIT = [
         "Date alone",
         {"date": _http_date(), "authorization": _v4(_UNKNOWN, _now())},
         "",
-        "InvalidAccessKeyId",
-        _NO_KEY,
+        *_UNKNOWN_KEY,
     ),
     (
         "x-amz-date over Date",
         {"x-amz-date": "garbage", "date": _http_date(), "authorization": _v4(_UNKNOWN, _now())},
         "",
-        "AccessDenied",
-        _NO_DATE,
+        *_DATELESS,
     ),
     (
         "an empty x-amz-date over Date",
         {"x-amz-date": "", "date": _http_date(), "authorization": _v4(_UNKNOWN, _now())},
         "",
-        "AccessDenied",
-        _NO_DATE,
+        *_DATELESS,
     ),
     (
         "Date skewed",
         {"date": _http_date(-30), "authorization": _v4(_UNKNOWN, _now(-30))},
         "",
-        "RequestTimeTooSkewed",
-        _SKEWED,
+        *_TOO_SKEWED,
     ),
     (
         "Date before 1970",
         {"date": "Tue, 29 Sep 1969 16:00:00 GMT", "authorization": _v4(_UNKNOWN, _now())},
         "",
-        "AccessDenied",
-        _NO_DATE,
+        *_DATELESS,
     ),
     (
         "Date past 9999",
         {"date": "Tue, 29 Sep 10000 16:00:00 GMT", "authorization": _v4(_UNKNOWN, _now())},
         "",
-        "InternalError",
-        _INTERNAL,
-        (),
+        *_INTERNAL_500,
     ),
     (
         "x-amz-date past 9999",
         {"x-amz-date": "Tue, 29 Sep 10000 16:00:00 GMT", "authorization": _v4(_UNKNOWN, _now())},
         "",
-        "InternalError",
-        _INTERNAL,
-        (),
+        *_INTERNAL_500,
     ),
     (
         "x-amz-date in RFC 1123",
         {"x-amz-date": _http_date(), "authorization": _v4(_UNKNOWN, _now())},
         "",
-        "InvalidAccessKeyId",
-        _NO_KEY,
+        *_UNKNOWN_KEY,
     ),
     (
         "scope date in the zone sent",
         {"date": _another_day()[0], "authorization": _v4(_UNKNOWN, _another_day()[1])},
         "",
-        "AuthorizationHeaderMalformed",
-        _MALFORMED + "Invalid credential date. Date is not the same as X-Amz-Date.",
+        *_SCOPE_DATE_DIFFERS,
     ),
     (
         "scope date in UTC",
         {"date": _another_day()[0], "authorization": _v4(_UNKNOWN, _now())},
         "",
-        "InvalidAccessKeyId",
-        _NO_KEY,
+        *_UNKNOWN_KEY,
     ),
     # The scope date's format, ahead of the region and read before it is compared with the date.
     *[
         (
             f"credential date {value!r}",
-            {"x-amz-date": _now(), "authorization": _v4(AK, _now(), scope_date=value)},
+            _dated(_v4(AK, _now(), scope_date=value)),
             "",
             "AuthorizationHeaderMalformed",
             _MALFORMED + f'incorrect date format "{value}". ' + _DATE_FORMAT,
@@ -6340,28 +5431,23 @@ _REFUSAL_ROWS_UNIT = [
     *[
         (
             f"credential date {value!r} is a date",
-            {"x-amz-date": _now(), "authorization": _v4(AK, _now(), scope_date=value)},
+            _dated(_v4(AK, _now(), scope_date=value)),
             "",
-            "AuthorizationHeaderMalformed",
-            _MALFORMED + "Invalid credential date. Date is not the same as X-Amz-Date.",
+            *_SCOPE_DATE_DIFFERS,
         )
         for value in ("2026092", _now()[:8] + "x")
     ],
     (
         "credential date before the region",
-        {"x-amz-date": _now(), "authorization": _v4(AK, _now(), scope_date="", region="us-west-2")},
+        _dated(_v4(AK, _now(), scope_date="", region="us-west-2")),
         "",
-        "AuthorizationHeaderMalformed",
-        _MALFORMED + 'incorrect date format "". ' + _DATE_FORMAT,
-        (),
+        *_EMPTY_SCOPE_DATE,
     ),
     (
         "credential date before an empty region",
-        {"x-amz-date": _now(), "authorization": _v4(AK, _now(), scope_date="", region="")},
+        _dated(_v4(AK, _now(), scope_date="", region="")),
         "",
-        "AuthorizationHeaderMalformed",
-        _MALFORMED + 'incorrect date format "". ' + _DATE_FORMAT,
-        (),
+        *_EMPTY_SCOPE_DATE,
     ),
     (
         "query credential date",
@@ -6393,9 +5479,7 @@ _REFUSAL_ROWS_UNIT = [
         "x-amz-meta-foo unsigned",
         {"x-amz-date": _now(), "x-amz-meta-foo": "bar", "authorization": _v4(_UNKNOWN, _now())},
         "",
-        "AccessDenied",
-        _NOT_SIGNED,
-        _not_signed("x-amz-meta-foo"),
+        *_META_NOT_SIGNED,
     ),
     (
         "content-md5 unsigned",
@@ -6407,7 +5491,7 @@ _REFUSAL_ROWS_UNIT = [
     ),
     (
         "host unsigned",
-        {"x-amz-date": _now(), "authorization": _v4(_UNKNOWN, _now(), signed="x-amz-date")},
+        _dated(_v4(_UNKNOWN, _now(), signed="x-amz-date")),
         "",
         "AccessDenied",
         _NOT_SIGNED,
@@ -6415,11 +5499,9 @@ _REFUSAL_ROWS_UNIT = [
     ),
     (
         "x-amz-date unsigned",
-        {"x-amz-date": _now(), "authorization": _v4(_UNKNOWN, _now(), signed="host")},
+        _dated(_v4(_UNKNOWN, _now(), signed="host")),
         "",
-        "AccessDenied",
-        _NOT_SIGNED,
-        _not_signed("x-amz-date"),
+        *_DATE_NOT_SIGNED,
     ),
     (
         "unsigned in real's order",
@@ -6447,15 +5529,13 @@ _REFUSAL_ROWS_UNIT = [
             "authorization": _v4(_UNKNOWN, _now()),
         },
         "",
-        "InvalidAccessKeyId",
-        _NO_KEY,
+        *_UNKNOWN_KEY,
     ),
     (
         "scope date before unsigned",
         {"x-amz-date": _now(), "x-amz-meta-foo": "bar", "authorization": _v4(AK, "20200101")},
         "",
-        "AuthorizationHeaderMalformed",
-        _MALFORMED + "Invalid credential date. Date is not the same as X-Amz-Date.",
+        *_SCOPE_DATE_DIFFERS,
     ),
     (
         "region before unsigned",
@@ -6465,8 +5545,7 @@ _REFUSAL_ROWS_UNIT = [
             "authorization": _v4(AK, _now(), region="us-west-2"),
         },
         "",
-        "AuthorizationHeaderMalformed",
-        _MALFORMED + _WRONG_REGION,
+        *_HEADER_WRONG_REGION,
     ),
     (
         "payload hash before unsigned",
@@ -6477,32 +5556,25 @@ _REFUSAL_ROWS_UNIT = [
             "authorization": _v4(AK, _now()),
         },
         "",
-        "InvalidArgument",
-        _BAD_PAYLOAD_HASH,
-        _hashed("garbage"),
+        *_GARBAGE_PAYLOAD_HASH,
     ),
     (
         "query unsigned",
         {"x-amz-meta-foo": "bar"},
         _presign(_now(), credential=f"{_UNKNOWN}/{_now()[:8]}/us-east-1/s3/aws4_request"),
-        "AccessDenied",
-        _NOT_SIGNED,
-        _not_signed("x-amz-meta-foo"),
+        *_META_NOT_SIGNED,
     ),
     (
         "query x-amz-date header unsigned",
         {"x-amz-date": _now()},
         _presign(_now(), credential=f"{_UNKNOWN}/{_now()[:8]}/us-east-1/s3/aws4_request"),
-        "AccessDenied",
-        _NOT_SIGNED,
-        _not_signed("x-amz-date"),
+        *_DATE_NOT_SIGNED,
     ),
     (
         "query expiry before unsigned",
         {"x-amz-meta-foo": "bar"},
         _presign(_now(-600), expires="60"),
-        "AccessDenied",
-        "Request has expired",
+        *_EXPIRED,
     ),
     # `X-Amz-Expires` as a Java long.
     *[
@@ -6531,15 +5603,13 @@ _REFUSAL_ROWS_UNIT = [
         "query X-Amz-Expires the least long",
         {},
         _presign(_now(), expires="-9223372036854775808"),
-        "AuthorizationQueryParametersError",
-        "X-Amz-Expires must be non-negative",
+        *_NEGATIVE_EXPIRES,
     ),
     (
         "query X-Amz-Expires the greatest long",
         {},
         _presign(_now(), expires="9223372036854775807"),
-        "AuthorizationQueryParametersError",
-        _WEEK,
+        *_OVER_A_WEEK,
     ),
     *[
         (
@@ -6550,8 +5620,7 @@ _REFUSAL_ROWS_UNIT = [
                 expires=value,
                 credential=f"{_UNKNOWN}/{_now()[:8]}/us-east-1/s3/aws4_request",
             ),
-            "InvalidAccessKeyId",
-            _NO_KEY,
+            *_UNKNOWN_KEY,
         )
         for value in ("+300", "0300", "\u0663\u0660\u0660", "\uff13\uff10\uff10", "0" * 40 + "300")
     ],
@@ -6561,8 +5630,7 @@ _REFUSAL_ROWS_UNIT = [
         "v2 query Expires with a plus",
         {},
         _query(Signature="abc", AWSAccessKeyId=_UNKNOWN, Expires="+2147483647"),
-        "InvalidAccessKeyId",
-        _NO_KEY,
+        *_UNKNOWN_KEY,
     ),
     *[
         (
@@ -6590,9 +5658,7 @@ _REFUSAL_ROWS_UNIT = [
             f"v2 query Expires {value} is real's 500",
             {},
             _query(Signature="abc", AWSAccessKeyId=_UNKNOWN, Expires=value),
-            "InternalError",
-            _INTERNAL,
-            (),
+            *_INTERNAL_500,
         )
         for value in ("-62167219201", "-70000000000", "-9223372036854775")
     ],
@@ -6600,8 +5666,7 @@ _REFUSAL_ROWS_UNIT = [
         "v2 query Expires that wraps into the future",
         {},
         _query(Signature="abc", AWSAccessKeyId=_UNKNOWN, Expires="-9223372036854776"),
-        "InvalidAccessKeyId",
-        _NO_KEY,
+        *_UNKNOWN_KEY,
     ),
     (
         "v2 query Expires below a long",
@@ -6614,17 +5679,12 @@ _REFUSAL_ROWS_UNIT = [
         "v2 Date past 9999",
         {"date": "Tue, 29 Sep 10000 16:00:00 GMT", "authorization": f"AWS {_UNKNOWN}:abc"},
         "",
-        "InternalError",
-        _INTERNAL,
-        (),
+        *_INTERNAL_500,
     ),
     # SigV4a in the header: its scope has no region, and it signs a region set.
     (
         "v4a scope with a region",
-        {
-            "x-amz-date": _now(),
-            "authorization": _v4a(AK, _now(), scope=f"{_now()[:8]}/us-east-1/s3/aws4_request"),
-        },
+        _dated(_v4a(AK, _now(), scope=f"{_now()[:8]}/us-east-1/s3/aws4_request")),
         "",
         "AuthorizationHeaderMalformed",
         _MALFORMED + _SHAPE_4A,
@@ -6634,9 +5694,7 @@ _REFUSAL_ROWS_UNIT = [
         "v4a no payload hash",
         {"x-amz-content-sha256": None, "authorization": _v4a(AK, _now())},
         "",
-        "InvalidRequest",
-        _NO_PAYLOAD_HASH,
-        (),
+        *_PAYLOAD_HASH_MISSING,
     ),
     (
         "v4a service",
@@ -6646,37 +5704,29 @@ _REFUSAL_ROWS_UNIT = [
             "authorization": _v4a(AK, _now(), scope=f"{_now()[:8]}/ec2/aws4_request"),
         },
         "",
-        "AuthorizationHeaderMalformed",
-        _MALFORMED + 'incorrect service "ec2". This endpoint belongs to "s3".',
+        *_WRONG_SERVICE,
     ),
     (
         "v4a terminal",
-        {
-            "x-amz-date": _now(),
-            "authorization": _v4a(AK, _now(), scope=f"{_now()[:8]}/s3/aws5_request"),
-        },
+        _dated(_v4a(AK, _now(), scope=f"{_now()[:8]}/s3/aws5_request")),
         "",
-        "AuthorizationHeaderMalformed",
-        _MALFORMED + 'incorrect terminal "aws5_request". This endpoint uses "aws4_request".',
+        *_WRONG_TERMINAL,
     ),
     (
         "v4a credential date",
-        {"x-amz-date": _now(), "authorization": _v4a(AK, _now(), scope="/ec2/aws4_request")},
+        _dated(_v4a(AK, _now(), scope="/ec2/aws4_request")),
         "",
-        "AuthorizationHeaderMalformed",
-        _MALFORMED + 'incorrect date format "". ' + _DATE_FORMAT,
-        (),
+        *_EMPTY_SCOPE_DATE,
     ),
     (
         "v4a scope date before the region set",
-        {"x-amz-date": _now(), "authorization": _v4a(AK, _now(), scope="20200101/s3/aws4_request")},
+        _dated(_v4a(AK, _now(), scope="20200101/s3/aws4_request")),
         "",
-        "AuthorizationHeaderMalformed",
-        _MALFORMED + "Invalid credential date. Date is not the same as X-Amz-Date.",
+        *_SCOPE_DATE_DIFFERS,
     ),
     (
         "v4a no region set",
-        {"x-amz-date": _now(), "authorization": _v4a(_UNKNOWN, _now(), signed="host;x-amz-date")},
+        _dated(_v4a(_UNKNOWN, _now(), signed="host;x-amz-date")),
         "",
         "InvalidRequest",
         "Missing required header for this request: x-amz-region-set",
@@ -6702,9 +5752,7 @@ _REFUSAL_ROWS_UNIT = [
             "authorization": _v4a(AK, _now(), signed="host;x-amz-date"),
         },
         "",
-        "AccessDenied",
-        _NOT_SIGNED,
-        _not_signed("x-amz-meta-foo"),
+        *_META_NOT_SIGNED,
     ),
     *[
         (
@@ -6725,8 +5773,7 @@ _REFUSAL_ROWS_UNIT = [
         "v4a region set before the key",
         {"x-amz-date": _now(), "x-amz-region-set": "us-*", "authorization": _v4a(_UNKNOWN, _now())},
         "",
-        "InvalidAccessKeyId",
-        _NO_KEY,
+        *_UNKNOWN_KEY,
     ),
     # And in the query.
     (
@@ -6741,9 +5788,7 @@ _REFUSAL_ROWS_UNIT = [
         "v4a query no region set",
         {},
         _presign(_now(), credential=f"{_UNKNOWN}/{_now()[:8]}/s3/aws4_request", algorithm=V4A),
-        "AuthorizationQueryParametersError",
-        "SigV4a query auth requires a non empty x-amz-region-set parameter.",
-        (),
+        *_NO_REGION_SET_QUERY,
     ),
     (
         "v4a query region set in lower case is none",
@@ -6754,9 +5799,7 @@ _REFUSAL_ROWS_UNIT = [
             algorithm=V4A,
             x_amz_region_set="*",
         ),
-        "AuthorizationQueryParametersError",
-        "SigV4a query auth requires a non empty x-amz-region-set parameter.",
-        (),
+        *_NO_REGION_SET_QUERY,
     ),
     (
         "v4a query empty region set",
@@ -6767,9 +5810,7 @@ _REFUSAL_ROWS_UNIT = [
             algorithm=V4A,
             X_Amz_Region_Set="",
         ),
-        "AuthorizationQueryParametersError",
-        "SigV4a query auth requires a non empty x-amz-region-set parameter.",
-        (),
+        *_NO_REGION_SET_QUERY,
     ),
     (
         "v4a query region set",
@@ -6788,16 +5829,13 @@ _REFUSAL_ROWS_UNIT = [
         "v4a query unsigned before the region set",
         {"x-amz-meta-foo": "bar"},
         _presign(_now(), credential=f"{_UNKNOWN}/{_now()[:8]}/s3/aws4_request", algorithm=V4A),
-        "AccessDenied",
-        _NOT_SIGNED,
-        _not_signed("x-amz-meta-foo"),
+        *_META_NOT_SIGNED,
     ),
     (
         "v4a query algorithm in lower case",
         {},
         _presign(_now(), algorithm="aws4-ecdsa-p256-sha256"),
-        "AuthorizationQueryParametersError",
-        'X-Amz-Algorithm only supports "AWS4-HMAC-SHA256 and AWS4-ECDSA-P256-SHA256"',
+        *_BAD_QUERY_ALGORITHM,
     ),
 ]
 
