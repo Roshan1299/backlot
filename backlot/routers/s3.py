@@ -2307,11 +2307,11 @@ def _cors_preflight(request: Request, message: str) -> Response:
 
     Without an `Origin`, or with an empty one, it is the same 400 on a bucket, a key and the service
     root; with one it is a 403 whose message says which way the lookup failed, whose `ResourceType`
-    is `BUCKET` on all three, and whose `Method` is the `Access-Control-Request-Method` the preflight
-    asks about, or `OPTIONS` without one or with an empty one (measured, the service root included,
-    and the two empty values 2026-09-30). Real says "Bucket not found" for a
-    bucket that does not exist; the preflight carries no credential, so this server names every
-    bucket path as present rather than tell an anonymous caller which names the corpus holds.
+    is `BUCKET` on all three, and whose `Method` is the `Access-Control-Request-Method` the
+    preflight asks about, or `OPTIONS` without one or with an empty one (measured, the service root
+    included, and the two empty values 2026-09-30). Real says "Bucket not found" for a bucket that
+    does not exist; the preflight carries no credential, so this server names every bucket path as
+    present rather than tell an anonymous caller which names the corpus holds.
     """
     if not request.headers.get("origin"):
         return _error("BadRequest", _CORS_NEEDS_ORIGIN)
