@@ -23,7 +23,7 @@ import yaml
 from starlette.requests import Request
 
 from backlot import auth, sigv2, sigv4a, synth
-from backlot.acl import ANONYMOUS, Acl, Caller
+from backlot.acl import Acl, Caller
 from backlot.sigv4 import (
     canonical_request,
     expected_signature,
@@ -211,7 +211,8 @@ def test_s3_the_same_request_gets_the_same_pair_and_another_request_a_different_
 _KEY = "/s3/eng-artifacts/docs/runbook.md"
 
 _REFUSAL_ROWS = [
-    # path, method, status, code, a member of the body, the Allow this server sends
+    # path, method, status, code, a member of the body, the Allow this server sends, and any
+    # headers the request carries beyond the signature's
     ("/s3/eng-artifacts", "PATCH", 405, "MethodNotAllowed", "<ResourceType>BUCKET</", "GET, HEAD"),
     (
         "/s3/eng-artifacts",
@@ -228,6 +229,11 @@ _REFUSAL_ROWS = [
     ("/s3/", "PATCH", 405, "MethodNotAllowed", "<ResourceType>SERVICE</", "GET"),
     ("/s3/", "PUT", 405, "MethodNotAllowed", "<ResourceType>SERVICE</", "GET"),
     ("/s3/", "OPTIONS", 400, "BadRequest", "Origin request header needed.", None),
+    # An empty `Origin` is none on all three paths (2026-09-30).
+    *[
+        (path, "OPTIONS", 400, "BadRequest", "Origin request header needed.", None, {"Origin": ""})
+        for path in ("/s3/eng-artifacts", _KEY, "/s3/")
+    ],
     # A selector the method is not an operation of: the 405 names the selector's own type, and the
     # `Allow` is `GET` only where this server answers that selector on a GET.
     ("/s3/eng-artifacts?acl", "PATCH", 405, "MethodNotAllowed", "<ResourceType>ACL</", "GET"),
@@ -309,17 +315,20 @@ _REFUSAL_ROWS = [
 
 
 @pytest.mark.parametrize(
-    "path, method, status, code, member, allow",
-    _REFUSAL_ROWS,
-    ids=[f"{r[1]}-{r[0].rsplit('/', 1)[-1] or 'root'}" for r in _REFUSAL_ROWS],
+    "path, method, status, code, member, allow, headers",
+    [(*r, {}) if len(r) == 6 else r for r in _REFUSAL_ROWS],
+    ids=[
+        f"{r[1]}-{r[0].rsplit('/', 1)[-1] or 'root'}" + ("-" + "-".join(r[6]) if r[6:] else "")
+        for r in _REFUSAL_ROWS
+    ],
 )
 def test_s3_a_method_this_router_does_not_serve_answers_reals_own_refusal(
-    live_server, path, method, status, code, member, allow
+    live_server, path, method, status, code, member, allow, headers
 ):
     """Each row measured. The body is XML on every one, and the `Allow` names what this server
     serves rather than real's own methods, which is the line the sub-resource 405 already draws."""
     base_url, settings = live_server
-    r = _signed(base_url, path, settings.admin_token, method=method)
+    r = _signed(base_url, path, settings.admin_token, method=method, extra_headers=headers or None)
     assert r.status_code == status
     assert r.headers["content-type"] == "application/xml"
     assert f"<Code>{code}</Code>" in r.text and member in r.text
@@ -417,16 +426,17 @@ def test_s3_a_write_is_refused_as_not_implemented(live_server, path, method, bod
         ("/s3/", "Bucket not found"),
     ],
 )
-@pytest.mark.parametrize("asked", [None, "GET", "DELETE"])
+@pytest.mark.parametrize("asked", [None, "", "GET", "DELETE"])
 def test_s3_an_options_carrying_an_origin_answers_the_cors_refusal(
     live_server, path, message, asked
 ):
     """Measured: with an `Origin` the answer is a 403 whose message says which way the CORS lookup
     failed, whose `ResourceType` is `BUCKET` on all three paths, the service root included, and
-    whose `Method` is the method the preflight asks about, or `OPTIONS` when it names none."""
+    whose `Method` is the method the preflight asks about, or `OPTIONS` when it names none or an
+    empty one (2026-09-30)."""
     base_url, settings = live_server
     headers = {"Origin": "https://example.invalid"}
-    if asked:
+    if asked is not None:
         headers["Access-Control-Request-Method"] = asked
     r = _signed(base_url, path, settings.admin_token, method="OPTIONS", extra_headers=headers)
     assert r.status_code == 403
@@ -511,10 +521,14 @@ def test_s3_a_request_in_a_bucket_the_caller_cannot_see_is_nosuchbucket(live_ser
         u["email"]: u["token"] for u in yaml.safe_load(settings.tokens_path.read_text())["users"]
     }
     scoped_token = tokens["ava@acme.com"]
-    for method, path, admin_status in (
+    for method, path, admin_status, *extra in (
         ("DELETE", "/s3/people-vault", 501),
         ("POST", "/s3/people-vault?delete", 400),
         ("POST", "/s3/people-vault?restore", 400),
+        # A write's checks come after the bucket, so the scoped caller is told there is none
+        # whatever the request carries, where the admin gets the check's 400.
+        ("POST", "/s3/people-vault/comp/bands.csv?delete", 400, {"Content-MD5": "garbage"}),
+        ("PUT", "/s3/people-vault/comp/bands.csv?encryption", 400, {"Content-MD5": "garbage"}),
         ("GET", "/s3/people-vault?versioning", 200),
         ("GET", "/s3/people-vault?acl", 200),
         ("GET", "/s3/people-vault?versions", 200),
@@ -525,8 +539,9 @@ def test_s3_a_request_in_a_bucket_the_caller_cannot_see_is_nosuchbucket(live_ser
         ("HEAD", "/s3/people-vault/comp/bands.csv", 200),
         ("HEAD", "/s3/people-vault", 200),
     ):
-        scoped = _signed(base_url, path, scoped_token, method=method)
-        admin = _signed(base_url, path, settings.admin_token, method=method)
+        headers = extra[0] if extra else None
+        scoped = _signed(base_url, path, scoped_token, method=method, extra_headers=headers)
+        admin = _signed(base_url, path, settings.admin_token, method=method, extra_headers=headers)
         assert scoped.status_code == 404, path
         if method != "HEAD":
             assert "<BucketName>people-vault</BucketName>" in scoped.text, path
@@ -710,19 +725,34 @@ _ANONYMOUS_ROWS = [
     ("GET", "/s3/eng-artifacts?list-type=2&max-keys=abc", 400, "InvalidArgument"),
     ("GET", "/s3/eng-artifacts?start-after=x", 400, "InvalidArgument"),
     ("PUT", "/s3/eng-artifacts", 403, "AccessDenied"),
+    # An `X-Amz-Signature` without `X-Amz-Algorithm` and an `AWSAccessKeyId` without `Signature`
+    # carry no credential (``backlot.auth.resolve_sigv4``).
     ("GET", "/s3/eng-artifacts?list-type=2&X-Amz-Signature=00", 404, "NoSuchBucket"),
+    # The admin's own key, which the test puts in for `{admin_key}`.
+    ("GET", "/s3/eng-artifacts?list-type=2&AWSAccessKeyId={admin_key}", 404, "NoSuchBucket"),
+    (
+        "GET",
+        "/s3/eng-artifacts?list-type=2&Expires=9999999999&AWSAccessKeyId=x",
+        404,
+        "NoSuchBucket",
+    ),
+    # Nor does an empty `Authorization` with no credential in the query (2026-09-30).
+    *[
+        ("GET", f"/s3/eng-artifacts?list-type=2{query}", 404, "NoSuchBucket", {"Authorization": ""})
+        for query in ("", "&X-Amz-Signature=00", "&AWSAccessKeyId=x")
+    ],
     # ListBuckets, which real answers with a 307 to the product page and no body.
     ("GET", "/s3/", 307, None),
 ]
 
 
 @pytest.mark.parametrize(
-    "method, path, status, code",
-    _ANONYMOUS_ROWS,
-    ids=[f"{r[0]}-{r[1][4:]}" for r in _ANONYMOUS_ROWS],
+    "method, path, status, code, headers",
+    [(*r, {}) if len(r) == 4 else r for r in _ANONYMOUS_ROWS],
+    ids=[f"{r[0]}-{r[1][4:]}" + ("-empty-authorization" if r[4:] else "") for r in _ANONYMOUS_ROWS],
 )
 def test_s3_an_unsigned_request_is_an_anonymous_caller_who_sees_no_bucket(
-    live_server, method, path, status, code
+    live_server, method, path, status, code, headers
 ):
     """Every bucket gets the answer for one the caller cannot see (``backlot.routers.s3._auth``).
     The listing's parses come first, as on real. CreateBucket names no bucket, and real's refusal of
@@ -731,7 +761,8 @@ def test_s3_an_unsigned_request_is_an_anonymous_caller_who_sees_no_bucket(
     import httpx
 
     base_url, settings = live_server
-    r = httpx.request(method, f"{base_url}{path}")
+    path = path.replace("{admin_key}", synth.s3_access_key_id(settings.admin_token))
+    r = httpx.request(method, f"{base_url}{path}", headers=headers)
     assert r.status_code == status
     if code is None:
         assert r.headers["location"] == "https://aws.amazon.com/s3/" and r.content == b""
@@ -4366,7 +4397,8 @@ _WRITE_CHECK_ROWS = [
         "",
     ),
     # Each algorithm's right value for the body, and the SDK's algorithm beside it, which has to
-    # name that algorithm, compared without case (2026-09-29 and 2026-09-30).
+    # name that algorithm, compared without case, or be empty, which is none (2026-09-29 and
+    # 2026-09-30).
     *[
         (
             "POST",
@@ -4382,8 +4414,9 @@ _WRITE_CHECK_ROWS = [
             *((name, {}) for name in _CHECKSUM_NAMES),
             *(
                 ("crc32", {"x-amz-sdk-checksum-algorithm": alg})
-                for alg in ("crc32", "Crc32", "CRC32")
+                for alg in ("crc32", "Crc32", "CRC32", "")
             ),
+            ("sha256", {"x-amz-sdk-checksum-algorithm": ""}),
         ]
     ],
     (
@@ -4397,6 +4430,32 @@ _WRITE_CHECK_ROWS = [
         400,
         "InvalidRequest",
         "Value for x-amz-sdk-checksum-algorithm header is invalid.",
+        "",
+    ),
+    # An empty SDK algorithm beside a `Content-MD5` alone is none, and so the write; an empty
+    # `x-amz-trailer` is none too, so a named algorithm beside it is refused (2026-09-30).
+    (
+        "POST",
+        "/s3/eng-artifacts?delete",
+        _GOOD_DELETE,
+        {"Content-MD5": _md5(_GOOD_DELETE), "x-amz-sdk-checksum-algorithm": ""},
+        501,
+        "NotImplemented",
+        "A method you provided writes to the corpus, which this server does not implement: POST",
+        "",
+    ),
+    (
+        "POST",
+        "/s3/eng-artifacts?delete",
+        _GOOD_DELETE,
+        {
+            "Content-MD5": _md5(_GOOD_DELETE),
+            "x-amz-sdk-checksum-algorithm": "CRC32",
+            "x-amz-trailer": "",
+        },
+        400,
+        "InvalidRequest",
+        _SDK_ALONE,
         "",
     ),
     # A key's `POST ?delete` is the bucket's DeleteObjects, whatever the key.
@@ -5068,43 +5127,6 @@ def test_s3_a_write_is_checked_as_real_checks_it_before_the_501(
     assert (named[1], named[2], named[3]) == (code, message, members)
 
 
-def test_s3_a_write_is_checked_once_the_bucket_is_one_the_caller_can_see(live_server):
-    """The checks come after the bucket, so a caller who cannot see it, and an unsigned one, is told
-    there is none whatever the body says (see
-    ``test_s3_a_request_in_a_bucket_the_caller_cannot_see_is_nosuchbucket``)."""
-    import httpx
-
-    base_url, settings = live_server
-    tokens = {
-        u["email"]: u["token"] for u in yaml.safe_load(settings.tokens_path.read_text())["users"]
-    }
-    for method, path in (
-        ("POST", "/s3/people-vault?restore"),
-        ("POST", "/s3/people-vault/comp/bands.csv?delete"),
-        ("PUT", "/s3/people-vault/comp/bands.csv?encryption"),
-    ):
-        scoped = _signed(
-            base_url,
-            path,
-            tokens["ava@acme.com"],
-            method=method,
-            extra_headers={"Content-MD5": "garbage"},
-        )
-        assert (
-            scoped.status_code == 404 and "<BucketName>people-vault</BucketName>" in scoped.text
-        ), path
-        unsigned = httpx.request(method, f"{base_url}{path}", headers={"Content-MD5": "garbage"})
-        assert "<Code>NoSuchBucket</Code>" in unsigned.text, path
-        admin = _signed(
-            base_url,
-            path,
-            settings.admin_token,
-            method=method,
-            extra_headers={"Content-MD5": "garbage"},
-        )
-        assert admin.status_code == 400, path
-
-
 def test_s3_an_encryption_write_signed_with_signature_version_2_is_refused_for_it(live_server):
     """The V2 refusal ``backlot.routers.s3._object_encryption_refusal`` makes first, with a body and
     without, where V4 is checked for its body. Signed here by hand: botocore's V2 signer leaves
@@ -5596,6 +5618,29 @@ _REFUSAL_ROWS_UNIT = [
         "InvalidArgument",
         "Only one auth mechanism allowed; only the X-Amz-Algorithm query parameter, Signature "
         "query string parameter or the Authorization header should be specified",
+    ),
+    # An empty header beside either query form, a valid presign and a bad algorithm alike
+    # (``backlot.auth.resolve_sigv4`` has the measurement).
+    (
+        "empty header and a presign",
+        {"authorization": ""},
+        _presign(_now()),
+        "InvalidArgument",
+        _ONE_MECHANISM,
+    ),
+    (
+        "empty header and X-Amz-Algorithm",
+        {"authorization": ""},
+        _query(X_Amz_Algorithm="zz"),
+        "InvalidArgument",
+        _ONE_MECHANISM,
+    ),
+    (
+        "empty header and Signature",
+        {"authorization": ""},
+        _query(Signature="abc", AWSAccessKeyId=AK, Expires="9999999999"),
+        "InvalidArgument",
+        _ONE_MECHANISM,
     ),
     (
         "bearer",
@@ -7169,75 +7214,67 @@ def test_signature_version_2_signs_the_query_parameters_real_signs(where, name, 
 
 
 @pytest.mark.parametrize(
-    "query, signed, amz, headers",
+    "query, signed, amz, headers, form",
     [
-        ("versionId=v&acl", "?acl&versionId=v", "", {}),
-        ("uploads&prefix=x", "?uploads", "", {}),
-        ("acl=", "?acl", "", {}),
-        (
-            "response-content-type=a%2Fb&response-expires=x",
-            "?response-content-type=a/b&response-expires=x",
-            "",
-            {},
-        ),
-        ("x-amz-foo=1&acl", "?acl", "x-amz-foo:1\n", {}),
-        ("X-Amz-Foo=1&acl", "?acl", "x-amz-foo:1\n", {}),
-        ("partNumber=2&uploadId=a%20b", "?partNumber=2&uploadId=a b", "", {}),
-        ("tagging&tagging", "?tagging", "", {}),
-        ("acl=a&acl=b", "?acl", "", {}),
-        # A query's `x-amz-*` parameter signed over a header of its name.
-        ("x-amz-foo=1", "", "x-amz-foo:1\n", {"x-amz-foo": "2"}),
+        (*row, "header")
+        for row in (
+            ("versionId=v&acl", "?acl&versionId=v", "", {}),
+            ("uploads&prefix=x", "?uploads", "", {}),
+            ("acl=", "?acl", "", {}),
+            (
+                "response-content-type=a%2Fb&response-expires=x",
+                "?response-content-type=a/b&response-expires=x",
+                "",
+                {},
+            ),
+            ("x-amz-foo=1&acl", "?acl", "x-amz-foo:1\n", {}),
+            ("X-Amz-Foo=1&acl", "?acl", "x-amz-foo:1\n", {}),
+            ("partNumber=2&uploadId=a%20b", "?partNumber=2&uploadId=a b", "", {}),
+            ("tagging&tagging", "?tagging", "", {}),
+            ("acl=a&acl=b", "?acl", "", {}),
+            # A query's `x-amz-*` parameter signed over a header of its name.
+            ("x-amz-foo=1", "", "x-amz-foo:1\n", {"x-amz-foo": "2"}),
+        )
+    ]
+    + [
+        # A query's date line is its `Expires` as sent, and its `x-amz-*` parameters are signed.
+        ("X-Amz-Signature=00", "", "x-amz-signature:00\n", {}, "query"),
     ],
 )
 def test_signature_version_2_sorts_names_and_decodes_values_as_real_does(
-    query, signed, amz, headers
+    query, signed, amz, headers, form
 ):
     """The strings ``backlot.sigv2._resource`` and ``backlot.sigv2._amz_headers`` build, with a
     value decoded where one is signed and a name sent twice signed once (measured 2026-09-29 at a
     key over a bad secret). The mismatch names the string this server signed, which is real's, over
-    the path under the mount (``backlot.auth._verify_v2``)."""
+    the path under the mount (``backlot.auth._verify_v2``): the access key, the string, the
+    signature sent and the string's bytes, and no canonical request, which V2 has none of, in the
+    order real named them for a header over thirty samples at a bucket's path (same date)."""
     path = "/s3/eng-artifacts/runbooks/oncall.md"
-    date = _http_date()
-    req, _ = _v2_request("GET", path, query, {"date": date, **headers}, secret="x" * 40)
+    if form == "header":
+        date = _http_date()
+        req, _ = _v2_request("GET", path, query, {"date": date, **headers}, secret="x" * 40)
+    else:
+        date = _epoch(60)
+        credential = _query(AWSAccessKeyId=AK, Expires=date, Signature="abc")
+        req = _request("GET", path, f"{credential}&{query}", {"host": "backlot"})
     caller, err = auth.resolve_sigv4(req)
     assert caller is None and err.code == "SignatureDoesNotMatch"
-    under = path.removeprefix("/s3")
-    assert dict(err.members)["StringToSign"] == f"GET\n\n\n{date}\n{amz}{under}{signed}"
-
-
-def test_a_signature_version_2_mismatch_names_what_real_names():
-    """The access key, the string signed, the signature sent and the string's bytes, in that order,
-    and no canonical request, which V2 has none of; a query's date line is its `Expires` as sent
-    (measured 2026-09-29, the header over thirty samples at a bucket's path in this order every
-    time)."""
-    date = _http_date()
-    req, _ = _v2_request(
-        "GET",
-        "/s3/eng-artifacts",
-        "versioning",
-        {"date": date, "_signed": "?versioning"},
-        secret="x" * 40,
-    )
-    _, err = auth.resolve_sigv4(req)
     members = dict(err.members)
-    assert [name for name, _ in err.members] == [
-        "AWSAccessKeyId",
-        "StringToSign",
-        "SignatureProvided",
-        "StringToSignBytes",
-    ]
-    assert members["StringToSign"] == f"GET\n\n\n{date}\n/eng-artifacts?versioning"
+    under = path.removeprefix("/s3")
+    assert members["StringToSign"] == f"GET\n\n\n{date}\n{amz}{under}{signed}"
     assert members["StringToSignBytes"] == " ".join(
         f"{b:02x}" for b in members["StringToSign"].encode()
     )
-    expires = _epoch(60)
-    query = _query(AWSAccessKeyId=AK, Expires=expires, Signature="abc", X_Amz_Signature="00")
-    _, err = auth.resolve_sigv4(_request("GET", "/s3/eng-artifacts", query, {"host": "backlot"}))
-    assert (
-        dict(err.members)["StringToSign"]
-        == f"GET\n\n\n{expires}\nx-amz-signature:00\n/eng-artifacts"
-    )
-    assert dict(err.members)["SignatureProvided"] == "abc"
+    if form == "header":
+        assert [name for name, _ in err.members] == [
+            "AWSAccessKeyId",
+            "StringToSign",
+            "SignatureProvided",
+            "StringToSignBytes",
+        ]
+    else:
+        assert members["SignatureProvided"] == "abc"
 
 
 @pytest.mark.parametrize("algorithm", [V4, V4A])
@@ -7455,46 +7492,19 @@ def test_signature_version_2_signs_the_path_under_the_mount_or_the_whole_path(
     assert (err is None) == verifies
 
 
-def test_boto3_signing_with_signature_version_2_is_served_as_real_serves_it(live_server):
-    """boto3's own V2 client, path-style: ListBuckets and an object's GET and HEAD are served, as
-    real served them, and a bucket's own operations are the mismatch real answered them with
-    (2026-09-29), for the slash ``backlot.auth._verify_v2`` describes."""
-    boto3 = pytest.importorskip("boto3")
-    from botocore.config import Config
-    from botocore.exceptions import ClientError
-
-    base_url, settings = live_server
-    s3 = boto3.client(
-        "s3",
-        endpoint_url=f"{base_url}/s3",
-        aws_access_key_id=synth.s3_access_key_id(settings.admin_token),
-        aws_secret_access_key=synth.s3_secret_access_key(settings.admin_token),
-        region_name="us-east-1",
-        config=Config(signature_version="s3", s3={"addressing_style": "path"}),
-    )
-    assert "eng-artifacts" in {b["Name"] for b in s3.list_buckets()["Buckets"]}
-    assert (
-        s3.get_object(Bucket="eng-artifacts", Key="runbooks/oncall.md")["Body"].read()
-        == OBJECT_TEXT
-    )
-    assert s3.head_object(Bucket="eng-artifacts", Key="runbooks/oncall.md")["ContentLength"] == len(
-        OBJECT_TEXT
-    )
-    for call in (
-        lambda: s3.list_objects_v2(Bucket="eng-artifacts"),
-        lambda: s3.get_bucket_versioning(Bucket="eng-artifacts"),
-    ):
-        with pytest.raises(ClientError) as e:
-            call()
-        assert e.value.response["Error"]["Code"] == "SignatureDoesNotMatch"
-
-
 def test_signature_version_2_is_served_as_real_serves_it(live_server):
     """botocore's own V2 signers, header and query, against the served routes: the listings, a
     bucket's configuration, an object and its HEAD, ListBuckets, a query ten years ahead and the
-    scheme in lower case (each served on real, 2026-09-29), and a scoped caller still scoped."""
+    scheme in lower case (each served on real, 2026-09-29), and a scoped caller still scoped. Then
+    boto3's own V2 client, path-style: ListBuckets and an object's GET and HEAD are served, as real
+    served them, and a bucket's own operations are the mismatch real answered them with (same
+    date), for the slash ``backlot.auth._verify_v2`` describes."""
     import httpx
     from botocore.auth import HmacV1Auth, HmacV1QueryAuth
+    from botocore.config import Config
+    from botocore.exceptions import ClientError
+
+    boto3 = pytest.importorskip("boto3")
 
     base_url, settings = live_server
     admin = Credentials(
@@ -7535,26 +7545,29 @@ def test_signature_version_2_is_served_as_real_serves_it(live_server):
     assert v2("GET", "/s3/people-vault/comp/bands.csv").status_code == 200
     bad = v2("HEAD", "/s3/eng-artifacts", Credentials(admin.access_key, "x" * 40))
     assert (bad.status_code, bad.content) == (403, b"")
-
-
-@pytest.mark.parametrize(
-    "query",
-    [
-        "",
-        "X-Amz-Signature=00",
-        "list-type=2",
-        "AWSAccessKeyId=" + AK,
-        "Expires=9999999999&AWSAccessKeyId=x",
-    ],
-)
-def test_a_request_with_no_credential_is_the_anonymous_callers(query):
-    """A request ``backlot.auth.resolve_sigv4`` reads as carrying no credential, an
-    `X-Amz-Signature` without `X-Amz-Algorithm` and an `AWSAccessKeyId` without `Signature` among
-    them, is the anonymous caller's."""
-    caller, err = auth.resolve_sigv4(
-        _request("GET", "/s3/eng-artifacts", query, {"host": "backlot"})
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=f"{base_url}/s3",
+        aws_access_key_id=admin.access_key,
+        aws_secret_access_key=admin.secret_key,
+        region_name="us-east-1",
+        config=Config(signature_version="s3", s3={"addressing_style": "path"}),
     )
-    assert (caller, err) == (ANONYMOUS, None)
+    assert "eng-artifacts" in {b["Name"] for b in s3.list_buckets()["Buckets"]}
+    assert (
+        s3.get_object(Bucket="eng-artifacts", Key="runbooks/oncall.md")["Body"].read()
+        == OBJECT_TEXT
+    )
+    assert s3.head_object(Bucket="eng-artifacts", Key="runbooks/oncall.md")["ContentLength"] == len(
+        OBJECT_TEXT
+    )
+    for call in (
+        lambda: s3.list_objects_v2(Bucket="eng-artifacts"),
+        lambda: s3.get_bucket_versioning(Bucket="eng-artifacts"),
+    ):
+        with pytest.raises(ClientError) as e:
+            call()
+        assert e.value.response["Error"]["Code"] == "SignatureDoesNotMatch"
 
 
 # --- the two listings ------------------------------------------------------------

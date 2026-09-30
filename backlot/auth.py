@@ -554,23 +554,26 @@ def resolve_sigv4(request: Request) -> tuple[Caller | None, SigV4Refusal | None]
     Each refusal is real's own code, message and members, and they come in real's order: measured
     2026-09-29 against `s3.us-east-1.amazonaws.com`, one fault at a time and, where two could meet,
     the two together. A header beside `X-Amz-Algorithm` or `Signature` in the query is refused
-    first, whatever either says, and the two query forms beside each other. For a header it is then
-    its one space and its scheme, matched without case (anything but `AWS4-HMAC-SHA256`,
-    `AWS4-ECDSA-P256-SHA256` and V2's `AWS` is `InvalidArgument`, "Unsupported Authorization Type",
-    Bearer and `AWS4-HMAC-SHA512` alike), and after those the order each form's own function gives.
-    A mismatch names the string this server signed and, for V4 and SigV4a, the canonical request it
-    signed it over, as bytes too, the way real names its own. The canonical URI and query are the
-    raw wire path and query string (S3 signs the path verbatim, see ``_wire``)."""
+    first, whatever either says, an empty one included, and the two query forms beside each other.
+    Real's front ends split on the empty header (2026-09-30): about three in four refused it beside
+    either query form and the rest read it as absent, and this refuses it; with no credential in the
+    query, every one measured read the request as unsigned. For a header it is then its one space
+    and scheme, matched without case (anything but `AWS4-HMAC-SHA256`, `AWS4-ECDSA-P256-SHA256` and
+    V2's `AWS` is `InvalidArgument`, "Unsupported Authorization Type", Bearer and `AWS4-HMAC-SHA512`
+    alike), and after those the order each form's own function gives. A mismatch names the string
+    this server signed and, for V4 and SigV4a, the canonical request it signed it over, as bytes
+    too, the way real names its own. The canonical URI and query are the raw wire path and query
+    string (S3 signs the path verbatim, see ``_wire``)."""
     hdrs = {k.lower(): v for k, v in request.headers.items()}
     qs = request.query_params
     now = datetime.now(timezone.utc)
     authz = hdrs.get("authorization", "")
     presigned = "X-Amz-Algorithm" in qs
     v2_query = "Signature" in qs
+    argument = (("ArgumentName", "Authorization"), ("ArgumentValue", authz))
+    if "authorization" in hdrs and (presigned or v2_query):
+        return None, SigV4Refusal("InvalidArgument", _ONE_MECHANISM, argument)
     if authz:
-        argument = (("ArgumentName", "Authorization"), ("ArgumentValue", authz))
-        if presigned or v2_query:
-            return None, SigV4Refusal("InvalidArgument", _ONE_MECHANISM, argument)
         scheme, space, rest = authz.partition(" ")
         if not space:
             return None, SigV4Refusal("InvalidArgument", _NO_SPACE, argument)

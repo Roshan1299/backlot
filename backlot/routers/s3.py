@@ -17,14 +17,14 @@ a different operation at the same path. Every one of a bucket's is answered, as 
 bucket nobody configured, which is what every bucket here is (``_bucket_configuration``), and
 ``?versions`` is ListObjectVersions over the bucket's keys; ``?uploads`` (ListMultipartUploads) is
 always the empty page, since data enters through ``backlot import`` and no upload is ever in
-progress, and ``?uploadId`` at a key (ListParts) is ``NoSuchUpload`` for the same reason. A
-selector whose operations are all on another method is the 405 a GET gets on real
-(``_BUCKET_READ_REFUSED``, ``_OBJECT_READ_REFUSED``), and a few more are refused at one path the
-way real refuses them there (``_BUCKET_OBJECT_SELECTORS``, ``_KEY_BUCKET_REFUSALS``). An object's
-own are answered as real answers an object with no tags, no annotations and no checksum in a
-bucket without Object Lock (``_object_subresource``), ``?torrent`` being the 405 real gives its
-GET. The writes are refused with ``NotImplemented`` (501), after what real checks of three of them
-first (``_WRITE_CHECKS``).
+progress, and ``?uploadId`` at a key (ListParts) is ``NoSuchUpload`` for the same reason. A selector
+whose operations are all on another method is the 405 a GET gets on real (``_BUCKET_READ_REFUSED``,
+``_OBJECT_READ_REFUSED``), and a few more are refused at one path the way real refuses them there
+(``_BUCKET_OBJECT_SELECTORS``, ``_KEY_BUCKET_REFUSALS``). An object's own are answered as real
+answers an object with no tags and no annotations, written with no checksum header, in a bucket
+without Object Lock (``_object_subresource``), ``?torrent`` being the 405 real gives its GET. The
+writes are refused with ``NotImplemented`` (501), after what real checks of four of them first
+(``_WRITE_CHECKS``, ``_KEY_WRITE_CHECKS``, ``_put_object_refusal``).
 
 Object model: a bucket is the grouping/ACL unit (``s3_buckets``); an object is one doc
 (``s3_objects``), ``key`` is its address and ``content`` its verbatim body. "Folders" are pure
@@ -2144,12 +2144,12 @@ def _parse_range(header: str, total: int):
 #                                    | route here can be declared for a method that is not named
 #
 # The methods real answers by doing the write are the ones this server does not serve, so they
-# answer `NotImplemented` (501), once what real checks of three of them first finds nothing to
-# refuse (``_WRITE_CHECKS``). The rest are real's own answers. Three more deliberate differences,
-# each stated where it is made: the `Allow` names what Backlot serves rather than what real serves,
-# which is what the sub-resource 405 already does; a multipart `POST` on a bucket is refused as a
-# non-multipart one is, since an upload is a write; and a preflight names every bucket path as
-# present (`_cors_preflight`).
+# answer `NotImplemented` (501), once what real checks of four of them first finds nothing to refuse
+# (``_WRITE_CHECKS``, ``_KEY_WRITE_CHECKS``, ``_put_object_refusal``). The rest are real's own
+# answers. Three more deliberate differences, each stated where it is made: the `Allow` names what
+# Backlot serves rather than what real serves, which is what the sub-resource 405 already does; a
+# multipart `POST` on a bucket is refused as a non-multipart one is, since an upload is a write; and
+# a preflight names every bucket path as present (`_cors_preflight`).
 #
 # An unsigned request gets each method refusal a signed one gets, because real answers the method
 # first: an unsigned `PATCH` on a bucket, on a key and at the root, an unsigned `HEAD` at the root,
@@ -2304,14 +2304,15 @@ def _method_type(method: str, resource_type: str) -> str:
 def _cors_preflight(request: Request, message: str) -> Response:
     """Real's answer to an `OPTIONS`, which its CORS front end gives before anything reads the path.
 
-    Without an `Origin` it is the same 400 on a bucket, a key and the service root; with one it is
-    a 403 whose message says which way the lookup failed, whose `ResourceType` is `BUCKET` on all
-    three, and whose `Method` is the `Access-Control-Request-Method` the preflight asks about, or
-    `OPTIONS` without one (measured, the service root included). Real says "Bucket not found" for a
+    Without an `Origin`, or with an empty one, it is the same 400 on a bucket, a key and the service
+    root; with one it is a 403 whose message says which way the lookup failed, whose `ResourceType`
+    is `BUCKET` on all three, and whose `Method` is the `Access-Control-Request-Method` the preflight
+    asks about, or `OPTIONS` without one or with an empty one (measured, the service root included,
+    and the two empty values 2026-09-30). Real says "Bucket not found" for a
     bucket that does not exist; the preflight carries no credential, so this server names every
     bucket path as present rather than tell an anonymous caller which names the corpus holds.
     """
-    if request.headers.get("origin") is None:
+    if not request.headers.get("origin"):
         return _error("BadRequest", _CORS_NEEDS_ORIGIN)
     asked = request.headers.get("access-control-request-method") or "OPTIONS"
     if asked not in _CORS_METHODS:
@@ -2321,14 +2322,15 @@ def _cors_preflight(request: Request, message: str) -> Response:
 
 # --- what real checks of a write before it performs it -----------------------------------------
 #
-# Three writes real refuses on what the request carries before doing anything, and this server can
+# Four writes real refuses on what the request carries before doing anything, and this server can
 # answer them the same way before its 501: a bucket's `POST ?restore`, which names no object, a
-# `POST ?delete` at a bucket's path or a key's, DeleteObjects on the bucket either way, and a key's
-# `PUT ?encryption`, UpdateObjectEncryption. Measured 2026-09-29 against
-# `s3.us-east-1.amazonaws.com` on a bucket this account created for it, the public bucket
-# `noaa-ghcn-pds`, another account's bucket and a name nobody owns, the refusals one at a time and
-# two at once. Each comes after the credential and the bucket, as the rest of a write's answer does
-# (``_refuse_write``). What a valid request would then do is the write, which is the 501.
+# `POST ?delete` at a bucket's path or a key's, DeleteObjects on the bucket either way, a key's
+# `PUT ?encryption`, UpdateObjectEncryption, and a key's bare `PUT`, PutObject
+# (``_put_object_refusal``). Measured 2026-09-29 against `s3.us-east-1.amazonaws.com` on a bucket
+# this account created for it, the public bucket `noaa-ghcn-pds`, another account's bucket and a
+# name nobody owns, the refusals one at a time and two at once. Each comes after the credential and
+# the bucket, as the rest of a write's answer does (``_refuse_write``). What a valid request would
+# then do is the write, which is the 501.
 _MALFORMED_XML = (
     "The XML you provided was not well-formed or did not validate against our published schema"
 )
@@ -2514,7 +2516,10 @@ def _checksum_headers(headers) -> tuple[tuple[str, bytes] | None, Response | Non
     value that is not one; then an `x-amz-sdk-checksum-algorithm` with none of them and no
     `x-amz-trailer`, which names the checksum an aws-chunked body carries after it, and one naming
     another algorithm, compared without case. PutObject and DeleteObjects read them alike, and an
-    aws-chunked PutObject naming its checksum in `x-amz-trailer` was served (2026-09-29)."""
+    aws-chunked PutObject naming its checksum in `x-amz-trailer` was served (2026-09-29). An empty
+    `x-amz-sdk-checksum-algorithm` or `x-amz-trailer` is none, where an empty checksum value is one
+    that is not one: real took DeleteObjects with the first empty beside a checksum and beside none,
+    and refused the second empty beside a named algorithm (2026-09-30)."""
     named = {
         name[len("x-amz-checksum-") :]: value
         for name, value in headers.items()
@@ -2537,8 +2542,8 @@ def _checksum_headers(headers) -> tuple[tuple[str, bytes] | None, Response | Non
         if checksum[1] is None:
             message = f"Value for x-amz-checksum-{name} header is invalid."
             return None, _error("InvalidRequest", message)
-    algorithm = headers.get("x-amz-sdk-checksum-algorithm")
-    if algorithm is not None and checksum is None and "x-amz-trailer" not in headers:
+    algorithm = headers.get("x-amz-sdk-checksum-algorithm") or None
+    if algorithm is not None and checksum is None and not headers.get("x-amz-trailer"):
         return None, _error(
             "InvalidRequest",
             "x-amz-sdk-checksum-algorithm specified, but no corresponding x-amz-checksum-* or "
@@ -2766,7 +2771,8 @@ async def _refuse_write(
 ) -> Response:
     """The 501 for a write, or ``instead``, once the credential and, unless ``resolve`` is false,
     the bucket it names resolve, and once ``validate`` — what real checks of the request before it
-    performs the write (``_WRITE_CHECKS``) — finds nothing to refuse.
+    performs the write (``_WRITE_CHECKS``, ``_KEY_WRITE_CHECKS``, ``_put_object_refusal``) — finds
+    nothing to refuse.
 
     Real answers a write naming a bucket that does not exist — a `DELETE`, a key's `PUT`, a
     selector's own method such as `POST ?delete` or `PUT ?acl` — with `NoSuchBucket` at 404, where
