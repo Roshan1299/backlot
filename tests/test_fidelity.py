@@ -882,6 +882,7 @@ S3_MODEL = {
     "operations": {
         "ListObjectsV2": {"http": {"method": "GET", "requestUri": "/{Bucket}?list-type=2"}},
         "GetBucketAcl": {"http": {"method": "GET", "requestUri": "/{Bucket}?acl"}},
+        "GetBucketCors": {"http": {"method": "GET", "requestUri": "/{Bucket}?cors"}},
         "GetObjectTagging": {"http": {"method": "GET", "requestUri": "/{Bucket}/{Key+}?tagging"}},
         "ListBuckets": {"http": {"method": "GET", "requestUri": "/"}},
         "PutBucketAcl": {"http": {"method": "PUT", "requestUri": "/{Bucket}?acl"}},
@@ -931,36 +932,51 @@ def test_the_s3_model_yields_read_operations_keyed_by_what_selects_them():
 _LISTING = '<?xml version="1.0"?><ListBucketResult><Name>b</Name></ListBucketResult>'
 
 
+def _s3_error(code: str) -> str:
+    return f"<Error><Code>{code}</Code></Error>"
+
+
 @pytest.mark.parametrize(
-    "acl, tagging, expected",
+    "answers, expected",
     [
         # The failure a path diff cannot see: not refused, not implemented, answered 200 with
         # whatever the catch-all route returns; and `NotImplemented`, the refusal.
         (
-            (200, _LISTING),
-            (400, "<Error><Code>NotImplemented</Code></Error>"),
+            {"acl": (200, _LISTING), "tagging": (400, _s3_error("NotImplemented"))},
             {
                 "GetBucketAcl": ("silent_fallthrough", BREAKING),
                 "GetObjectTagging": ("missing_operation", GAP),
             },
         ),
-        # A 404 naming a vendor code is what an implemented operation answers where nothing is
-        # configured, as real's `NoSuchCORSConfiguration` is; the same status with
-        # `NotImplemented` is still the refusal.
+        # The error real gives an operation is its answer, as real's `NoSuchCORSConfiguration` is
+        # for a bucket nobody configured; the same status with `NotImplemented` is still the
+        # refusal.
         (
-            (404, "<Error><Code>NoSuchCORSConfiguration</Code></Error>"),
-            (404, "<Error><Code>NotImplemented</Code></Error>"),
-            {"GetBucketAcl": None, "GetObjectTagging": ("missing_operation", GAP)},
+            {
+                "cors": (404, _s3_error("NoSuchCORSConfiguration")),
+                "tagging": (404, _s3_error("NotImplemented")),
+            },
+            {"GetBucketCors": None, "GetObjectTagging": ("missing_operation", GAP)},
+        ),
+        # Any other error is this server refusing what real answers: a 405 where real's is a 200,
+        # and a 400 where real's is that 404.
+        (
+            {
+                "acl": (405, _s3_error("MethodNotAllowed")),
+                "cors": (400, _s3_error("InvalidRequest")),
+            },
+            {
+                "GetBucketAcl": ("unexpected_error", BREAKING),
+                "GetBucketCors": ("unexpected_error", BREAKING),
+            },
         ),
     ],
-    ids=["another-operations-body", "a-vendors-own-error"],
+    ids=["another-operations-body", "a-vendors-own-error", "an-error-real-does-not-give"],
 )
-def test_an_operation_is_judged_by_what_the_server_answers_it_with(
-    monkeypatch, acl, tagging, expected
-):
+def test_an_operation_is_judged_by_what_the_server_answers_it_with(monkeypatch, answers, expected):
     def fake(method, url, headers=None, timeout=None):
-        for selector, (status, text) in (("tagging", tagging), ("acl", acl)):
-            if selector in url:
+        for selector, (status, text) in answers.items():
+            if f"?{selector}" in url:
                 return httpx.Response(status, text=text)
         return httpx.Response(200, text=_LISTING)
 
