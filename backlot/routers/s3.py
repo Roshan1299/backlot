@@ -533,10 +533,11 @@ def _error(
     `NoSuchKey`, alone on GetObject and with its bucket on `?tagging` and UpdateObjectEncryption,
     `ArgumentName` and mostly `ArgumentValue` for `InvalidArgument`, `RangeRequested` and
     `ActualObjectSize` for `InvalidRange`, and `Method` and `ResourceType` for `MethodNotAllowed`.
-    Measured 2026-09-29 against `s3.us-east-1.amazonaws.com` over fifty-three error bodies of nine
-    codes, a key in an absent bucket and a missing key under a prefix among them; none carried a
-    `Resource`. `NotImplemented` is this server's own refusal, with no real body to copy, and names
-    nothing. A credential refusal's members are the ones ``backlot.auth.resolve_sigv4`` names
+    Measured 2026-09-29 and 2026-09-30 against `s3.us-east-1.amazonaws.com`: none of the 267
+    distinct error bodies of 34 codes those days' captures hold, request ids set aside, carried a
+    `Resource`, a key in an absent bucket and a missing key under a prefix among them.
+    `NotImplemented` is this server's own refusal, with no real body to copy, and names nothing. A
+    credential refusal's members are the ones ``backlot.auth.resolve_sigv4`` names
     (``_refused_credential``)."""
     ids = REQUEST_IDS.get()
     # Real names them last, after the members that describe the failure (measured over seven error
