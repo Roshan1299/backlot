@@ -559,6 +559,7 @@ def _gmail_ids(row) -> tuple[str, str]:
 @router.get(
     "/gmail/v1/users/{user_id}/messages",
     response_model=GmailMessageList,
+    response_model_exclude_unset=True,
     openapi_extra={"parameters": _P_GMAIL_LIST},
 )
 async def gmail_messages_list(user_id: str, request: Request):
@@ -580,7 +581,10 @@ async def gmail_messages_list(user_id: str, request: Request):
         rows = store.list_gmail_in_range(conn, mailbox, None, None, ids, limit=limit, offset=offset)
     # threadId must agree with messages.get (a reply belongs to its root's thread)
     messages = [dict(zip(("id", "threadId"), _gmail_ids(r))) for r in rows]
-    body = {"messages": messages, "resultSizeEstimate": total}
+    # A list with no match leaves `messages` out rather than sending `[]` — measured on 2026-09-30
+    # (#382), so a client that reads `response["messages"]` meets the KeyError it meets there.
+    body = {"messages": messages} if messages else {}
+    body["resultSizeEstimate"] = total
     token = next_page_token(offset, len(rows), total)
     if token:
         body["nextPageToken"] = token
@@ -634,6 +638,7 @@ async def gmail_attachment(user_id: str, msg_id: str, att_id: str, request: Requ
 @router.get(
     "/gmail/v1/users/{user_id}/threads",
     response_model=GmailThreadList,
+    response_model_exclude_unset=True,
     openapi_extra={"parameters": _P_GMAIL_LIST},
 )
 async def gmail_threads_list(user_id: str, request: Request):
@@ -666,7 +671,9 @@ async def gmail_threads_list(user_id: str, request: Request):
     threads = [
         {"id": _gmail_ids(r)[1], "snippet": r["content"][:200], "historyId": "1"} for r in rows
     ]
-    body = {"threads": threads, "resultSizeEstimate": total}
+    # left out when empty, as `messages.list` leaves `messages` out (#382)
+    body = {"threads": threads} if threads else {}
+    body["resultSizeEstimate"] = total
     token = next_page_token(offset, len(rows), total)
     if token:
         body["nextPageToken"] = token

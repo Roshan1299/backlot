@@ -5042,6 +5042,14 @@ def test_gmail_labels_list_order(client, admin_h):
     ]
 
 
+def test_gmail_a_list_with_no_match_leaves_its_array_out(client, admin_h):
+    for kind in ("messages", "threads"):
+        body = client.get(
+            f"/gmail/v1/users/me/{kind}", headers=admin_h, params={"q": "zzqxjbacklotnomatch"}
+        ).json()
+        assert body == {"resultSizeEstimate": 0}, kind
+
+
 # --- OAuth credentials (backlot/oauth.py) — the /oauth2/token exchange Google's SDKs refresh against -----
 
 
