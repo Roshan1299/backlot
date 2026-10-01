@@ -697,9 +697,10 @@ async def gmail_thread_get(user_id: str, thread_id: str, request: Request):
             raise gerr.not_found_entity()
         msgs = [row]
     fmt = request.query_params.get("format", "full")
+    # No `snippet`: real serves one on a `threads.list` entry and not on `threads.get`, with or
+    # without `format=minimal` — measured on 2026-09-30 (#382).
     return {
         "id": thread_id.lower(),
-        "snippet": msgs[0]["content"][:200],
         "historyId": "1",
         "messages": [_gmail_message(m, fmt, caller.email) for m in msgs],
     }

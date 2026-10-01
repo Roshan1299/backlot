@@ -5050,6 +5050,16 @@ def test_gmail_a_list_with_no_match_leaves_its_array_out(client, admin_h):
         assert body == {"resultSizeEstimate": 0}, kind
 
 
+def test_gmail_a_thread_carries_no_snippet(client, admin_h):
+    listed = client.get("/gmail/v1/users/me/threads", headers=admin_h).json()["threads"]
+    assert all("snippet" in t for t in listed)  # the list entries keep theirs
+    for params in ({}, {"format": "minimal"}):
+        thread = client.get(
+            f"/gmail/v1/users/me/threads/{listed[0]['id']}", headers=admin_h, params=params
+        ).json()
+        assert sorted(thread) == ["historyId", "id", "messages"], params
+
+
 # --- OAuth credentials (backlot/oauth.py) — the /oauth2/token exchange Google's SDKs refresh against -----
 
 
