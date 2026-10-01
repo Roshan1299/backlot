@@ -13,6 +13,7 @@ import base64
 import datetime
 import hashlib
 import json
+import quopri
 import re
 import string
 from email.parser import BytesParser
@@ -704,13 +705,134 @@ def _att_content(message_id: str, i: int, att: dict) -> str:
     return att.get("content", f"attachment {_att_id(message_id, i)}")
 
 
-def _leaf(mime: str, part_id: str, data: str) -> dict:
-    return {
+def _header(name: str, value: str) -> dict:
+    return {"name": name, "value": value}
+
+
+def _text_node(mime: str, data: str, encoding: str | None) -> dict:
+    """A text leaf, sent in `encoding` (None: as it is, with no `Content-Transfer-Encoding`)."""
+    headers = [_header("Content-Type", f'{mime}; charset="UTF-8"')]
+    if encoding:
+        headers.append(_header("Content-Transfer-Encoding", encoding))
+    return {"mimeType": mime, "filename": "", "headers": headers, "data": data, "cte": encoding}
+
+
+# Gmail's web composer quoted-printables an ASCII text/html part once a line is longer than this. Its
+# own choice, not an API rule: `messages.send` stores and serves whatever the sender wrote. Measured
+# on 2026-10-02 (#382): lines of 80, 81 and 175 characters went with no `Content-Transfer-Encoding`
+# and lines of 325 and 425 went quoted-printable, so the limit lies somewhere in 175..324; that range
+# is all that was measured, and 250 is a pick inside it.
+_HTML_QP_LINE = 250
+
+
+def _mime_tree(row, html: str, attachments: list, boundary: str) -> list[dict]:
+    """The payload's parts, which `full` serves as JSON and `raw` as MIME, so the two describe one
+    message. As measured on 2026-09-30 (#382): with no attachment the payload is
+    `multipart/alternative` over the text and HTML parts; with one it is `multipart/mixed` over a
+    `multipart/alternative` part holding those two, then one part per attachment."""
+    # The part headers are what Gmail's web composer writes, which the API passes through. Measured
+    # on web-composed messages on 2026-09-30, 2026-10-01 and 2026-10-02 (#382): text/plain is base64
+    # when its text is non-ASCII and carries no `Content-Transfer-Encoding` otherwise (the composer
+    # wraps ASCII text at 74 characters, so no sample had a long ASCII text/plain line); text/html
+    # is quoted-printable when it is non-ASCII or has a line longer than `_HTML_QP_LINE`, and
+    # carries no `Content-Transfer-Encoding` otherwise.
+    html_qp = not html.isascii() or any(len(line) > _HTML_QP_LINE for line in html.splitlines())
+    texts = [
+        _text_node("text/plain", row["content"], None if row["content"].isascii() else "base64"),
+        _text_node("text/html", html, "quoted-printable" if html_qp else None),
+    ]
+    if not attachments:
+        return texts
+    alt_boundary = f"a_{row['id'][:12]}"
+    nodes = [
+        {
+            "mimeType": "multipart/alternative",
+            "filename": "",
+            "headers": [
+                _header("Content-Type", f'multipart/alternative; boundary="{alt_boundary}"')
+            ],
+            "boundary": alt_boundary,
+            "parts": texts,
+        }
+    ]
+    for i, att in enumerate(attachments):
+        filename = att.get("filename", "attachment.bin")
+        mime = att.get("mime", "application/octet-stream")
+        # A text attachment names its charset: US-ASCII for ASCII content and UTF-8 otherwise, as an
+        # ASCII one (2026-10-01) and a Korean one (2026-09-30) were served (#382). A binary type has
+        # none to name.
+        ascii_att = _att_content(row["id"], i, att).isascii()
+        charset = (
+            f'; charset="{"US-ASCII" if ascii_att else "UTF-8"}"'
+            if mime.startswith("text/")
+            else ""
+        )
+        # `f_` and nine lowercase alphanumerics, the one attachment measured on 2026-09-30 (#382)
+        x_id = f"f_{synth.gmail_id(row['id'], salt=f'att{i}')[:9]}"
+        nodes.append(
+            {
+                "mimeType": mime,
+                "filename": filename,
+                "headers": [
+                    _header("Content-Type", f'{mime}{charset}; name="{filename}"'),
+                    _header("Content-Disposition", f'attachment; filename="{filename}"'),
+                    _header("Content-Transfer-Encoding", "base64"),
+                    _header("X-Attachment-Id", x_id),
+                    _header("Content-ID", f"<{x_id}>"),
+                ],
+                "attachment": (i, att),
+            }
+        )
+    return nodes
+
+
+def _json_part(node: dict, part_id: str, message_id: str) -> dict:
+    """One node of `_mime_tree` as a `full` payload part."""
+    part = {
         "partId": part_id,
-        "mimeType": mime,
-        "filename": "",
-        "body": {"size": len(data), "data": _b64url(data)},
+        "mimeType": node["mimeType"],
+        "filename": node["filename"],
+        "headers": node["headers"],
     }
+    if "parts" in node:
+        part["body"] = {"size": 0}
+        part["parts"] = [
+            _json_part(child, f"{part_id}.{j}", message_id) for j, child in enumerate(node["parts"])
+        ]
+    elif "attachment" in node:
+        i, att = node["attachment"]
+        # size = the exact byte length attachments.get serves (see _att_content), so a client can
+        # stat the attachment from this metadata without a second call — real Gmail's contract.
+        part["body"] = {
+            "attachmentId": _att_id(message_id, i),
+            "size": len(_att_content(message_id, i, att)),
+        }
+    else:
+        part["body"] = {"size": len(node["data"]), "data": _b64url(node["data"])}
+    return part
+
+
+def _mime_part(node: dict, message_id: str) -> str:
+    """One node of `_mime_tree` as a MIME entity, encoded as its own headers declare."""
+    head = "\r\n".join(f"{h['name']}: {h['value']}" for h in node["headers"])
+    if "parts" in node:
+        body = _mime_multipart(node["parts"], node["boundary"], message_id)
+    elif "attachment" in node:
+        i, att = node["attachment"]
+        # same bytes attachments.get serves, so raw MIME and the attachment endpoint agree
+        body = base64.b64encode(_att_content(message_id, i, att).encode("utf-8")).decode("ascii")
+    elif node["cte"] == "quoted-printable":
+        body = quopri.encodestring(node["data"].encode("utf-8")).decode("ascii")
+    elif node["cte"] == "base64":
+        body = base64.encodebytes(node["data"].encode("utf-8")).decode("ascii")
+    else:
+        body = node["data"]
+    return f"{head}\r\n\r\n{body}"
+
+
+def _mime_multipart(nodes: list[dict], boundary: str, message_id: str) -> str:
+    parts = "".join(f"--{boundary}\r\n{_mime_part(n, message_id)}\r\n" for n in nodes)
+    return parts + f"--{boundary}--"
 
 
 def _gmail_ts(row) -> int:
@@ -784,32 +906,6 @@ def _gmail_message(row, fmt: str, caller_email: str | None = None) -> dict:
         "sizeEstimate": len(row["content"]) + 400,
     }
     html = row["body_html"] or f"<html><body><p>{row['content']}</p></body></html>"
-    if fmt == "raw":
-        # RFC 2822 message, base64url — a genuine boundary-delimited MIME body matching the
-        # declared multipart Content-Type above. It has to be real MIME: a plain-text body under a
-        # `multipart/...` header with no boundary makes Python's `email` parser raise
-        # StartBoundaryNotFoundDefect/MultipartInvariantViolationDefect, and readers built on it
-        # (llama-index's GmailReader) choke because `get_payload()` degrades to a bare
-        # string instead of a list of sub-messages). Mirrors the same flat text/plain + text/html
-        # (+ attachment) leaves the `full` format exposes via `parts` below.
-        leaves = [
-            f'Content-Type: text/plain; charset="UTF-8"\r\n\r\n{row["content"]}',
-            f'Content-Type: text/html; charset="UTF-8"\r\n\r\n{html}',
-        ]
-        for i, att in enumerate(attachments):
-            filename = att.get("filename", "attachment.bin")
-            mime = att.get("mime", "application/octet-stream")
-            # same bytes attachments.get serves, so raw MIME and the attachment endpoint agree
-            b64 = base64.b64encode(_att_content(row["id"], i, att).encode("utf-8")).decode("ascii")
-            leaves.append(
-                f'Content-Type: {mime}; name="{filename}"\r\n'
-                f'Content-Disposition: attachment; filename="{filename}"\r\n'
-                f"Content-Transfer-Encoding: base64\r\n\r\n{b64}"
-            )
-        mime_body = "".join(f"--{boundary}\r\n{leaf}\r\n" for leaf in leaves) + f"--{boundary}--"
-        raw = "\r\n".join(f"{h['name']}: {h['value']}" for h in headers) + "\r\n\r\n" + mime_body
-        msg["raw"] = _b64url(raw)
-        return msg
     if fmt == "minimal":
         return msg
     if fmt == "metadata":
@@ -821,36 +917,26 @@ def _gmail_message(row, fmt: str, caller_email: str | None = None) -> dict:
             "body": {"size": 0},
         }
         return msg
+    nodes = _mime_tree(row, html, attachments, boundary)
+    if fmt == "raw":
+        # RFC 2822 message, base64url — a genuine boundary-delimited MIME body matching the
+        # declared multipart Content-Type above. It has to be real MIME: a plain-text body under a
+        # `multipart/...` header with no boundary makes Python's `email` parser raise
+        # StartBoundaryNotFoundDefect/MultipartInvariantViolationDefect, and readers built on it
+        # (llama-index's GmailReader) choke because `get_payload()` degrades to a bare
+        # string instead of a list of sub-messages). Built from the same parts `full` serves.
+        mime_body = _mime_multipart(nodes, boundary, row["id"])
+        raw = "\r\n".join(f"{h['name']}: {h['value']}" for h in headers) + "\r\n\r\n" + mime_body
+        msg["raw"] = _b64url(raw)
+        return msg
 
-    # full: multipart with text/plain + text/html leaves, plus attachment leaves
-    parts = [_leaf("text/plain", "0", row["content"]), _leaf("text/html", "1", html)]
-    for i, att in enumerate(attachments):
-        parts.append(
-            {
-                "partId": str(i + 2),
-                "mimeType": att.get("mime", "application/octet-stream"),
-                "filename": att.get("filename", "attachment.bin"),
-                "headers": [
-                    {
-                        "name": "Content-Disposition",
-                        "value": f'attachment; filename="{att.get("filename", "attachment.bin")}"',
-                    }
-                ],
-                # size = the exact byte length attachments.get serves (see _att_content), so a client can
-                # stat the attachment from this metadata without a second call — real Gmail's contract.
-                "body": {
-                    "attachmentId": _att_id(row["id"], i),
-                    "size": len(_att_content(row["id"], i, att)),
-                },
-            }
-        )
     msg["payload"] = {
         "partId": "",
         "mimeType": top_mime,
         "filename": "",
         "headers": headers,
         "body": {"size": 0},
-        "parts": parts,
+        "parts": [_json_part(n, str(i), row["id"]) for i, n in enumerate(nodes)],
     }
     return msg
 

@@ -98,12 +98,15 @@ def test_admin_drive_crawls_all(client, admin_h, ro_conn):
 
 
 def _gmail_plain(payload):
-    """Extract the text/plain body data from a Gmail payload (top-level or a part)."""
+    """Extract the text/plain body data from a Gmail payload (top-level or a part, descending into
+    the `multipart/alternative` part a message with an attachment nests it in)."""
     if payload.get("body", {}).get("data"):
         return payload["body"]["data"]
     for part in payload.get("parts", []):
         if part["mimeType"] == "text/plain":
             return part["body"]["data"]
+        if part["mimeType"].startswith("multipart/"):
+            return _gmail_plain(part)
     raise AssertionError("no text/plain part")
 
 
@@ -4775,6 +4778,195 @@ def test_gmail_raw_with_attachment_is_valid_mime(tmp_path):
     assert mime_msg.is_multipart()
     filenames = {p.get_filename() for p in mime_msg.get_payload() if p.get_filename()}
     assert "notes.txt" in filenames
+    # the text and HTML parts sit in a multipart/alternative part, as `full` serves them
+    alt = mime_msg.get_payload()[0]
+    assert alt.get_content_type() == "multipart/alternative"
+    assert [p.get_content_type() for p in alt.get_payload()] == ["text/plain", "text/html"]
+    assert alt.get_payload()[0].get_payload(decode=True).decode() == "see attached"
+
+
+# --- Gmail shapes measured against gmail.googleapis.com on 2026-09-30, 10-01 and 10-02 (#382) ----
+
+_GMAIL_382 = [
+    {
+        "source_type": "gmail",
+        "doc_id": "att",
+        "mailbox": "ceo",
+        "title": "With attachment",
+        "content": "see attached",
+        "author_email": "ceo@x.com",
+        "attachments": [{"filename": "notes.txt", "mime": "text/plain", "content": "hello"}],
+    },
+    {
+        "source_type": "gmail",
+        "doc_id": "lt",
+        "mailbox": "ceo",
+        "title": "Angles",
+        "content": "a < b & c > d",
+        "author_email": "ceo@x.com",
+    },
+    {
+        "source_type": "gmail",
+        "doc_id": "ko",
+        "mailbox": "ceo",
+        "title": "Non-ASCII",
+        "content": "안녕하세요",
+        "author_email": "ceo@x.com",
+    },
+    # an HTML line on each side of the measured quoted-printable boundary (175 none, 325 QP)
+    {
+        "source_type": "gmail",
+        "doc_id": "html175",
+        "mailbox": "ceo",
+        "title": "HTML line of 175",
+        "content": "short",
+        "html": "<div>" + "a" * 164 + "</div>",
+        "author_email": "ceo@x.com",
+    },
+    {
+        "source_type": "gmail",
+        "doc_id": "html325",
+        "mailbox": "ceo",
+        "title": "HTML line of 325",
+        "content": "short",
+        "html": "<div>" + "a" * 314 + "</div>",
+        "author_email": "ceo@x.com",
+    },
+    {
+        "source_type": "gmail",
+        "doc_id": "att-ko",
+        "mailbox": "ceo",
+        "title": "Non-ASCII attachment",
+        "content": "see attached",
+        "author_email": "ceo@x.com",
+        "attachments": [{"filename": "notes.txt", "mime": "text/plain", "content": "안녕"}],
+    },
+]
+
+
+@pytest.fixture
+def gmail_382(tmp_path):
+    settings = tiny_corpus(tmp_path, _GMAIL_382)
+    with client_for(settings, reload=True) as client:
+        yield client, {"Authorization": f"Bearer {settings.admin_token}"}
+
+
+def _hdrs(part) -> dict[str, str]:
+    return {h["name"]: h["value"] for h in part.get("headers", [])}
+
+
+def test_gmail_a_message_with_an_attachment_nests_its_text_in_multipart_alternative(gmail_382):
+    """The part tree, and each part's headers, as measured on four web-composed messages. Those
+    headers are what Gmail's composer writes and the API passes through."""
+    client, h = gmail_382
+    payload = client.get(
+        f"/gmail/v1/users/me/messages/{served_id('gmail', 'att')}", headers=h
+    ).json()["payload"]
+    assert payload["mimeType"] == "multipart/mixed"
+    alt, att = payload["parts"]
+    assert (alt["partId"], alt["mimeType"]) == ("0", "multipart/alternative")
+    assert list(_hdrs(alt)) == ["Content-Type"]
+    assert _hdrs(alt)["Content-Type"].startswith("multipart/alternative; boundary=")
+    text, html = alt["parts"]
+    assert (text["partId"], text["mimeType"]) == ("0.0", "text/plain")
+    # ASCII text with short lines carries no Content-Transfer-Encoding, plain or HTML
+    assert _hdrs(text) == {"Content-Type": 'text/plain; charset="UTF-8"'}
+    assert (html["partId"], html["mimeType"]) == ("0.1", "text/html")
+    assert _hdrs(html) == {"Content-Type": 'text/html; charset="UTF-8"'}
+    assert (att["partId"], att["filename"]) == ("1", "notes.txt")
+    att_h = _hdrs(att)
+    assert list(att_h) == [
+        "Content-Type",
+        "Content-Disposition",
+        "Content-Transfer-Encoding",
+        "X-Attachment-Id",
+        "Content-ID",
+    ]
+    assert att_h["Content-Type"] == 'text/plain; charset="US-ASCII"; name="notes.txt"'
+    assert att_h["Content-Disposition"] == 'attachment; filename="notes.txt"'
+    assert att_h["Content-Transfer-Encoding"] == "base64"
+    # one attachment was measured, so only the prefix and the Content-ID equality are pinned
+    assert att_h["X-Attachment-Id"].startswith("f_")
+    assert att_h["Content-ID"] == f"<{att_h['X-Attachment-Id']}>"
+
+    # with no attachment the payload is the alternative itself, and its parts carry headers too
+    plain = client.get(f"/gmail/v1/users/me/messages/{served_id('gmail', 'lt')}", headers=h).json()[
+        "payload"
+    ]
+    assert plain["mimeType"] == "multipart/alternative"
+    assert [(p["partId"], list(_hdrs(p))) for p in plain["parts"]] == [
+        ("0", ["Content-Type"]),
+        ("1", ["Content-Type"]),
+    ]
+
+
+def _cte(client, h, doc: str) -> dict[str, str | None]:
+    payload = client.get(
+        f"/gmail/v1/users/me/messages/{served_id('gmail', doc)}", headers=h
+    ).json()["payload"]
+    return {p["mimeType"]: _hdrs(p).get("Content-Transfer-Encoding") for p in payload["parts"]}
+
+
+@pytest.mark.parametrize(
+    ("doc", "plain", "html"),
+    [
+        ("lt", None, None),  # ASCII, short lines: neither part is encoded
+        ("ko", "base64", "quoted-printable"),  # non-ASCII: both are
+        ("html175", None, None),  # the longest ASCII HTML line measured to go unencoded
+        ("html325", None, "quoted-printable"),  # the shortest measured to go quoted-printable
+    ],
+)
+def test_gmail_text_parts_are_encoded_as_the_web_composer_encodes_them(gmail_382, doc, plain, html):
+    """Gmail's web composer chooses each part's Content-Transfer-Encoding and the API passes it
+    through. Only measured points are pinned (2026-09-30, 2026-10-01, 2026-10-02): the limit between
+    175 and 325 characters is Backlot's pick, and no sample had a long ASCII text/plain line."""
+    client, h = gmail_382
+    assert _cte(client, h, doc) == {"text/plain": plain, "text/html": html}
+
+
+def test_gmail_a_text_attachment_names_us_ascii_or_utf8_by_its_content(gmail_382):
+    """An ASCII attachment was served `charset="US-ASCII"` (2026-10-01) and a Korean one
+    `charset="UTF-8"` (2026-09-30)."""
+    client, h = gmail_382
+    charsets = {}
+    for doc in ("att", "att-ko"):
+        parts = client.get(
+            f"/gmail/v1/users/me/messages/{served_id('gmail', doc)}", headers=h
+        ).json()["payload"]["parts"]
+        charsets[doc] = _hdrs(next(p for p in parts if p["filename"]))["Content-Type"]
+    assert charsets == {
+        "att": 'text/plain; charset="US-ASCII"; name="notes.txt"',
+        "att-ko": 'text/plain; charset="UTF-8"; name="notes.txt"',
+    }
+
+
+@pytest.mark.parametrize("doc", ["att", "lt", "ko", "html175", "html325", "att-ko"])
+def test_gmail_raw_and_full_describe_one_message(gmail_382, doc):
+    """`format=raw` and the `full` payload are the same tree, with the same headers on each part,
+    and each raw part decodes, by its own Content-Transfer-Encoding, to the bytes `full` serves."""
+    import email
+
+    client, h = gmail_382
+    url = f"/gmail/v1/users/me/messages/{served_id('gmail', doc)}"
+    full = client.get(url, headers=h).json()["payload"]
+    raw = client.get(url, headers=h, params={"format": "raw"}).json()["raw"]
+    mime = email.message_from_bytes(base64.urlsafe_b64decode(raw))
+    assert not mime.defects
+
+    def check(part, entity):
+        assert entity.get_content_type() == part["mimeType"]
+        assert {k: v for k, v in entity.items()} == _hdrs(part)
+        if "parts" in part:
+            children = entity.get_payload()
+            assert len(children) == len(part["parts"])
+            for child, sub in zip(part["parts"], children):
+                check(child, sub)
+        elif "data" in part["body"]:
+            assert entity.get_payload(decode=True) == base64.urlsafe_b64decode(part["body"]["data"])
+
+    assert mime.get_content_type() == full["mimeType"]
+    for part, entity in zip(full["parts"], mime.get_payload(), strict=True):
+        check(part, entity)
 
 
 # --- OAuth credentials (backlot/oauth.py) — the /oauth2/token exchange Google's SDKs refresh against -----
