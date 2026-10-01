@@ -275,50 +275,57 @@ async def gmail_profile(user_id: str, request: Request):
 _GMAIL_DEFAULT_LABEL = "INBOX"
 
 # The system labels Gmail always exposes (users.labels.list).
+# In the order real `labels.list` returned them on one mailbox, twice, on 2026-10-01 (#382). Gmail
+# documents no order, so this is Backlot's choice, taken from that measurement.
 _SYSTEM_LABELS = [
-    "INBOX",
+    "CHAT",
     "SENT",
+    "INBOX",
+    "IMPORTANT",
+    "TRASH",
     "DRAFT",
     "SPAM",
-    "TRASH",
-    "UNREAD",
-    "STARRED",
-    "IMPORTANT",
-    "CHAT",
-    "CATEGORY_PERSONAL",
-    "CATEGORY_SOCIAL",
-    "CATEGORY_UPDATES",
     "CATEGORY_FORUMS",
+    "CATEGORY_UPDATES",
+    "CATEGORY_PERSONAL",
     "CATEGORY_PROMOTIONS",
+    "CATEGORY_SOCIAL",
+    "YELLOW_STAR",
+    "STARRED",
+    "UNREAD",
 ]
 
+# Measured against gmail.googleapis.com on 2026-09-30 (#382): these labels carry
+# `messageListVisibility: "hide"` and `labelListVisibility: "labelHide"`, and the rest carry
+# neither member. That is the Workspace account of the issue, re-measured on 2026-10-02. A personal
+# account measured on 2026-10-01 also served INBOX with `messageListVisibility: "hide"` and
+# `labelListVisibility: "labelShow"`; what makes the two differ was not measured.
+_HIDDEN_LABELS = {"IMPORTANT", "CHAT", "SPAM", "TRASH"}
 
-def _label_obj(lid: str, messages: int = 0, threads: int = 0) -> dict:
-    hide = lid in ("SPAM", "TRASH", "CHAT")
-    return {
-        "id": lid,
-        "name": lid,
-        "type": "system",
-        "messageListVisibility": "hide" if hide else "show",
-        "labelListVisibility": "labelHide" if lid.startswith("CATEGORY_") else "labelShow",
-        "messagesTotal": messages,
-        "messagesUnread": 0,
-        "threadsTotal": threads,
-        "threadsUnread": 0,
-    }
+
+def _label_obj(lid: str, counts: tuple[int, int] | None = None) -> dict:
+    """One system label. `labels.list` serves no counts and `labels.get` serves all four, as
+    measured on 2026-09-30 (#382) — so `counts` is ``(messages, threads)`` on a get and None on a
+    list."""
+    obj = {"id": lid, "name": lid, "type": "system"}
+    if lid in _HIDDEN_LABELS or lid.startswith("CATEGORY_"):
+        obj["messageListVisibility"] = "hide"
+        obj["labelListVisibility"] = "labelHide"
+    if counts is not None:
+        messages, threads = counts
+        obj |= {
+            "messagesTotal": messages,
+            "messagesUnread": 0,
+            "threadsTotal": threads,
+            "threadsUnread": 0,
+        }
+    return obj
 
 
 @router.get("/gmail/v1/users/{user_id}/labels")
 async def gmail_labels(user_id: str, request: Request):
-    conn = auth.conn(request)
-    caller = _require(request)
-    ids = auth.visible_ids(request, caller)
-    messages, threads = _mailbox_totals(conn, caller, user_id, ids)
-    labels = [
-        _label_obj(lid, *((messages, threads) if lid == _GMAIL_DEFAULT_LABEL else (0, 0)))
-        for lid in _SYSTEM_LABELS
-    ]
-    return {"labels": labels}
+    _require(request)
+    return {"labels": [_label_obj(lid) for lid in _SYSTEM_LABELS]}
 
 
 @router.get("/gmail/v1/users/{user_id}/labels/{label_id}")
@@ -329,9 +336,7 @@ async def gmail_label_get(user_id: str, label_id: str, request: Request):
         raise gerr.not_found_entity()
     ids = auth.visible_ids(request, caller)
     messages, threads = _mailbox_totals(conn, caller, user_id, ids)
-    return _label_obj(
-        label_id, *((messages, threads) if label_id == _GMAIL_DEFAULT_LABEL else (0, 0))
-    )
+    return _label_obj(label_id, (messages, threads) if label_id == _GMAIL_DEFAULT_LABEL else (0, 0))
 
 
 _GMAIL_OP = re.compile(r'(\w+):("[^"]*"|\S+)')

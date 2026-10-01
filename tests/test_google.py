@@ -4993,6 +4993,55 @@ def test_gmail_attachments_get_is_size_and_data(gmail_382):
     assert sorted(body) == ["data", "size"] and body["size"] == att["body"]["size"]
 
 
+def test_gmail_labels_list_and_get_serve_real_members(client, admin_h):
+    labels = client.get("/gmail/v1/users/me/labels", headers=admin_h).json()["labels"]
+    by_id = {label["id"]: label for label in labels}
+    for lid in ("INBOX", "SENT", "DRAFT", "UNREAD", "STARRED", "YELLOW_STAR"):
+        assert sorted(by_id[lid]) == ["id", "name", "type"], lid
+    hidden = ["IMPORTANT", "CHAT", "SPAM", "TRASH"] + [
+        i for i in by_id if i.startswith("CATEGORY_")
+    ]
+    assert len(hidden) == 9
+    for lid in hidden:
+        assert by_id[lid]["messageListVisibility"] == "hide", lid
+        assert by_id[lid]["labelListVisibility"] == "labelHide", lid
+        assert "messagesTotal" not in by_id[lid]
+
+    counts = ["messagesTotal", "messagesUnread", "threadsTotal", "threadsUnread"]
+    for lid in ("INBOX", "UNREAD", "DRAFT", "YELLOW_STAR"):
+        got = client.get(f"/gmail/v1/users/me/labels/{lid}", headers=admin_h)
+        assert got.status_code == 200, lid
+        assert sorted(got.json()) == sorted(["id", "name", "type", *counts]), lid
+    for lid in ("CHAT", "SPAM", "TRASH", "CATEGORY_SOCIAL"):
+        got = client.get(f"/gmail/v1/users/me/labels/{lid}", headers=admin_h).json()
+        assert sorted(got) == sorted(
+            ["id", "name", "type", "messageListVisibility", "labelListVisibility", *counts]
+        ), lid
+
+
+def test_gmail_labels_list_order(client, admin_h):
+    """The order real `labels.list` returned on one mailbox, twice, on 2026-10-01. Gmail documents
+    no order, so this pins Backlot's choice, taken from that measurement, not a Gmail guarantee."""
+    labels = client.get("/gmail/v1/users/me/labels", headers=admin_h).json()["labels"]
+    assert [label["id"] for label in labels] == [
+        "CHAT",
+        "SENT",
+        "INBOX",
+        "IMPORTANT",
+        "TRASH",
+        "DRAFT",
+        "SPAM",
+        "CATEGORY_FORUMS",
+        "CATEGORY_UPDATES",
+        "CATEGORY_PERSONAL",
+        "CATEGORY_PROMOTIONS",
+        "CATEGORY_SOCIAL",
+        "YELLOW_STAR",
+        "STARRED",
+        "UNREAD",
+    ]
+
+
 # --- OAuth credentials (backlot/oauth.py) — the /oauth2/token exchange Google's SDKs refresh against -----
 
 
