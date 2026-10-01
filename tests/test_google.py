@@ -4982,6 +4982,17 @@ def test_gmail_metadata_payload_is_mime_type_and_headers(gmail_382):
             assert sorted(m["payload"]) == ["headers", "mimeType"], (doc, params)
 
 
+def test_gmail_attachments_get_is_size_and_data(gmail_382):
+    client, h = gmail_382
+    mid = served_id("gmail", "att")
+    payload = client.get(f"/gmail/v1/users/me/messages/{mid}", headers=h).json()["payload"]
+    att = next(p for p in payload["parts"] if p["filename"])
+    body = client.get(
+        f"/gmail/v1/users/me/messages/{mid}/attachments/{att['body']['attachmentId']}", headers=h
+    ).json()
+    assert sorted(body) == ["data", "size"] and body["size"] == att["body"]["size"]
+
+
 # --- OAuth credentials (backlot/oauth.py) — the /oauth2/token exchange Google's SDKs refresh against -----
 
 

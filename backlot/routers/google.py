@@ -72,7 +72,6 @@ class GmailThread(_GLoose):
 
 
 class GmailAttachment(_GLoose):
-    attachmentId: str
     size: int
     data: str
 
@@ -623,7 +622,8 @@ async def gmail_attachment(user_id: str, msg_id: str, att_id: str, request: Requ
     if not found:
         raise gerr.invalid_attachment_token()
     body = _att_content(message_id, found[0], found[1])
-    return {"attachmentId": att_id, "size": len(body), "data": _b64url(body)}
+    # `{size, data}` alone: real names no `attachmentId` here, measured on 2026-09-30 (#382)
+    return {"size": len(body), "data": _b64url(body)}
 
 
 @router.get(
