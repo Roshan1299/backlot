@@ -4969,6 +4969,19 @@ def test_gmail_raw_and_full_describe_one_message(gmail_382, doc):
         check(part, entity)
 
 
+def test_gmail_metadata_payload_is_mime_type_and_headers(gmail_382):
+    client, h = gmail_382
+    for doc in ("att", "lt"):
+        for params in (
+            {"format": "metadata"},
+            {"format": "metadata", "metadataHeaders": "Subject"},
+        ):
+            m = client.get(
+                f"/gmail/v1/users/me/messages/{served_id('gmail', doc)}", headers=h, params=params
+            ).json()
+            assert sorted(m["payload"]) == ["headers", "mimeType"], (doc, params)
+
+
 # --- OAuth credentials (backlot/oauth.py) — the /oauth2/token exchange Google's SDKs refresh against -----
 
 

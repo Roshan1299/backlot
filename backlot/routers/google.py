@@ -909,13 +909,9 @@ def _gmail_message(row, fmt: str, caller_email: str | None = None) -> dict:
     if fmt == "minimal":
         return msg
     if fmt == "metadata":
-        msg["payload"] = {
-            "partId": "",
-            "mimeType": top_mime,
-            "filename": "",
-            "headers": headers,
-            "body": {"size": 0},
-        }
+        # `mimeType` and `headers` alone: real sends no `partId`, `filename` or `body` on a
+        # metadata payload, measured on 2026-09-30 (#382).
+        msg["payload"] = {"mimeType": top_mime, "headers": headers}
         return msg
     nodes = _mime_tree(row, html, attachments, boundary)
     if fmt == "raw":
