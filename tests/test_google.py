@@ -5060,6 +5060,17 @@ def test_gmail_a_thread_carries_no_snippet(client, admin_h):
         assert sorted(thread) == ["historyId", "id", "messages"], params
 
 
+def test_gmail_snippet_escapes_angle_brackets(gmail_382):
+    """`messages.get` and `threads.list` both send `<` and `>` as `&lt;` and `&gt;`, measured on
+    2026-09-30 and 2026-10-01."""
+    client, h = gmail_382
+    mid = served_id("gmail", "lt")
+    m = client.get(f"/gmail/v1/users/me/messages/{mid}", headers=h).json()
+    assert m["snippet"] == "a &lt; b & c &gt; d"
+    threads = client.get("/gmail/v1/users/me/threads", headers=h).json()["threads"]
+    assert next(t for t in threads if t["id"] == m["threadId"])["snippet"] == "a &lt; b & c &gt; d"
+
+
 # --- OAuth credentials (backlot/oauth.py) — the /oauth2/token exchange Google's SDKs refresh against -----
 
 

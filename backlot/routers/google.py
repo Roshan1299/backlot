@@ -668,9 +668,7 @@ async def gmail_threads_list(user_id: str, request: Request):
         rows = store.list_gmail_in_range(
             conn, mailbox, None, None, ids, limit=limit, offset=offset, roots_only=True
         )
-    threads = [
-        {"id": _gmail_ids(r)[1], "snippet": r["content"][:200], "historyId": "1"} for r in rows
-    ]
+    threads = [{"id": _gmail_ids(r)[1], "snippet": _snippet(r), "historyId": "1"} for r in rows]
     # left out when empty, as `messages.list` leaves `messages` out (#382)
     body = {"threads": threads} if threads else {}
     body["resultSizeEstimate"] = total
@@ -848,6 +846,13 @@ def _mime_multipart(nodes: list[dict], boundary: str, message_id: str) -> str:
     return parts + f"--{boundary}--"
 
 
+def _snippet(row) -> str:
+    """The message's first 200 characters, with `<` and `>` as `&lt;` and `&gt;`: real's snippet of
+    a quoted `Name <address>` line reads `Name &lt;address&gt;`, measured on 2026-09-30 (#382).
+    Only those two were in the text measured, so `&` and quotes are sent as they are."""
+    return row["content"][:200].replace("<", "&lt;").replace(">", "&gt;")
+
+
 def _gmail_ts(row) -> int:
     """A message's unix ts. A real per-message created_ts (its parsed Date header) is used
     verbatim; only when it's missing do we synthesize a thread base and spread replies an hour
@@ -913,7 +918,7 @@ def _gmail_message(row, fmt: str, caller_email: str | None = None) -> dict:
         "id": _gmail_ids(row)[0],
         "threadId": _gmail_ids(row)[1],
         "labelIds": store.jcol(row, "label_ids") or [_GMAIL_DEFAULT_LABEL],
-        "snippet": row["content"][:200],
+        "snippet": _snippet(row),
         "historyId": "1",
         "internalDate": str(ts * 1000),
         "sizeEstimate": len(row["content"]) + 400,
