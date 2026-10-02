@@ -736,7 +736,7 @@ def _text_node(mime: str, data: str, encoding: str | None) -> dict:
 _HTML_QP_LINE = 250
 
 
-def _mime_tree(row, html: str, attachments: list, boundary: str) -> list[dict]:
+def _mime_tree(row, html: str, attachments: list) -> list[dict]:
     """The payload's parts, which `full` serves as JSON and `raw` as MIME, so the two describe one
     message. As measured on 2026-09-30 (#382): with no attachment the payload is
     `multipart/alternative` over the text and HTML parts; with one it is `multipart/mixed` over a
@@ -931,7 +931,7 @@ def _gmail_message(row, fmt: str, caller_email: str | None = None) -> dict:
         # metadata payload, measured on 2026-09-30 (#382).
         msg["payload"] = {"mimeType": top_mime, "headers": headers}
         return msg
-    nodes = _mime_tree(row, html, attachments, boundary)
+    nodes = _mime_tree(row, html, attachments)
     if fmt == "raw":
         # RFC 2822 message, base64url — a genuine boundary-delimited MIME body matching the
         # declared multipart Content-Type above. It has to be real MIME: a plain-text body under a
