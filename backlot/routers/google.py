@@ -295,10 +295,10 @@ _SYSTEM_LABELS = [
     "UNREAD",
 ]
 
-# Measured against gmail.googleapis.com on 2026-09-30 (#382): these labels carry
-# `messageListVisibility: "hide"` and `labelListVisibility: "labelHide"`, and the rest carry
-# neither member. That is the Workspace account of the issue, re-measured on 2026-10-02. A personal
-# account measured on 2026-10-01 also served INBOX with `messageListVisibility: "hide"` and
+# Measured against gmail.googleapis.com on a Google Workspace account on 2026-09-30, and again on
+# 2026-10-02: these four labels and the five `CATEGORY_` ones carry `messageListVisibility: "hide"`
+# and `labelListVisibility: "labelHide"`, and the rest carry neither member. A personal account
+# measured on 2026-10-01 also served INBOX with `messageListVisibility: "hide"` and
 # `labelListVisibility: "labelShow"`; what makes the two differ was not measured.
 _HIDDEN_LABELS = {"IMPORTANT", "CHAT", "SPAM", "TRASH"}
 
