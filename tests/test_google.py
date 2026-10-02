@@ -4785,7 +4785,7 @@ def test_gmail_raw_with_attachment_is_valid_mime(tmp_path):
     assert alt.get_payload()[0].get_payload(decode=True).decode() == "see attached"
 
 
-# --- Gmail shapes measured against gmail.googleapis.com on 2026-09-30, 10-01 and 10-02 (#382) ----
+# --- Gmail shapes measured against gmail.googleapis.com on 2026-09-30, 10-01 and 10-02 -----------
 
 _GMAIL_382 = [
     {

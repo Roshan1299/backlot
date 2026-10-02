@@ -274,9 +274,9 @@ async def gmail_profile(user_id: str, request: Request):
 # query for it has to agree with the message it comes back with.
 _GMAIL_DEFAULT_LABEL = "INBOX"
 
-# The system labels Gmail always exposes (users.labels.list).
-# In the order real `labels.list` returned them on one mailbox, twice, on 2026-10-01 (#382). Gmail
-# documents no order, so this is Backlot's choice, taken from that measurement.
+# The system labels Gmail always exposes (users.labels.list), in the order real `labels.list`
+# returned them on one mailbox, twice, on 2026-10-01. Gmail documents no order, so this is
+# Backlot's choice, taken from that measurement.
 _SYSTEM_LABELS = [
     "CHAT",
     "SENT",
@@ -305,8 +305,7 @@ _HIDDEN_LABELS = {"IMPORTANT", "CHAT", "SPAM", "TRASH"}
 
 def _label_obj(lid: str, counts: tuple[int, int] | None = None) -> dict:
     """One system label. `labels.list` serves no counts and `labels.get` serves all four, as
-    measured on 2026-09-30 (#382) — so `counts` is ``(messages, threads)`` on a get and None on a
-    list."""
+    measured on 2026-09-30 — so `counts` is ``(messages, threads)`` on a get and None on a list."""
     obj = {"id": lid, "name": lid, "type": "system"}
     if lid in _HIDDEN_LABELS or lid.startswith("CATEGORY_"):
         obj["messageListVisibility"] = "hide"
@@ -581,8 +580,8 @@ async def gmail_messages_list(user_id: str, request: Request):
         rows = store.list_gmail_in_range(conn, mailbox, None, None, ids, limit=limit, offset=offset)
     # threadId must agree with messages.get (a reply belongs to its root's thread)
     messages = [dict(zip(("id", "threadId"), _gmail_ids(r))) for r in rows]
-    # A list with no match leaves `messages` out rather than sending `[]` — measured on 2026-09-30
-    # (#382), so a client that reads `response["messages"]` meets the KeyError it meets there.
+    # A list with no match leaves `messages` out rather than sending `[]` — measured on 2026-09-30,
+    # so a client that reads `response["messages"]` meets the KeyError it meets there.
     body = {"messages": messages} if messages else {}
     body["resultSizeEstimate"] = total
     token = next_page_token(offset, len(rows), total)
@@ -631,7 +630,7 @@ async def gmail_attachment(user_id: str, msg_id: str, att_id: str, request: Requ
     if not found:
         raise gerr.invalid_attachment_token()
     body = _att_content(message_id, found[0], found[1])
-    # `{size, data}` alone: real names no `attachmentId` here, measured on 2026-09-30 (#382)
+    # `{size, data}` alone: real names no `attachmentId` here, measured on 2026-09-30
     return {"size": len(body), "data": _b64url(body)}
 
 
@@ -669,7 +668,7 @@ async def gmail_threads_list(user_id: str, request: Request):
             conn, mailbox, None, None, ids, limit=limit, offset=offset, roots_only=True
         )
     threads = [{"id": _gmail_ids(r)[1], "snippet": _snippet(r), "historyId": "1"} for r in rows]
-    # left out when empty, as `messages.list` leaves `messages` out (#382)
+    # A list with no match leaves `threads` out rather than sending `[]`, measured on 2026-09-30.
     body = {"threads": threads} if threads else {}
     body["resultSizeEstimate"] = total
     token = next_page_token(offset, len(rows), total)
@@ -696,7 +695,7 @@ async def gmail_thread_get(user_id: str, thread_id: str, request: Request):
         msgs = [row]
     fmt = request.query_params.get("format", "full")
     # No `snippet`: real serves one on a `threads.list` entry and not on `threads.get`, with or
-    # without `format=minimal` — measured on 2026-09-30 (#382).
+    # without `format=minimal` — measured on 2026-09-30.
     return {
         "id": thread_id.lower(),
         "historyId": "1",
@@ -730,23 +729,23 @@ def _text_node(mime: str, data: str, encoding: str | None) -> dict:
 
 # Gmail's web composer quoted-printables an ASCII text/html part once a line is longer than this. Its
 # own choice, not an API rule: `messages.send` stores and serves whatever the sender wrote. Measured
-# on 2026-10-02 (#382): lines of 80, 81 and 175 characters went with no `Content-Transfer-Encoding`
-# and lines of 325 and 425 went quoted-printable, so the limit lies somewhere in 175..324; that range
-# is all that was measured, and 250 is a pick inside it.
+# on 2026-10-02: lines of 80, 81 and 175 characters went with no `Content-Transfer-Encoding` and
+# lines of 325 and 425 went quoted-printable, so the limit lies somewhere in 175..324; that range is
+# all that was measured, and 250 is a pick inside it.
 _HTML_QP_LINE = 250
 
 
 def _mime_tree(row, html: str, attachments: list) -> list[dict]:
     """The payload's parts, which `full` serves as JSON and `raw` as MIME, so the two describe one
-    message. As measured on 2026-09-30 (#382): with no attachment the payload is
-    `multipart/alternative` over the text and HTML parts; with one it is `multipart/mixed` over a
-    `multipart/alternative` part holding those two, then one part per attachment."""
+    message. As measured on 2026-09-30: with no attachment the payload is `multipart/alternative`
+    over the text and HTML parts; with one it is `multipart/mixed` over a `multipart/alternative`
+    part holding those two, then one part per attachment."""
     # The part headers are what Gmail's web composer writes, which the API passes through. Measured
-    # on web-composed messages on 2026-09-30, 2026-10-01 and 2026-10-02 (#382): text/plain is base64
-    # when its text is non-ASCII and carries no `Content-Transfer-Encoding` otherwise (the composer
-    # wraps ASCII text at 74 characters, so no sample had a long ASCII text/plain line); text/html
-    # is quoted-printable when it is non-ASCII or has a line longer than `_HTML_QP_LINE`, and
-    # carries no `Content-Transfer-Encoding` otherwise.
+    # on web-composed messages on 2026-09-30, 2026-10-01 and 2026-10-02: text/plain is base64 when
+    # its text is non-ASCII and carries no `Content-Transfer-Encoding` otherwise (the composer wraps
+    # ASCII text at 74 characters, so no sample had a long ASCII text/plain line); text/html is
+    # quoted-printable when it is non-ASCII or has a line longer than `_HTML_QP_LINE`, and carries
+    # no `Content-Transfer-Encoding` otherwise.
     html_qp = not html.isascii() or any(len(line) > _HTML_QP_LINE for line in html.splitlines())
     texts = [
         _text_node("text/plain", row["content"], None if row["content"].isascii() else "base64"),
@@ -770,15 +769,15 @@ def _mime_tree(row, html: str, attachments: list) -> list[dict]:
         filename = att.get("filename", "attachment.bin")
         mime = att.get("mime", "application/octet-stream")
         # A text attachment names its charset: US-ASCII for ASCII content and UTF-8 otherwise, as an
-        # ASCII one (2026-10-01) and a Korean one (2026-09-30) were served (#382). A binary type has
-        # none to name.
+        # ASCII one (2026-10-01) and a Korean one (2026-09-30) were served. A binary type has none
+        # to name.
         ascii_att = _att_content(row["id"], i, att).isascii()
         charset = (
             f'; charset="{"US-ASCII" if ascii_att else "UTF-8"}"'
             if mime.startswith("text/")
             else ""
         )
-        # `f_` and nine lowercase alphanumerics, the one attachment measured on 2026-09-30 (#382)
+        # `f_` and nine lowercase alphanumerics, the one attachment measured on 2026-09-30
         x_id = f"f_{synth.gmail_id(row['id'], salt=f'att{i}')[:9]}"
         nodes.append(
             {
@@ -848,8 +847,8 @@ def _mime_multipart(nodes: list[dict], boundary: str, message_id: str) -> str:
 
 def _snippet(row) -> str:
     """The message's first 200 characters, with `<` and `>` as `&lt;` and `&gt;`: real's snippet of
-    a quoted `Name <address>` line reads `Name &lt;address&gt;`, measured on 2026-09-30 (#382).
-    Only those two were in the text measured, so `&` and quotes are sent as they are."""
+    a quoted `Name <address>` line reads `Name &lt;address&gt;`, measured on 2026-09-30. Only those
+    two were in the text measured, so `&` and quotes are sent as they are."""
     return row["content"][:200].replace("<", "&lt;").replace(">", "&gt;")
 
 
@@ -928,7 +927,7 @@ def _gmail_message(row, fmt: str, caller_email: str | None = None) -> dict:
         return msg
     if fmt == "metadata":
         # `mimeType` and `headers` alone: real sends no `partId`, `filename` or `body` on a
-        # metadata payload, measured on 2026-09-30 (#382).
+        # metadata payload, measured on 2026-09-30.
         msg["payload"] = {"mimeType": top_mime, "headers": headers}
         return msg
     nodes = _mime_tree(row, html, attachments)
