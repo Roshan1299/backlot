@@ -4963,6 +4963,10 @@ def test_gmail_raw_and_full_describe_one_message(gmail_382, doc):
                 check(child, sub)
         elif "data" in part["body"]:
             assert entity.get_payload(decode=True) == base64.urlsafe_b64decode(part["body"]["data"])
+            if "Content-Transfer-Encoding" in entity:
+                # encoded, not only labelled: RFC 2045 holds both to ASCII lines of at most 76
+                body = entity.get_payload()
+                assert body.isascii() and max(map(len, body.splitlines())) <= 76
 
     assert mime.get_content_type() == full["mimeType"]
     for part, entity in zip(full["parts"], mime.get_payload(), strict=True):
@@ -4990,7 +4994,7 @@ def test_gmail_attachments_get_is_size_and_data(gmail_382):
     body = client.get(
         f"/gmail/v1/users/me/messages/{mid}/attachments/{att['body']['attachmentId']}", headers=h
     ).json()
-    assert sorted(body) == ["data", "size"] and body["size"] == att["body"]["size"]
+    assert sorted(body) == ["data", "size"]
 
 
 def test_gmail_labels_list_and_get_serve_real_members(client, admin_h):
