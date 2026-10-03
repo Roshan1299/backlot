@@ -4805,12 +4805,13 @@ _GMAIL_SHAPES = [
         "content": "a < b & c > d",
         "author_email": "ceo@x.com",
     },
+    # more than 57 bytes of UTF-8, so its base64 text/plain part runs past one 76-character line
     {
         "source_type": "gmail",
         "doc_id": "ko",
         "mailbox": "ceo",
         "title": "Non-ASCII",
-        "content": "안녕하세요",
+        "content": "안녕하세요, 다음 주 회의 일정을 공유드립니다.",
         "author_email": "ceo@x.com",
     },
     # an HTML line on each side of the measured quoted-printable boundary (175 none, 325 QP)
