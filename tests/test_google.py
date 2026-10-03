@@ -257,8 +257,11 @@ def test_gmail_thread_id_matches_the_message_id_for_a_lone_message(client, admin
     assert upper.status_code == 200 and upper.json() == t.json()
 
 
-def test_gmail_reply_reports_its_roots_thread_id(client, admin_h, ro_conn):
-
+def test_gmail_a_reply_is_served_under_its_roots_thread_id_only(client, admin_h, ro_conn):
+    """A reply reports its root's id as `threadId`, `threads.get` on that id serves the thread with
+    the reply in it, and `threads.get` on the reply's own id gets the answer a well-formed id the
+    mailbox does not hold gets. The measurement is beside the fallback in `gmail_thread_get`.
+    """
     row = ro_conn.execute(
         "SELECT * FROM gmail_messages WHERE COALESCE(thread_id,'') != '' "
         "AND thread_id != id LIMIT 1"
@@ -268,6 +271,13 @@ def test_gmail_reply_reports_its_roots_thread_id(client, admin_h, ro_conn):
     # `thread_id` holds the ROOT'S OWN served id — no re-derivation on either side.
     assert m["threadId"] == row["thread_id"]
     assert m["id"] != m["threadId"]
+    thread = client.get(f"/gmail/v1/users/me/threads/{m['threadId']}", headers=admin_h)
+    assert thread.status_code == 200
+    assert row["id"] in [x["id"] for x in thread.json()["messages"]]
+    reply = client.get(f"/gmail/v1/users/me/threads/{row['id']}", headers=admin_h)
+    unknown = client.get("/gmail/v1/users/me/threads/1", headers=admin_h)
+    assert reply.status_code == unknown.status_code == 404
+    assert reply.json() == unknown.json()
 
 
 def test_gmail_threads_list_is_the_mailbox_searched_or_not(client, tokens):
