@@ -4787,7 +4787,7 @@ def test_gmail_raw_with_attachment_is_valid_mime(tmp_path):
 
 # --- Gmail shapes measured against gmail.googleapis.com on 2026-09-30, 10-01 and 10-02 -----------
 
-_GMAIL_382 = [
+_GMAIL_SHAPES = [
     {
         "source_type": "gmail",
         "doc_id": "att",
@@ -4845,8 +4845,8 @@ _GMAIL_382 = [
 
 
 @pytest.fixture
-def gmail_382(tmp_path):
-    settings = tiny_corpus(tmp_path, _GMAIL_382)
+def gmail_shapes(tmp_path):
+    settings = tiny_corpus(tmp_path, _GMAIL_SHAPES)
     with client_for(settings, reload=True) as client:
         yield client, {"Authorization": f"Bearer {settings.admin_token}"}
 
@@ -4855,10 +4855,10 @@ def _hdrs(part) -> dict[str, str]:
     return {h["name"]: h["value"] for h in part.get("headers", [])}
 
 
-def test_gmail_a_message_with_an_attachment_nests_its_text_in_multipart_alternative(gmail_382):
+def test_gmail_a_message_with_an_attachment_nests_its_text_in_multipart_alternative(gmail_shapes):
     """The part tree, and each part's headers, as measured on four web-composed messages. Those
     headers are what Gmail's composer writes and the API passes through."""
-    client, h = gmail_382
+    client, h = gmail_shapes
     payload = client.get(
         f"/gmail/v1/users/me/messages/{served_id('gmail', 'att')}", headers=h
     ).json()["payload"]
@@ -4916,18 +4916,20 @@ def _cte(client, h, doc: str) -> dict[str, str | None]:
         ("html325", None, "quoted-printable"),  # the shortest measured to go quoted-printable
     ],
 )
-def test_gmail_text_parts_are_encoded_as_the_web_composer_encodes_them(gmail_382, doc, plain, html):
+def test_gmail_text_parts_are_encoded_as_the_web_composer_encodes_them(
+    gmail_shapes, doc, plain, html
+):
     """Gmail's web composer chooses each part's Content-Transfer-Encoding and the API passes it
     through. Only measured points are pinned (2026-09-30, 2026-10-01, 2026-10-02): the limit between
     175 and 325 characters is Backlot's pick, and no sample had a long ASCII text/plain line."""
-    client, h = gmail_382
+    client, h = gmail_shapes
     assert _cte(client, h, doc) == {"text/plain": plain, "text/html": html}
 
 
-def test_gmail_a_text_attachment_names_us_ascii_or_utf8_by_its_content(gmail_382):
+def test_gmail_a_text_attachment_names_us_ascii_or_utf8_by_its_content(gmail_shapes):
     """An ASCII attachment was served `charset="US-ASCII"` (2026-10-01) and a Korean one
     `charset="UTF-8"` (2026-09-30)."""
-    client, h = gmail_382
+    client, h = gmail_shapes
     charsets = {}
     for doc in ("att", "att-ko"):
         parts = client.get(
@@ -4941,12 +4943,12 @@ def test_gmail_a_text_attachment_names_us_ascii_or_utf8_by_its_content(gmail_382
 
 
 @pytest.mark.parametrize("doc", ["att", "lt", "ko", "html175", "html325", "att-ko"])
-def test_gmail_raw_and_full_describe_one_message(gmail_382, doc):
+def test_gmail_raw_and_full_describe_one_message(gmail_shapes, doc):
     """`format=raw` and the `full` payload are the same tree, with the same headers on each part,
     and each raw part decodes, by its own Content-Transfer-Encoding, to the bytes `full` serves."""
     import email
 
-    client, h = gmail_382
+    client, h = gmail_shapes
     url = f"/gmail/v1/users/me/messages/{served_id('gmail', doc)}"
     full = client.get(url, headers=h).json()["payload"]
     raw = client.get(url, headers=h, params={"format": "raw"}).json()["raw"]
@@ -4973,8 +4975,8 @@ def test_gmail_raw_and_full_describe_one_message(gmail_382, doc):
         check(part, entity)
 
 
-def test_gmail_metadata_payload_is_mime_type_and_headers(gmail_382):
-    client, h = gmail_382
+def test_gmail_metadata_payload_is_mime_type_and_headers(gmail_shapes):
+    client, h = gmail_shapes
     for doc in ("att", "lt"):
         for params in (
             {"format": "metadata"},
@@ -4986,8 +4988,8 @@ def test_gmail_metadata_payload_is_mime_type_and_headers(gmail_382):
             assert sorted(m["payload"]) == ["headers", "mimeType"], (doc, params)
 
 
-def test_gmail_attachments_get_is_size_and_data(gmail_382):
-    client, h = gmail_382
+def test_gmail_attachments_get_is_size_and_data(gmail_shapes):
+    client, h = gmail_shapes
     mid = served_id("gmail", "att")
     payload = client.get(f"/gmail/v1/users/me/messages/{mid}", headers=h).json()["payload"]
     att = next(p for p in payload["parts"] if p["filename"])
@@ -5064,10 +5066,10 @@ def test_gmail_a_thread_carries_no_snippet(client, admin_h):
         assert sorted(thread) == ["historyId", "id", "messages"], params
 
 
-def test_gmail_snippet_escapes_angle_brackets(gmail_382):
+def test_gmail_snippet_escapes_angle_brackets(gmail_shapes):
     """`messages.get` and `threads.list` both send `<` and `>` as `&lt;` and `&gt;`, measured on
     2026-09-30 and 2026-10-01."""
-    client, h = gmail_382
+    client, h = gmail_shapes
     mid = served_id("gmail", "lt")
     m = client.get(f"/gmail/v1/users/me/messages/{mid}", headers=h).json()
     assert m["snippet"] == "a &lt; b & c &gt; d"
