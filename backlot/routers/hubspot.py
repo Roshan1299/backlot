@@ -493,7 +493,10 @@ def _match_one(prop, f: dict) -> bool:
     if op == "NOT_HAS_PROPERTY":
         return not present
     if not present:
-        return False
+        # A record without the property matches the three negative operators and no other one:
+        # real includes it under NEQ, NOT_IN and NOT_CONTAINS_TOKEN and leaves it out under EQ,
+        # CONTAINS_TOKEN, LT and GT, measured against api.hubapi.com on 2026-10-05.
+        return op in ("NEQ", "NOT_IN", "NOT_CONTAINS_TOKEN")
     target = f.get("value")
     cands = _values_of(prop)
 
