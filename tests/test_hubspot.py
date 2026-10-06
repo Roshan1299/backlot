@@ -490,6 +490,21 @@ def test_hubspot_search_prefilter_cannot_change_results(client, admin_h, monkeyp
                 }
             ]
         },
+        # IN on `domain`, which Stealth Health Co lacks: the pushdown drops that record, so Python
+        # has to as well
+        {
+            "filterGroups": [
+                {
+                    "filters": [
+                        {
+                            "propertyName": "domain",
+                            "operator": "IN",
+                            "values": ["acme-health.com", "borealis.example"],
+                        }
+                    ]
+                }
+            ]
+        },
         # a group whose filters mix a pushable and a non-pushable operator
         {
             "filterGroups": [
