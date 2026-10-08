@@ -106,6 +106,42 @@ def test_hubspot_read_one_record(client, admin_h):
     assert got["createdAt"].endswith("Z")
 
 
+def _each_route(client, company: str, headers: dict) -> list:
+    """One request to each HubSpot route: the listing, a record, search, batch/read and the
+    record's associations."""
+    return [
+        client.get("/hubspot/crm/v3/objects/companies", headers=headers),
+        client.get(f"/hubspot/crm/v3/objects/companies/{company}", headers=headers),
+        client.post("/hubspot/crm/v3/objects/companies/search", headers=headers, json={}),
+        client.post(
+            "/hubspot/crm/v3/objects/companies/batch/read",
+            headers=headers,
+            json={"inputs": [{"id": company}]},
+        ),
+        client.get(
+            f"/hubspot/crm/v4/objects/companies/{company}/associations/contacts", headers=headers
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    "authorization",
+    ["bearer {key}", "Bearer  {key}", "Bearer {key} x", "Basic Zm9vOmJhcg==", "{key}"],
+)
+def test_hubspot_reads_the_bearer_scheme_spelled_exactly(client, tokens_yaml, authorization):
+    """Measured against api.hubapi.com on 2026-09-30 with a valid key: a lower-case scheme, two
+    spaces after it, a word after the key, another scheme and no scheme are each the
+    INVALID_AUTHENTICATION 401, where `Bearer <key>` is served."""
+    key = tokens_yaml["admin_token"]
+    valid = {"Authorization": f"Bearer {key}"}
+    company = client.get("/hubspot/crm/v3/objects/companies", headers=valid).json()["results"][0]
+    for r in _each_route(client, company["id"], {"Authorization": authorization.format(key=key)}):
+        assert r.status_code == 401, (authorization, r.request.url)
+        assert r.json()["category"] == "INVALID_AUTHENTICATION"
+    for r in _each_route(client, company["id"], valid):
+        assert r.status_code in (200, 207), r.request.url
+
+
 def test_hubspot_unknown_object_type_is_400(client, admin_h):
     """A typo'd object type must not read as "this type has no records" — that silently turns a
     client bug into an empty result. An object type the caller simply cannot see any rows of is a
