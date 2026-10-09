@@ -49,11 +49,28 @@ def test_admin_hubspot_crawls_all(client, admin_h, ro_conn):
         ("true\r", False),
         ("\u00a0true", False),
         ("true\u00a0", False),
+        (["true", "false"], True),
+        (["true", ""], True),
+        (["true", "abc"], True),
+        (["TRUE", "false"], True),
+        (["True", "false"], True),
+        (["true", "false", "false"], True),
+        (["false", "true"], False),
+        (["", "true"], False),
+        (["yes", "true"], False),
+        (["1", "true"], False),
+        (["abc", "true"], False),
+        ([" true", "true"], False),
+        (["false", "TRUE"], False),
+        (["false", "false", "true"], False),
     ],
 )
-def test_hubspot_archived_parameter_reads_only_true_as_true(client, admin_h, value, archived):
-    """`_flag`'s rule over companies: the one archived company when `_flag` reads the value as true,
-    and otherwise the same page as a request without `archived`."""
+def test_hubspot_archived_parameter_reads_its_first_value_and_only_true_as_true(
+    client, admin_h, value, archived
+):
+    """`_flag`'s rule over companies, on the first value when `archived` repeats (a list row is
+    sent as the key repeated in list order): the one archived company when `_flag` reads that value
+    as true, and otherwise the same page as a request without `archived`."""
     url = "/hubspot/crm/v3/objects/companies"
     r = client.get(url, headers=admin_h, params={"archived": value})
     assert r.status_code == 200
@@ -61,6 +78,68 @@ def test_hubspot_archived_parameter_reads_only_true_as_true(client, admin_h, val
         assert [x["properties"]["name"] for x in r.json()["results"]] == ["Defunct Labs"]
     else:
         assert r.json() == client.get(url, headers=admin_h).json()
+
+
+@pytest.mark.parametrize(
+    "object_type,type_label",
+    [
+        ("meetings", "0-47 (MEETING_EVENT)"),
+        ("meeting", "0-47 (MEETING_EVENT)"),
+        ("0-47", "0-47 (MEETING_EVENT)"),
+        ("communications", "0-18 (COMMUNICATION)"),
+        ("communication", "0-18 (COMMUNICATION)"),
+        ("deal_splits", "0-72 (DEAL_SPLIT)"),
+        ("deal_split", "0-72 (DEAL_SPLIT)"),
+        ("quote_templates", "0-64 (QUOTE_TEMPLATE)"),
+        ("quote_template", "0-64 (QUOTE_TEMPLATE)"),
+    ],
+)
+def test_hubspot_archived_listing_refuses_unsupported_types(
+    client, admin_h, object_type, type_label
+):
+    url = f"/hubspot/crm/v3/objects/{object_type}"
+    r = client.get(url, headers=admin_h, params={"archived": "true"})
+    assert r.status_code == 400
+    body = r.json()
+    assert body["status"] == "error"
+    assert body["message"] == (
+        f"Paging through deleted objects is not yet supported for object type {type_label}"
+    )
+    assert body["category"] == "VALIDATION_ERROR"
+    assert client.get(url, headers=admin_h).status_code == 200
+
+
+@pytest.mark.parametrize(
+    "params,refused",
+    [
+        ({"archived": "TRUE"}, True),
+        ({"archived": "True"}, True),
+        ({"archived": ["true", "false"]}, True),
+        ({"archived": "true", "limit": "1"}, True),
+        ({"archived": "true", "properties": "hs_meeting_title"}, True),
+        ({"archived": "yes"}, False),
+        ({"archived": "false"}, False),
+        ({"archived": ["false", "true"]}, False),
+    ],
+)
+def test_hubspot_meetings_refuses_or_lists_by_the_parsed_flag(client, admin_h, params, refused):
+    url = "/hubspot/crm/v3/objects/meetings"
+    r = client.get(url, headers=admin_h, params=params)
+    expected = client.get(url, headers=admin_h, params={"archived": "true"} if refused else None)
+    assert r.status_code == (400 if refused else 200)
+    assert r.json() == expected.json()
+
+
+@pytest.mark.parametrize("headers", [None, "admin"])
+def test_hubspot_archived_refusal_follows_authentication_and_cursor_validation(
+    client, admin_h, headers
+):
+    url = "/hubspot/crm/v3/objects/meetings"
+    h = admin_h if headers == "admin" else {}
+    r = client.get(url, headers=h, params={"archived": "true", "after": "abc"})
+    control = client.get(url, headers=h, params={"after": "abc"})
+    assert r.status_code == control.status_code == (400 if h else 401)
+    assert r.json() == control.json()
 
 
 def test_hubspot_list_cursor_pages_without_overlap(client, admin_h):
