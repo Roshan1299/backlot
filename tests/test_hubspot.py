@@ -125,21 +125,33 @@ def _each_route(client, company: str, headers: dict) -> list:
 
 
 @pytest.mark.parametrize(
-    "authorization",
-    ["bearer {key}", "Bearer  {key}", "Bearer {key} x", "Basic Zm9vOmJhcg==", "{key}"],
+    ("authorization", "status"),
+    [
+        ("Bearer {key}", 200),
+        (" Bearer {key}", 200),
+        ("Bearer {key} ", 200),
+        ("Bearer {key}\t", 200),
+        ("bearer {key}", 401),
+        ("BEARER {key}", 401),
+        ("Bearer  {key}", 401),
+        ("Bearer\t{key}", 401),
+        ("Bearer {key} x", 401),
+        ("token {key}", 401),
+        ("Basic Zm9vOmJhcg==", 401),
+        ("{key}", 401),
+    ],
 )
-def test_hubspot_reads_the_bearer_scheme_spelled_exactly(client, tokens_yaml, authorization):
-    """Measured against api.hubapi.com on 2026-09-30 with a valid key: a lower-case scheme, two
-    spaces after it, a word after the key, another scheme and no scheme are each the
-    INVALID_AUTHENTICATION 401, where `Bearer <key>` is served."""
-    key = tokens_yaml["admin_token"]
-    valid = {"Authorization": f"Bearer {key}"}
-    company = client.get("/hubspot/crm/v3/objects/companies", headers=valid).json()["results"][0]
-    for r in _each_route(client, company["id"], {"Authorization": authorization.format(key=key)}):
-        assert r.status_code == 401, (authorization, r.request.url)
-        assert r.json()["category"] == "INVALID_AUTHENTICATION"
-    for r in _each_route(client, company["id"], valid):
-        assert r.status_code in (200, 207), r.request.url
+def test_hubspot_reads_the_bearer_scheme_spelled_exactly(
+    client, admin_h, tokens_yaml, authorization, status
+):
+    """Each of the five routes serves what `_bearer_credential` in `backlot.routers.hubspot`
+    records as served, and answers the other spellings with the INVALID_AUTHENTICATION 401."""
+    company = client.get("/hubspot/crm/v3/objects/companies", headers=admin_h).json()["results"][0]
+    headers = {"Authorization": authorization.format(key=tokens_yaml["admin_token"])}
+    for r in _each_route(client, company["id"], headers):
+        assert r.status_code == status, (authorization, r.request.url)
+        if status == 401:
+            assert r.json()["category"] == "INVALID_AUTHENTICATION"
 
 
 def test_hubspot_unknown_object_type_is_400(client, admin_h):
