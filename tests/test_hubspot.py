@@ -464,6 +464,60 @@ def test_hubspot_associations_v4(client, admin_h):
     assert assoc["associationTypes"][0]["label"] == "Primary"
 
 
+@pytest.fixture
+def ava_and_her_company(client, admin_h):
+    """The contact Ava's id, and the id of the company she is associated with."""
+    listed = client.get(
+        "/hubspot/crm/v3/objects/contacts", headers=admin_h, params={"limit": 100}
+    ).json()["results"]
+    ava = next(r for r in listed if r["properties"].get("firstname") == "Ava")["id"]
+    (company,) = client.get(
+        f"/hubspot/crm/v4/objects/contacts/{ava}/associations/companies", headers=admin_h
+    ).json()["results"]
+    return ava, company["toObjectId"]
+
+
+@pytest.mark.parametrize(
+    ("path", "status", "answer"),
+    [
+        ("/crm/v3/objects/Contacts", 200, "contacts"),
+        ("/crm/v3/objects/CONTACTS", 200, "contacts"),
+        ("/crm/v3/objects/Contacts/{ava}", 200, "ava"),
+        ("/crm/v3/objects/nosuch/{ava}", 400, "nosuch"),
+        ("/crm/v4/objects/contacts/{ava}/associations/company", 200, "company"),
+        ("/crm/v4/objects/contacts/{ava}/associations/0-2", 200, "company"),
+        ("/crm/v4/objects/contacts/{ava}/associations/nosuch", 400, "nosuch"),
+        ("/crm/v4/objects/nosuch/{ava}/associations/companies", 400, "nosuch"),
+        ("/crm/v4/objects/contacts/1/associations/companies", 200, "empty"),
+        ("/crm/v4/objects/deals/{ava}/associations/companies", 200, "empty"),
+    ],
+)
+def test_hubspot_object_types_resolve_as_real_resolves_them(
+    client, admin_h, ava_and_her_company, path, status, answer
+):
+    """Each row is one that `_canonical`, `get_object` and `list_associations` record as measured:
+    a standard type read without its case, a type real cannot infer refused on every path, the
+    target read under any of its spellings, and a missing or mismatched record an empty page."""
+    ava, company = ava_and_her_company
+    r = client.get("/hubspot" + path.format(ava=ava), headers=admin_h)
+    assert r.status_code == status, path
+    body = r.json()
+    if answer == "contacts":
+        lower = client.get("/hubspot/crm/v3/objects/contacts", headers=admin_h).json()
+        assert body == lower
+    elif answer == "ava":
+        assert body["id"] == ava
+    elif answer == "nosuch":
+        assert body == {
+            "status": "error",
+            "message": "Unable to infer object type from: nosuch",
+        }
+    elif answer == "company":
+        assert [x["toObjectId"] for x in body["results"]] == [company]
+    else:
+        assert body == {"results": []}
+
+
 def test_hubspot_search_filter_groups(client, admin_h):
     """filterGroups combine as OR, filters within a group as AND — over arbitrary properties."""
     body = {

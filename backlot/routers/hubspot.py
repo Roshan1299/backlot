@@ -382,13 +382,21 @@ _CANONICAL.update(_SINGULAR)
 _CANONICAL.update(_TYPE_IDS)
 
 
+def _canonical(object_type: str) -> str | None:
+    """The canonical name of a standard object type, read without its letter case: real serves the
+    contacts for `/crm/v3/objects/Contacts` and `…/CONTACTS` as for `…/contacts`, measured against
+    api.hubapi.com on 2026-09-30. A custom object keeps its exact spelling, since the case of one
+    was not measured."""
+    return _CANONICAL.get(object_type.lower())
+
+
 def _aliases(object_type: str) -> list[str]:
     """Every spelling of this object type — plural, singular and objectTypeId — with the one the
     caller asked for first, so a corpus that states two of them keeps the caller's own.
 
     A type outside the standard set is its own only spelling: a custom object is whatever the corpus
     called it."""
-    canonical = _CANONICAL.get(object_type)
+    canonical = _canonical(object_type)
     if canonical is None:
         return [object_type]
     rest = [spelling for spelling in _CANONICAL if _CANONICAL[spelling] == canonical]
@@ -412,7 +420,7 @@ def _resolve_type(request: Request, object_type: str) -> list[str] | None:
     names = _aliases(object_type)
     if any(store.get_container(conn, "hubspot", name) is not None for name in names):
         return names
-    canonical = _CANONICAL.get(object_type)
+    canonical = _canonical(object_type)
     return [canonical] if canonical else None
 
 
@@ -838,6 +846,11 @@ async def get_object(object_type: str, record_id: str, request: Request):
     caller = _caller(request)
     if caller is None:
         return _error(401, "Authentication credentials not found.", "INVALID_AUTHENTICATION")
+    # A type real cannot infer is its 400 here too, not a missing record: `GET
+    # /crm/v3/objects/nosuch/{id}` answered `Unable to infer object type from: nosuch`, measured
+    # against api.hubapi.com on 2026-09-30.
+    if _resolve_type(request, object_type) is None:
+        return _unknown_type(object_type)
     # One ACL-scoped query, not a resolve followed by a get_document refetch of the same row:
     # `id` is the PRIMARY KEY, so the ACL clause can only narrow "found" to "not found", never
     # redirect to a different row (see store.hubspot_by_id).
@@ -973,12 +986,18 @@ async def list_associations(
     caller = _caller(request)
     if caller is None:
         return _error(401, "Authentication credentials not found.", "INVALID_AUTHENTICATION")
+    # Measured against api.hubapi.com on 2026-09-30: a type real cannot infer is its 400 on either
+    # side of the path; the target is read under any of its spellings (`company` and `0-2` answer as
+    # `companies`); and a record that does not exist, or is of another type, is an empty page.
+    for name in (object_type, to_object_type):
+        if _resolve_type(request, name) is None:
+            return _unknown_type(name)
     conn, visible = auth.conn(request), auth.visible_ids(request, caller)
     # One ACL-scoped query, not a resolve followed by a get_document refetch of the same row --
     # see get_object's comment for why the collapse is safe.
     row = store.hubspot_by_id(conn, record_id, visible)
     if row is None or row["object_type"] not in _aliases(object_type):
-        return _error(404, "resource not found", "OBJECT_NOT_FOUND")
+        return {"results": []}
     limit = _clamp(request.query_params.get("limit"), _ASSOC_PAGE_MAX, _ASSOC_PAGE_MAX)
     after_to, err = _resolve_cursor(request, request.query_params.get("after"))
     if err is not None:
@@ -988,7 +1007,7 @@ async def list_associations(
     rows = store.hubspot_associations(
         conn,
         row["id"],
-        to_object_type,
+        _aliases(to_object_type),
         after_to_id=after_to,
         visible_ids=visible,
         limit=limit + 1,
