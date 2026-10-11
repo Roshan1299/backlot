@@ -32,6 +32,7 @@ def test_admin_hubspot_crawls_all(client, admin_h, ro_conn):
 @pytest.mark.parametrize(
     "value,archived",
     [
+        (None, False),
         ("true", True),
         ("TRUE", True),
         ("True", True),
@@ -69,42 +70,42 @@ def test_hubspot_archived_parameter_reads_its_first_value_and_only_true_as_true(
     client, admin_h, value, archived
 ):
     """`_flag`'s rule over companies, on the first value when `archived` repeats (a list row is
-    sent as the key repeated in list order): the one archived company when `_flag` reads that value
-    as true, and otherwise the same page as a request without `archived`."""
+    sent as the key repeated in list order, and `None` sends no `archived`). The listing answers the
+    one archived company when `_flag` reads that value as true, and otherwise the same page as a
+    request without `archived`. Read by id, alone or through batch/read, that company is served
+    when `_flag` reads the value as true and otherwise answered as a missing id is (see
+    `_hidden_archived`); an active company is served whatever the value."""
     url = "/hubspot/crm/v3/objects/companies"
-    r = client.get(url, headers=admin_h, params={"archived": value})
+    params = {} if value is None else {"archived": value}
+    r = client.get(url, headers=admin_h, params=params)
     assert r.status_code == 200
     if archived:
         assert [x["properties"]["name"] for x in r.json()["results"]] == ["Defunct Labs"]
     else:
         assert r.json() == client.get(url, headers=admin_h).json()
 
-
-def test_hubspot_an_archived_record_is_read_only_with_archived_true(client, admin_h):
-    """Measured against api.hubapi.com on 2026-09-30 over a portal with one archived contact: its
-    `GET …/{id}` was a 404, the same with `?archived=true` a 200 with the record, and batch/read
-    without `archived=true` a 207 with `results` empty and the not-found error for its id."""
-    (defunct,) = client.get(
-        "/hubspot/crm/v3/objects/companies", headers=admin_h, params={"archived": "true"}
-    ).json()["results"]
-    url = f"/hubspot/crm/v3/objects/companies/{defunct['id']}"
-
-    r = client.get(url, headers=admin_h)
-    assert r.status_code == 404
-    assert r.json()["category"] == "OBJECT_NOT_FOUND"
-
-    r = client.get(url, headers=admin_h, params={"archived": "true"})
-    assert r.status_code == 200
-    assert (r.json()["id"], r.json()["archived"]) == (defunct["id"], True)
-
-    r = client.post(
-        "/hubspot/crm/v3/objects/companies/batch/read",
-        headers=admin_h,
-        json={"inputs": [{"id": defunct["id"]}]},
-    )
-    assert r.status_code == 207
-    assert r.json()["results"] == []
-    assert [e["context"]["id"] for e in r.json()["errors"]] == [[defunct["id"]]]
+    (defunct,) = client.get(url, headers=admin_h, params={"archived": "true"}).json()["results"]
+    active = client.get(url, headers=admin_h).json()["results"][0]["id"]
+    missing = "999999999999"
+    for rid, served in ((defunct["id"], archived), (active, True)):
+        got = client.get(f"{url}/{rid}", headers=admin_h, params=params)
+        batch = client.post(
+            f"{url}/batch/read", headers=admin_h, params=params, json={"inputs": [{"id": rid}]}
+        )
+        if served:
+            assert (got.status_code, got.json()["id"]) == (200, rid)
+            assert (batch.status_code, [x["id"] for x in batch.json()["results"]]) == (200, [rid])
+        else:
+            assert (got.status_code, got.json()) == (
+                404,
+                client.get(f"{url}/{missing}", headers=admin_h).json(),
+            )
+            assert (batch.status_code, json.loads(batch.text.replace(rid, missing))) == (
+                207,
+                client.post(
+                    f"{url}/batch/read", headers=admin_h, json={"inputs": [{"id": missing}]}
+                ).json(),
+            )
 
 
 def test_hubspot_list_cursor_pages_without_overlap(client, admin_h):

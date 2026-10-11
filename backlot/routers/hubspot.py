@@ -104,6 +104,7 @@ _B_SEARCH = {
     }
 }
 _B_BATCH = {
+    "parameters": [qp("archived", "boolean")],
     "requestBody": {
         "content": {
             "application/json": {
@@ -120,7 +121,7 @@ _B_BATCH = {
                 }
             }
         }
-    }
+    },
 }
 
 
@@ -166,11 +167,12 @@ def _flag(raw) -> bool:
 
 
 def _hidden_archived(row, request: Request) -> bool:
-    """Whether ``row`` is archived and the request did not ask for archived records. Measured
-    against api.hubapi.com on 2026-09-30 over a portal with one archived contact: `GET
-    …/{id}` answered it 404, the same with `?archived=true` 200 with the record, and batch/read
-    without `archived=true` a 207 with `results` empty and the not-found error for its id. The
-    parameter is read as the listing reads it (`_flag` of its first value)."""
+    """Whether ``row`` is archived and the request did not ask for archived records, reading
+    `archived` as the listing does (`_flag` of its first value). Measured against api.hubapi.com
+    over a portal with one archived contact (2026-09-30, 2026-10-09): `GET …/{id}` answers it with
+    the 404 a missing id gets, and batch/read with the not-found error a missing id gets, unless the
+    first `archived` is `true` in any letter case; an active contact is served by both whatever
+    `archived` is."""
     return row["archived"] is not None and not _flag(_first_query(request.query_params, "archived"))
 
 
