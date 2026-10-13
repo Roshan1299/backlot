@@ -513,6 +513,7 @@ _NOT_FOUND = {"status": "error", "message": "resource not found", "category": "O
         (_assoc("{ava}", to="nosuchtwo", source="nosuchone"), 400, _cannot_infer("nosuchone")),
         (_assoc("1"), 200, _EMPTY),
         (_assoc("9223372036854775807"), 200, _EMPTY),
+        (_assoc("0" * 25 + "1"), 200, _EMPTY),
         (_assoc("{ava}", source="deals"), 200, _EMPTY),
         (_assoc("abc"), 404, _NOT_FOUND),
         (_assoc("1.0"), 404, _NOT_FOUND),
