@@ -96,9 +96,11 @@ def test_hubspot_archived_parameter_reads_its_first_value_and_only_true_as_true(
             assert (got.status_code, got.json()["id"]) == (200, rid)
             assert (batch.status_code, [x["id"] for x in batch.json()["results"]]) == (200, [rid])
         else:
-            assert (got.status_code, got.json()) == (
+            gone = client.get(f"{url}/{missing}", headers=admin_h)
+            assert (got.status_code, got.headers["content-type"], got.content) == (
                 404,
-                client.get(f"{url}/{missing}", headers=admin_h).json(),
+                gone.headers["content-type"],
+                gone.content,
             )
             assert (batch.status_code, json.loads(batch.text.replace(rid, missing))) == (
                 207,
@@ -433,6 +435,42 @@ def test_hubspot_missing_record_is_404(client, admin_h):
     )
 
 
+_MISSING_RECORD_PAGE = (
+    b"<html>\n<head>\n"
+    b'<meta http-equiv="Content-Type" content="text/html;charset=utf-8"/>\n'
+    b"<title>Error 404 Not Found</title>\n</head>\n"
+    b"<body><h2>HTTP ERROR 404</h2>\n<p>Resource not found</p>\n</body>\n</html>\n"
+)
+
+
+@pytest.mark.parametrize("record", ["1", "9223372036854775807", "deals/{ava}"])
+def test_hubspot_a_record_id_that_names_nothing_is_real_html_page(client, admin_h, ava, record):
+    """An id real looks up but finds nothing under is its HTML 404 page, byte for byte and under its
+    Latin-1 content type: a missing contact, the largest id that parses, and a contact's id asked
+    for as a deal."""
+    path = record.format(ava=ava) if "/" in record else f"contacts/{record}"
+    r = client.get(f"/hubspot/crm/v3/objects/{path}", headers=admin_h)
+    assert (r.status_code, r.headers["content-type"], r.content) == (
+        404,
+        "text/html;charset=iso-8859-1",
+        _MISSING_RECORD_PAGE,
+    )
+
+
+def test_hubspot_an_id_too_long_for_any_64_bit_value_is_the_numeric_404(client, admin_h):
+    """Not measured at this length: it checks that an id longer than Python's `int` will parse
+    (4300 digits) gets the same answer as the measured 23-digit one rather than a server error."""
+    record = "9" * 5000
+    r = client.get(f"/hubspot/crm/v3/objects/contacts/{record}", headers=admin_h)
+    assert (r.status_code, r.json()) == (404, _not_looked_up(record, "numeric"))
+
+
+def test_hubspot_an_id_real_wont_look_up_is_json_in_real_member_order(client, admin_h):
+    """The JSON 404 lists its members in real's order: status, message, context, category."""
+    r = client.get("/hubspot/crm/v3/objects/contacts/abc", headers=admin_h)
+    assert list(r.json()) == ["status", "message", "context", "category"]
+
+
 def test_hubspot_unauth_is_401(client):
     assert client.get("/hubspot/crm/v3/objects/companies").status_code == 401
 
@@ -497,7 +535,20 @@ def _cannot_infer(name):
 
 
 _EMPTY = {"results": []}
-_NOT_FOUND = {"status": "error", "message": "resource not found", "category": "OBJECT_NOT_FOUND"}
+
+
+def _not_looked_up(record, why):
+    """Real's 404 for an id it won't look up: `why` is "numeric" or "positive"."""
+    message = {
+        "numeric": "Object not found.  objectId are usually numeric.",
+        "positive": "Object not found. objectId is usually positive.",
+    }[why]
+    return {
+        "status": "error",
+        "message": message,
+        "context": {"id": [record]},
+        "category": "OBJECT_NOT_FOUND",
+    }
 
 
 @pytest.mark.parametrize(
@@ -515,13 +566,32 @@ _NOT_FOUND = {"status": "error", "message": "resource not found", "category": "O
         (_assoc("9223372036854775807"), 200, _EMPTY),
         (_assoc("0" * 25 + "1"), 200, _EMPTY),
         (_assoc("{ava}", source="deals"), 200, _EMPTY),
-        (_assoc("abc"), 404, _NOT_FOUND),
-        (_assoc("1.0"), 404, _NOT_FOUND),
-        (_assoc("\u0661"), 404, _NOT_FOUND),
-        (_assoc("0"), 404, _NOT_FOUND),
-        (_assoc("-1"), 404, _NOT_FOUND),
-        (_assoc("9223372036854775808"), 404, _NOT_FOUND),
-        (_assoc("abc") + "?after=bogus", 404, _NOT_FOUND),
+        (_assoc("0{ava}"), 200, _assoc("{ava}")),
+        (_assoc("abc"), 404, _not_looked_up("abc", "numeric")),
+        (_assoc("1.0"), 404, _not_looked_up("1.0", "numeric")),
+        (_assoc("+1"), 404, _not_looked_up("+1", "numeric")),
+        (_assoc("\u0661"), 404, _not_looked_up("\u0661", "numeric")),
+        (_assoc("0"), 404, _not_looked_up("0", "positive")),
+        (_assoc("-1"), 404, _not_looked_up("-1", "positive")),
+        (_assoc("9223372036854775808"), 404, _not_looked_up("9223372036854775808", "numeric")),
+        (_assoc("abc") + "?after=bogus", 404, _not_looked_up("abc", "numeric")),
+        ("/crm/v3/objects/contacts/0{ava}", 200, "/crm/v3/objects/contacts/{ava}"),
+        ("/crm/v3/objects/contacts/abc", 404, _not_looked_up("abc", "numeric")),
+        ("/crm/v3/objects/contacts/1.0", 404, _not_looked_up("1.0", "numeric")),
+        ("/crm/v3/objects/contacts/+1", 404, _not_looked_up("+1", "numeric")),
+        ("/crm/v3/objects/contacts/\u0661", 404, _not_looked_up("\u0661", "numeric")),
+        (
+            "/crm/v3/objects/contacts/99999999999999999999999",
+            404,
+            _not_looked_up("99999999999999999999999", "numeric"),
+        ),
+        (
+            "/crm/v3/objects/contacts/9223372036854775808",
+            404,
+            _not_looked_up("9223372036854775808", "numeric"),
+        ),
+        ("/crm/v3/objects/contacts/0", 404, _not_looked_up("0", "positive")),
+        ("/crm/v3/objects/contacts/-1", 404, _not_looked_up("-1", "positive")),
         (_assoc("1") + "?after=bogus", 400, _assoc("{ava}") + "?after=bogus"),
         (_assoc("{ava}", source="deals") + "?after=bogus", 400, _assoc("{ava}") + "?after=bogus"),
     ],
@@ -529,10 +599,11 @@ _NOT_FOUND = {"status": "error", "message": "resource not found", "category": "O
 def test_hubspot_object_types_resolve_as_real_resolves_them(
     client, admin_h, ava, path, status, want
 ):
-    """Each row is one that `_canonical`, `get_object` and `list_associations` record as measured.
-    Where `want` is a path, the row answers what that path does, here and on real: the target under
-    its plural, for another spelling of it; and Ava's own associations, for a bad `after`, since the
-    cursor is refused before a missing or mismatched record is an empty page."""
+    """Each row is one that `_canonical`, `_record_id`, `get_object` and `list_associations` record
+    as measured. Where `want` is a path, the row answers what that path does, here and on real: the
+    target under its plural, for another spelling of it; Ava's own associations, for a bad `after`,
+    since the cursor is refused before a missing or mismatched record is an empty page; and Ava
+    herself, or her associations, for her id with a leading zero."""
     r = client.get("/hubspot" + path.format(ava=ava), headers=admin_h)
     assert r.status_code == status, path
     if isinstance(want, str):
