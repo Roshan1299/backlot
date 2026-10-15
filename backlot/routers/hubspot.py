@@ -174,7 +174,7 @@ def _record_id(record_id: str) -> str | JSONResponse:
     holds the id as sent. Those ids fit one reading, applied here to every id: ASCII digits, an
     optional `-` and leading zeros, naming a signed 64-bit value, looked up above 0 and "positive"
     otherwise, and anything that doesn't parse "numeric". Real's body also carries a
-    `correlationId`, which no error here carries yet."""
+    `correlationId`, which this one leaves out."""
     # At most 19 significant digits, so `int` never meets a string too long for it to convert.
     m = re.fullmatch(r"(-?)0*([0-9]{1,19})", record_id)
     value = int(m[1] + m[2]) if m else None

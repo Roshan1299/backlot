@@ -443,34 +443,6 @@ _MISSING_RECORD_PAGE = (
 )
 
 
-@pytest.mark.parametrize("record", ["1", "9223372036854775807", "deals/{ava}"])
-def test_hubspot_a_record_id_that_names_nothing_is_real_html_page(client, admin_h, ava, record):
-    """An id real looks up but finds nothing under is its HTML 404 page, byte for byte and under its
-    Latin-1 content type: a missing contact, the largest id that parses, and a contact's id asked
-    for as a deal."""
-    path = record.format(ava=ava) if "/" in record else f"contacts/{record}"
-    r = client.get(f"/hubspot/crm/v3/objects/{path}", headers=admin_h)
-    assert (r.status_code, r.headers["content-type"], r.content) == (
-        404,
-        "text/html;charset=iso-8859-1",
-        _MISSING_RECORD_PAGE,
-    )
-
-
-def test_hubspot_an_id_too_long_for_any_64_bit_value_is_the_numeric_404(client, admin_h):
-    """Not measured at this length: it checks that an id longer than Python's `int` will parse
-    (4300 digits) gets the same answer as the measured 23-digit one rather than a server error."""
-    record = "9" * 5000
-    r = client.get(f"/hubspot/crm/v3/objects/contacts/{record}", headers=admin_h)
-    assert (r.status_code, r.json()) == (404, _not_looked_up(record, "numeric"))
-
-
-def test_hubspot_an_id_real_wont_look_up_is_json_in_real_member_order(client, admin_h):
-    """The JSON 404 lists its members in real's order: status, message, context, category."""
-    r = client.get("/hubspot/crm/v3/objects/contacts/abc", headers=admin_h)
-    assert list(r.json()) == ["status", "message", "context", "category"]
-
-
 def test_hubspot_unauth_is_401(client):
     assert client.get("/hubspot/crm/v3/objects/companies").status_code == 401
 
@@ -495,9 +467,11 @@ def test_hubspot_acl_hides_restricted_record(client, tokens_yaml, admin_h):
         for r in crawl_hubspot(client, admin_h, "companies")
         if r["properties"].get("name") == "Stealth Health Co"
     )
-    url = f"/hubspot/crm/v3/objects/companies/{secret['id']}"
-    assert client.get(url, headers=ava_h).status_code == 404
-    assert client.get(url, headers=hana_h).status_code == 200
+    for record in (secret["id"], "0" + secret["id"]):
+        url = f"/hubspot/crm/v3/objects/companies/{record}"
+        hidden = client.get(url, headers=ava_h)
+        assert (hidden.status_code, hidden.content) == (404, _MISSING_RECORD_PAGE), record
+        assert client.get(url, headers=hana_h).status_code == 200, record
 
 
 def test_hubspot_associations_v4(client, admin_h):
@@ -592,6 +566,24 @@ def _not_looked_up(record, why):
         ),
         ("/crm/v3/objects/contacts/0", 404, _not_looked_up("0", "positive")),
         ("/crm/v3/objects/contacts/-1", 404, _not_looked_up("-1", "positive")),
+        ("/crm/v3/objects/contacts/00", 404, _not_looked_up("00", "positive")),
+        ("/crm/v3/objects/contacts/-00", 404, _not_looked_up("-00", "positive")),
+        (
+            "/crm/v3/objects/contacts/-9223372036854775808",
+            404,
+            _not_looked_up("-9223372036854775808", "positive"),
+        ),
+        (
+            "/crm/v3/objects/contacts/-9223372036854775809",
+            404,
+            _not_looked_up("-9223372036854775809", "numeric"),
+        ),
+        # longer than `int` converts (4300 digits): the 23-digit row's answer, not a server error
+        ("/crm/v3/objects/contacts/" + "9" * 5000, 404, _not_looked_up("9" * 5000, "numeric")),
+        ("/crm/v3/objects/nosuch/abc", 400, _cannot_infer("nosuch")),
+        ("/crm/v3/objects/contacts/1", 404, _MISSING_RECORD_PAGE),
+        ("/crm/v3/objects/contacts/9223372036854775807", 404, _MISSING_RECORD_PAGE),
+        ("/crm/v3/objects/deals/{ava}", 404, _MISSING_RECORD_PAGE),
         (_assoc("1") + "?after=bogus", 400, _assoc("{ava}") + "?after=bogus"),
         (_assoc("{ava}", source="deals") + "?after=bogus", 400, _assoc("{ava}") + "?after=bogus"),
     ],
@@ -603,14 +595,18 @@ def test_hubspot_object_types_resolve_as_real_resolves_them(
     as measured. Where `want` is a path, the row answers what that path does, here and on real: the
     target under its plural, for another spelling of it; Ava's own associations, for a bad `after`,
     since the cursor is refused before a missing or mismatched record is an empty page; and Ava
-    herself, or her associations, for her id with a leading zero."""
+    herself, or her associations, for her id with a leading zero. Where `want` is bytes, it is the
+    HTML page, under real's Latin-1 content type. A JSON answer's members come in real's order."""
     r = client.get("/hubspot" + path.format(ava=ava), headers=admin_h)
     assert r.status_code == status, path
+    if isinstance(want, bytes):
+        assert (r.headers["content-type"], r.content) == ("text/html;charset=iso-8859-1", want)
+        return
     if isinstance(want, str):
         twin = client.get("/hubspot" + want.format(ava=ava), headers=admin_h).json()
         assert twin != _EMPTY
         want = twin
-    assert r.json() == want
+    assert list(r.json().items()) == list(want.items())
 
 
 def test_hubspot_search_filter_groups(client, admin_h):
