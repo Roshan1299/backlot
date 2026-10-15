@@ -148,8 +148,8 @@ def _error(status: int, message: str, category: str = "VALIDATION_ERROR") -> JSO
 
 # Real's answer on the record route for an id that parses but names nothing visible: this page,
 # 197 bytes, under a Latin-1 content type although its own `<meta>` says utf-8. `contacts/1`,
-# `contacts/9223372036854775807` and `deals/{a contact's id}` answered it byte for byte the same on
-# api.hubapi.com (2026-09-30, 2026-10-14).
+# `contacts/9223372036854775807` and `deals/{a contact's id}` answered it byte for byte the same
+# against api.hubapi.com on 2026-09-30, 2026-10-14 and 2026-10-15.
 _MISSING_RECORD_PAGE = (
     b"<html>\n<head>\n"
     b'<meta http-equiv="Content-Type" content="text/html;charset=utf-8"/>\n'
