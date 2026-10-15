@@ -842,6 +842,11 @@ _OPERATOR_ROWS = [
     _op("default-separators", _jobtitle([("neq", "Salesperson")], compact=False), _enum_refusal(1, 73)),
     _op("indent", json.dumps(json.loads(_jobtitle([("neq", "Salesperson")])), indent=2), _enum_refusal(7, 23)),
     _op("crlf", json.dumps(json.loads(_jobtitle([("neq", "Salesperson")])), indent=2).replace("\n", "\r\n"), _enum_refusal(7, 23)),
+    _op("lone-cr", '{\r"filterGroups":[{"filters":[{"propertyName":"name","operator":"BOGUS"}]}]}', _enum_refusal(2, 63), object_type="companies"),
+    _op("byte-order-mark", '\ufeff{"filterGroups":[{"filters":[{"propertyName":"name","operator":"BOGUS"}]}]}', _enum_refusal(1, 67), object_type="companies"),
+    # a UTF-16 body is read in its own encoding, and its byte-order mark takes no column
+    _op("utf-16", '{"filterGroups":[{"filters":[{"propertyName":"name","operator":"BOGUS"}]}]}'.encode("utf-16-le"), _enum_refusal(1, 64), object_type="companies"),
+    _op("utf-16-byte-order-mark", '{"filterGroups":[{"filters":[{"propertyName":"name","operator":"BOGUS"}]}]}'.encode("utf-16"), _enum_refusal(1, 64), object_type="companies"),
     _op("tab-indent", json.dumps(json.loads(_jobtitle([("neq", "Salesperson")])), indent="\t"), _enum_refusal(7, 18)),
     _op("two-byte-chars-before", _value_first("ééé", ensure_ascii=False), _enum_refusal(1, 85)),
     _op("escaped-chars-before", _value_first("ééé", ensure_ascii=True), _enum_refusal(1, 97)),
@@ -892,7 +897,7 @@ def test_hubspot_search_reads_a_filter_operator_as_real_does(
     the body is served."""
     headers = {"Content-Type": "application/json", **(admin_h if authed else {})}
     url = f"/hubspot/crm/v3/objects/{object_type}/search"
-    r = client.post(url, headers=headers, content=raw.encode())
+    r = client.post(url, headers=headers, content=raw if isinstance(raw, bytes) else raw.encode())
     if isinstance(want, dict):
         assert (r.status_code, r.json()) == (400, want)
     elif isinstance(want, tuple):
@@ -1094,10 +1099,10 @@ def test_hubspot_batch_read(client, admin_h):
     assert {r["id"] for r in j["results"]} == set(ids)
 
 
-def _batch_refusal(column: int, text: str) -> dict:
+def _batch_refusal(column: int, text: str, line: int = 1) -> dict:
     return {
         "status": "error",
-        "message": f"Invalid input JSON on line 1, column {column}: {text}",
+        "message": f"Invalid input JSON on line {line}, column {column}: {text}",
         "category": "VALIDATION_ERROR",
     }
 
@@ -1132,6 +1137,9 @@ _ARRAY = "Cannot deserialize value of type  from Array value (token `JsonToken.S
 _BATCH_BODY_ROWS = [
     _br("inputs-string", '{"inputs":"x"}', _batch_refusal(11, _not_a_list("String", "VALUE_STRING"))),
     _br("inputs-blank-string", '{"inputs":" "}', _batch_refusal(11, _not_a_list("String", "VALUE_STRING"))),
+    _br("inputs-string-after-a-lone-cr", '{\r"inputs":"x"}', _batch_refusal(10, _not_a_list("String", "VALUE_STRING"), line=2)),
+    _br("inputs-string-after-crlf", '{\r\n"inputs":"x"}', _batch_refusal(10, _not_a_list("String", "VALUE_STRING"), line=2)),
+    _br("inputs-string-after-a-byte-order-mark", '\ufeff{"inputs":"x"}', _batch_refusal(14, _not_a_list("String", "VALUE_STRING"))),
     _br("inputs-object", '{"inputs":{"id":"1"}}', _batch_refusal(11, _not_a_list("Object", "START_OBJECT"))),
     _br("inputs-integer", '{"inputs":5}', _batch_refusal(11, _not_a_list("Integer", "VALUE_NUMBER_INT"))),
     _br("inputs-float", '{"inputs":1.5}', _batch_refusal(11, _not_a_list("Floating-point", "VALUE_NUMBER_FLOAT"))),
@@ -1235,6 +1243,9 @@ _TOKEN_ROWS = [
     # the position, counted as `_token_at` counts one
     _nt("lf", "search", '{\n"limit":NaN}', _token_refusal(12, "NaN", line=2)),
     _nt("crlf", "search", '{\r\n"limit":NaN}', _token_refusal(12, "NaN", line=2)),
+    _nt("lone-cr", "search", '{\r"limit":NaN}', _token_refusal(12, "NaN", line=2)),
+    _nt("double-cr", "search", '{\r\r"limit":NaN}', _token_refusal(12, "NaN", line=3)),
+    _nt("byte-order-mark", "search", b'\xef\xbb\xbf{"limit":NaN}', _token_refusal(16, "NaN")),
     _nt("tab", "search", '{\t"limit":NaN}', _token_refusal(14, "NaN")),
     _nt("two-byte-char-before", "search", '{"query":"é","limit":NaN}', _token_refusal(26, "NaN")),
     _nt("three-and-four-byte-chars-before", "search", '{"query":"' + chr(0x20AC) + chr(0x1F600) + '","limit":NaN}', _token_refusal(31, "NaN")),
