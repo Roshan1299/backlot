@@ -257,7 +257,7 @@ async def refuse_an_unserved_github_operation(request: Request, call_next):
 
 @app.middleware("http")
 async def refuse_an_unserved_hubspot_operation(request: Request, call_next):
-    """A write HubSpot publishes that no route here serves is refused for its credential as a
+    """An operation HubSpot publishes that no route here serves is refused for its credential as a
     served route refuses one, ahead of the router's 404 or 405
     (``backlot.routers.hubspot.refuse_an_unserved_operation``)."""
     if request.scope["path"].startswith("/hubspot/"):

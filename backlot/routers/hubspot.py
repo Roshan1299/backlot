@@ -1107,16 +1107,17 @@ def _caller(request: Request) -> Caller | None:
     return auth.acl(request).resolve(_bearer_credential(request))
 
 
-#: The HubSpot baseline's ``missing`` operations (``backlot.published``): writes HubSpot publishes
-#: that no route here serves.
+#: The HubSpot baseline's ``missing`` operations (``backlot.published``): what HubSpot publishes
+#: that no route here serves, its CRM writes and the v4 association `batch/read` among them.
 _PUBLISHED_NOT_SERVED = published.not_served("hubspot")
 
 
 #: The scopes real's 403 lists for a write on each object type, in its order. Measured against
-#: api.hubapi.com on 2026-10-18 with a read-only service key: `PATCH` and `DELETE` on
+#: api.hubapi.com on 2026-10-18 with a service key: `PATCH` and `DELETE` on
 #: `/crm/v3/objects/{type}/1` answered each list the same on every request, for `contact`,
-#: `CONTACTS` and `0-1` as for `contacts`. That key holds the write scopes of the other standard
-#: types (`tickets`, `notes` and the rest), so their lists are unmeasured.
+#: `CONTACTS` and `0-1` as for `contacts`. That key passes the scope check on `tickets`, `notes`,
+#: `tasks`, `calls`, `emails`, `meetings`, `line_items` and `products`, and no other standard type
+#: was sent, so no other type's list is measured.
 _WRITE_SCOPES = {
     "contacts": [
         "crm.schemas.contacts.write",
@@ -1177,16 +1178,17 @@ def refuse_an_unserved_operation(request: Request) -> JSONResponse | None:
     names no contact and was the 403, against api.hubapi.com on 2026-10-18). A `PATCH` body that
     doesn't parse, such as `{`, is real's JSON 400 ahead of the scopes; it is the 403 here, and that
     parse belongs between the type and the scopes once Backlot parses request bodies the way real
-    does. None otherwise, so the write goes on to the router's own 404 or 405, an operation Backlot
-    cannot run.
+    does. None otherwise, so the request goes on to the router's own 404 or 405, an operation
+    Backlot cannot run.
 
     Measured against api.hubapi.com on 2026-09-28 with no `Authorization` header and with
     `Bearer nope`: `POST /crm/v3/objects/contacts`, `PATCH` and `DELETE`
     `/crm/v3/objects/contacts/abc123` and `POST /crm/v3/objects/contacts/batch/create` each answered
     the 401 a served route answers, where `GET /crm/v3/nonexistent-xyz`, which HubSpot does not
-    publish, was a 404 with no key, so only the baseline's operations are refused. The other
-    operations the baseline lists, the v4 association writes among them, were not sent; they are
-    refused here by the same rule. The path is the scope's, decoded but whole, as
+    publish, was a 404 with no key, so only the baseline's operations are refused. On 2026-10-19
+    every other operation the baseline lists answered the same 401 both ways, the v4 association
+    writes and `batch/read` among them, and so did `PATCH` on `zzz/1` and `DELETE` on `2-999/1`,
+    whose types real can't resolve. The path is the scope's, decoded but whole, as
     ``backlot.routers.github.is_an_unserved_operation`` reads it.
     """
     path = request.scope["path"].removeprefix("/hubspot")

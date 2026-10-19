@@ -507,12 +507,18 @@ def test_hubspot_unauth_is_401(client):
         ("DELETE", "/hubspot/crm/v3/objects/contacts/abc123"),
         ("POST", "/hubspot/crm/v3/objects/contacts/batch/create"),
         ("DELETE", "/hubspot/crm/v4/objects/contacts/1/associations/companies/2"),
+        ("POST", "/hubspot/crm/v4/associations/contacts/companies/batch/read"),
+        ("PATCH", "/hubspot/crm/v3/objects/zzz/1"),
+        ("DELETE", "/hubspot/crm/v3/objects/2-999/1"),
     ],
 )
-def test_hubspot_refuses_an_unserved_write_for_its_credential(client, method, path, authorization):
-    """A write HubSpot publishes and no route here serves, sent with no key or one that names
-    nothing, is the INVALID_AUTHENTICATION 401 a served route answers, as
-    `refuse_an_unserved_operation` in `backlot.routers.hubspot` records, not FastAPI's 404 or 405."""
+def test_hubspot_refuses_an_unserved_operation_for_its_credential(
+    client, method, path, authorization
+):
+    """An operation HubSpot publishes and no route here serves, sent with no key or one that names
+    nothing, is the INVALID_AUTHENTICATION 401 a served route answers, ahead of an object type real
+    can't resolve, as `refuse_an_unserved_operation` in `backlot.routers.hubspot` records, not
+    FastAPI's 404 or 405."""
     headers = {"Authorization": authorization} if authorization else {}
     r = client.request(method, path, headers=headers, json={})
     assert r.status_code == 401
@@ -594,30 +600,45 @@ def test_hubspot_refuses_a_record_write_for_the_scopes_of_its_type(
     [
         ("zzz", 400, {"status": "error", "message": "Unable to infer object type from: zzz"}),
         ("2-999", 400, {"status": "error", "message": "Invalid object or event type id: 2-999"}),
-        ("tickets", 405, {"detail": "Method Not Allowed"}),
     ],
 )
 def test_hubspot_checks_a_record_writes_type_before_its_scopes(
     client, admin_h, method, object_type, status, body
 ):
-    """With a key that resolves, a type real can't resolve is its 400 ahead of the scopes, and a
-    standard type whose write scopes are unmeasured goes on to the router, whose 405 stands for an
-    operation Backlot cannot run (`refuse_an_unserved_operation` in `backlot.routers.hubspot`)."""
+    """With a key that resolves, a type real can't resolve is its 400 ahead of the scopes
+    (`refuse_an_unserved_operation` in `backlot.routers.hubspot`)."""
     r = client.request(method, f"/hubspot/crm/v3/objects/{object_type}/1", headers=admin_h)
     assert (r.status_code, r.json()) == (status, body)
 
 
+@pytest.mark.parametrize(
+    ("method", "path", "status"),
+    [
+        ("PATCH", "/hubspot/crm/v3/objects/tickets/1", 405),
+        ("DELETE", "/hubspot/crm/v3/objects/tickets/1", 405),
+        ("POST", "/hubspot/crm/v3/objects/contacts/merge", 405),
+        ("DELETE", "/hubspot/crm/v4/objects/contacts/1/associations/companies/2", 404),
+    ],
+)
+def test_hubspot_leaves_the_other_keyed_operations_to_the_router(
+    client, admin_h, method, path, status
+):
+    """With a key that resolves, a record write on a type outside `_WRITE_SCOPES`, and an operation
+    other than `PATCH` and `DELETE` on a record, go on to the router, whose 404 or 405 stands for an
+    operation Backlot cannot run (`refuse_an_unserved_operation` in `backlot.routers.hubspot`)."""
+    assert client.request(method, path, headers=admin_h, json={}).status_code == status
+
+
 def test_hubspot_answers_a_record_patch_that_does_not_parse_with_the_scopes(client, admin_h):
-    """A `PATCH` body that doesn't parse is real's JSON 400 ahead of the scopes; Backlot doesn't
-    parse it yet and answers the 403, as `refuse_an_unserved_operation` in
-    `backlot.routers.hubspot` records."""
+    """A `PATCH` body that doesn't parse is answered with the scopes' 403, as
+    `refuse_an_unserved_operation` in `backlot.routers.hubspot` records."""
     headers = {**admin_h, "Content-Type": "application/json"}
     r = client.request("PATCH", "/hubspot/crm/v3/objects/contacts/1", headers=headers, content="{")
     assert (r.status_code, r.json()["category"]) == (403, "MISSING_SCOPES")
 
 
 def test_hubspot_does_not_refuse_an_unpublished_path_for_its_credential(client):
-    """Only the published writes are refused for their credential: a path HubSpot does not publish
+    """Only what HubSpot publishes is refused for its credential: a path HubSpot does not publish
     is still a 404 with no key, as `refuse_an_unserved_operation` in `backlot.routers.hubspot`
     records."""
     assert client.get("/hubspot/crm/v3/nonexistent-xyz").status_code == 404
