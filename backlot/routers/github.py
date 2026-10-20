@@ -210,22 +210,73 @@ def honours_api_version(request: Request) -> bool:
 
 
 def selected_api_version(request: Request) -> str | None:
-    """The version this request selected, or ``None`` if it pinned one that does not exist."""
+    """The version this request selected, or ``None`` if it pinned one that does not exist.
+
+    An empty header selects the default, as no header does: on api.github.com on 2026-10-18,
+    `X-GitHub-Api-Version:` with nothing after it was answered as an unpinned request and echoed
+    `2022-11-28` on `/repos/{owner}/{repo}`, its `/issues`, `/orgs/{org}`, `/zen` and
+    `DELETE /installation/token`, where `1999-01-01` is the version's 400.
+    """
     pinned = request.headers.get(API_VERSION_HEADER)
-    if pinned is None:
+    if not pinned:
         return DEFAULT_API_VERSION
     return pinned if pinned in API_VERSIONS else None
 
 
-def _unsupported_version_error(pinned: str) -> HTTPException:
-    """Real's own 400, wording included — a client that matches on the message needs the real text.
+def _go_quoted(value: str) -> str:
+    """``value``'s bytes in double quotes as Go's `strconv.Quote` writes them, which is how real's
+    backend names the version it refused: `"` and `\\` behind a backslash, a tab as `\\t`, a byte
+    that is not UTF-8 as `\\x` and its two hex digits, a character Go does not print as `\\u` and
+    four (`\\U` and eight past U+FFFF), and every other character as it came. What Go prints is
+    what `str.isprintable` keeps: letters, marks, numbers, punctuation, symbols and the ASCII space,
+    each by the Unicode version it carries.
+
+    Measured against api.github.com on 2026-10-19, sending each byte from 0x01 to 0xFF but CR and
+    LF between an `a` and a `b` on `contents/README.md`, then UTF-8 sequences the same way: the
+    printable ASCII came back as sent but for `"` and `\\`, a tab as `\\t`, a lone byte from 0x80
+    up as `\\x` and its digits, `é`, U+FFFD, U+10000, an emoji and a combining acute as sent,
+    U+00A0, U+2028, U+2029, U+200B, U+E000 and U+FFFF as `\\u` escapes, U+10FFFF as `\\U0010ffff`,
+    and each byte of a truncated, overlong, surrogate or past-U+10FFFF sequence as `\\x`. The other
+    control bytes and DEL were the front door's 400 and reached no backend. Real's Go carries
+    Unicode 15.0, as Python 3.12 does: U+1F6DC and U+31350, new in 15.0, came back as sent, and
+    U+2EBF0, U+31EF and U+2FFC from 15.1 and U+1CC00 from 16.0 as escapes.
+    """
+    out = []
+    for ch in value.encode("latin-1").decode("utf-8", "surrogateescape"):
+        cp = ord(ch)
+        if 0xDC80 <= cp <= 0xDCFF:  # where `surrogateescape` puts an undecodable byte
+            out.append(f"\\x{cp & 0xFF:02x}")
+        elif ch in '"\\':
+            out.append("\\" + ch)
+        elif ch == "\t":
+            out.append("\\t")
+        elif ch.isprintable():
+            out.append(ch)
+        else:
+            out.append(f"\\u{cp:04x}" if cp < 0x10000 else f"\\U{cp:08x}")
+    return '"' + "".join(out) + '"'
+
+
+def _unsupported_version_error(pinned: str, *, backend: bool = False) -> HTTPException:
+    """The gateway or backend's 400, including the wording a client can match on.
 
     Composed from ``API_VERSIONS`` rather than pasted, so the sentence cannot fall out of step with
-    the list it describes. The "X (most recent) and Y" phrasing is real's for the two versions it
-    supports today; a third would need real's phrasing for three, not a guess at it.
+    the list it describes. The gateway's "X (most recent) and Y" and backend's comma before "and"
+    are measured for two versions; a third would need real's phrasing for three, not a guess at it.
     """
     newest, *rest = API_VERSIONS
     supported = ", ".join(f'"{v}"' for v in rest)
+    if backend:
+        quoted = _go_quoted(pinned)
+        exc = HTTPException(status_code=400, headers={SELECTED_VERSION_HEADER: ""})
+        exc.github_body = {
+            "message": (
+                f'The version you specified in the "X-GitHub-Api-Version" request header, {quoted}, '
+                f"is not a supported version. The following versions are currently supported: "
+                f'"{newest}" (most recent), and {supported}.'
+            )
+        }
+        return exc
     exc = HTTPException(status_code=400, detail="Bad Request")
     # The github envelope, carried on the exception the way backlot.errors.google carries its extra
     # fields; backlot.errors.github renders it. `errors` is a STRING here, not the usual array.
@@ -268,7 +319,22 @@ async def _validate_api_version(request: Request) -> None:
     """
     if honours_api_version(request) and selected_api_version(request) is None:
         # `None` is only reachable with the header present, so this read cannot miss.
-        raise _unsupported_version_error(request.headers[API_VERSION_HEADER])
+        # Measured against api.github.com on 2026-10-18: contents and the JSON pull backend
+        # answer a one-member body, newline and empty Selected header, ahead of a missing repository
+        # or path and of a missing credential, though a bad bearer is still `Bad credentials` first.
+        # A pull `_github_media` reads as a diff or a patch keeps the gateway's envelope, a diff
+        # after `application/json` included, and so does a HEAD on the pull whatever `Accept`
+        # holds, where a HEAD on contents is the backend's (measured 2026-10-19).
+        route = getattr(request.scope.get("route"), "path", None)
+        backend = route in {
+            "/github/repos/{owner}/{repo}/contents",
+            "/github/repos/{owner}/{repo}/contents/{path:path}",
+        } or (
+            route == "/github/repos/{owner}/{repo}/pulls/{number}"
+            and not getattr(request.state, "answering_head", False)
+            and not (_github_media(request, "diff") or _github_media(request, "patch"))
+        )
+        raise _unsupported_version_error(request.headers[API_VERSION_HEADER], backend=backend)
 
 
 async def _validate_path_owner(request: Request) -> None:
@@ -370,8 +436,16 @@ async def refuse_an_unserved_operation(request: Request) -> None:
     Of the 31, only `DELETE /installation/token` carried the version echo, and only a `GET` or a
     `POST` carried the five `x-ratelimit-*` and counted: `PATCH`, `PUT` and `DELETE` were refused
     with neither and moved no window, but `DELETE /installation/token`, which carried the five at
-    `used: 0`. Here none carries the echo and the methods split as real's did; ``backlot.main``
-    asks :func:`refused_an_unserved_operation` for the echo and
+    `used: 0`. On 2026-10-16, 2026-10-18 and 2026-10-19, each request on its own cache-busted URL
+    from one address with no token, that one delete was answered as a served route answers a caller
+    with no credential, header by header as ``GET /user/repos`` is here: no `Authorization`, an
+    empty one, `Digest x` and a `Basic` value naming no token were the 401 "Requires authentication"
+    with the version echo (`2026-03-10` when pinned to it) and the five; any of them pinned to
+    `1999-01-01` the version's 400 with the five; `Bearer nope` and `token nope` the 401 "Bad
+    credentials" with neither, and `Bearer<tab>x` that 401 with the five. None of them moved `used`
+    (:func:`refused_an_unserved_operation_reported`). Every other operation here carries no echo,
+    and the methods split as real's did; ``backlot.main`` asks
+    :func:`refused_an_unserved_operation` for the echo and
     :func:`refused_an_unserved_operation_uncounted` for the headers. With a token, real's answers to
     `GET /user/packages` and `GET /gists/starred` carried the echo, and so does the router's 404 or
     405 here.
@@ -392,6 +466,13 @@ async def refuse_an_unserved_operation(request: Request) -> None:
     counted. Here it is :func:`_require`'s 401 after the version, carrying both.
     """
     if not is_an_unserved_operation(request.method, request.scope["path"]):
+        return
+    if _deletes_the_installation_token(request):
+        request.state.github_unserved_refusal = "reported"
+        await _validate_bad_credential(request)
+        await _validate_api_version(request)
+        _require(request)
+        del request.state.github_unserved_refusal
         return
     if "authorization" not in request.headers:
         request.state.github_unserved_refusal = (
@@ -443,6 +524,22 @@ def refused_an_unserved_operation_uncounted(request: Request) -> bool:
     nowhere and sends without the five headers: for a header that carries no credential, on any
     method, and for no header on a method in :data:`_UNCOUNTED_METHODS`."""
     return getattr(request.state, "github_unserved_refusal", None) == "uncounted"
+
+
+def refused_an_unserved_operation_reported(request: Request) -> bool:
+    """Whether :func:`refuse_an_unserved_operation` answered ``DELETE /installation/token`` as a
+    served route does for a caller with no credential: the version echo, the five `x-ratelimit-*`,
+    and nothing counted. See that function for the measurement."""
+    return getattr(request.state, "github_unserved_refusal", None) == "reported"
+
+
+def _deletes_the_installation_token(request: Request) -> bool:
+    """Whether this is `DELETE /installation/token`, the one unpublished delete real answers as a
+    served route."""
+    return (
+        request.method == "DELETE"
+        and request.scope["path"].removeprefix("/github") == "/installation/token"
+    )
 
 
 # --- rate limits ----------------------------------------------------------------
@@ -648,19 +745,21 @@ def refused_without_a_window(request: Request) -> bool:
     return refused_a_credential(request) and not auth.github_scheme_then_a_tab(request)
 
 
-def rate_limit_headers(request: Request, status_code: int) -> dict[str, str]:
+def rate_limit_headers(request: Request, status_code: int, *, count: bool = True) -> dict[str, str]:
     """The five `x-ratelimit-*` headers for a `/github` answer.
 
     Counts the request against the window, except on :data:`RATE_LIMIT_PATH`, which reports its
     window without counting: two `GET /rate_limit` in a row both answered `remaining: 5000`,
     `used: 0`, each carrying the five with `resource: core`, and the description's own note says
-    the route does not count. `/rate_limit/` never reaches this — see
+    the route does not count. ``count`` False reports the same way, which is how
+    ``DELETE /installation/token`` carries the five while leaving `used` where it was
+    (:func:`refused_an_unserved_operation_reported`). `/rate_limit/` never reaches this — see
     ``backlot.main.refuse_a_trailing_slash_on_github``."""
     key, authenticated = rate_limit_caller(request)
     resource = rate_limit_resource(request.url.path, status_code)
     counted, limit = rate_limit_window(resource, authenticated)
     windows = _rate_limit_windows(request.app)
-    read = windows.count if request.url.path != RATE_LIMIT_PATH else windows.status
+    read = windows.count if count and request.url.path != RATE_LIMIT_PATH else windows.status
     window = read(key, counted, limit)
     return {
         "x-ratelimit-limit": str(window["limit"]),
