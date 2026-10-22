@@ -164,6 +164,22 @@ def _missing_record() -> Response:
     )
 
 
+def _reason_page(status: int, reason: str) -> bytes:
+    """Real's page for a 405 and a 406, which names its reason where the 404's page has a sentence.
+    Measured against api.hubapi.com on 2026-10-19: 229 bytes for the 405 and 221 for the 406, the
+    same on every request."""
+    return (
+        b"<html>\n<head>\n"
+        b'<meta http-equiv="Content-Type" content="text/html;charset=utf-8"/>\n'
+        b"<title>Error %d %s</title>\n</head>\n"
+        b"<body><h2>HTTP ERROR %d</h2>\n<p>Reason:\n<pre>    %s</pre></p>\n</body>\n</html>\n"
+    ) % (status, reason.encode(), status, reason.encode())
+
+
+# The `Cache-Control` real's 405 and 406 pages carry (api.hubapi.com, 2026-10-19).
+_NO_STORE = {"Cache-Control": "must-revalidate,no-cache,no-store"}
+
+
 def _record_id(record_id: str) -> str | JSONResponse:
     """The id to look up, or real's 404 for one it won't look up.
 
@@ -1224,6 +1240,73 @@ def refuse_an_unserved_operation(request: Request) -> JSONResponse | None:
             return _unknown_type(object_type)
         if _canonical(object_type) in _WRITE_SCOPES:
             return _missing_scopes(_canonical(object_type))
+    return None
+
+
+#: The body of real's 401 for `OPTIONS`, which is not the INVALID_AUTHENTICATION one a route answers.
+#: Real's also carries a `correlationId`, after `message`, which this one leaves out.
+_OPTIONS_REFUSAL = {
+    "status": "error",
+    "message": "Any of the listed authentication credentials are missing",
+    "engagement": {
+        "service-to-service": "service-to-service not engaged. Metadata for service-to-service "
+        "request not found.",
+        "internal-cookie": "internal-cookie not engaged. You can get a new internal auth cookie "
+        "for host 'api.hubapi.com' by visiting following link from your current browser window: "
+        "https://tools.hubteam.com/login/host/api.hubapi.com .",
+        "app-cookie": "app-cookie not engaged. App cookie is not present on the request.",
+    },
+}
+
+_POST_ONLY = re.compile(r"/crm/v3/objects/[^/]+/(search|batch/read)")
+
+
+def _media_ranges(accept: str) -> set[str]:
+    """The media ranges an `Accept` header names, their parameters left off."""
+    return {r.partition(";")[0].strip() for r in accept.split(",")}
+
+
+def answer_ahead_of_the_routes(request: Request) -> Response | None:
+    """Real's answer to a method or an `Accept` that no route here takes, or None to go on to the
+    routes. Measured against api.hubapi.com on 2026-10-19 with a service key, and on 2026-09-30 for
+    `PUT`.
+
+    `OPTIONS` is :data:`_OPTIONS_REFUSAL` at 401, the key sent or not: on the listing, a record and
+    the v4 associations path, and as a CORS preflight, with no `Allow` and no CORS headers. `GET` on
+    a type's `search` or `batch/read` is the 405 page with `Allow: POST,OPTIONS`, and with no key
+    too, so the method is checked ahead of the credential; `search`'s carries `nosniff` as well. A
+    `HEAD` arrives here as its `GET` (``backlot.main.answer_head_as_the_get_without_its_body``),
+    and real's `HEAD` on those two is the same 405 without the body. `PUT` on a record is a 405 with
+    no body. An `Accept` that admits no JSON is a 406: the page for `text/html`, no body for
+    `application/xml`. Those two are what was measured; the rule applied here, `text/html` gets the
+    page and any other type that admits no JSON gets the empty 406, is a reading of them.
+    """
+    path = request.scope["path"].removeprefix("/hubspot")
+    if request.method == "OPTIONS":
+        return JSONResponse(status_code=401, content=_OPTIONS_REFUSAL)
+    post_only = _POST_ONLY.fullmatch(path)
+    if post_only and request.method == "GET":
+        headers = {"Allow": "POST,OPTIONS", **_NO_STORE}
+        if post_only[1] == "search":
+            headers["X-Content-Type-Options"] = "nosniff"
+        return Response(
+            _reason_page(405, "Method Not Allowed"),
+            status_code=405,
+            headers=headers,
+            media_type="text/html;charset=iso-8859-1",
+        )
+    if request.method == "PUT" and not post_only and _RECORD_PATH.fullmatch(path):
+        return Response(status_code=405, headers={"Allow": "DELETE,GET,OPTIONS,PATCH"})
+    ranges = _media_ranges(request.headers.get("accept") or "*/*")
+    if not ranges & {"application/json", "application/*", "*/*"}:
+        if "text/html" in ranges:
+            return Response(
+                _reason_page(406, "Not Acceptable"),
+                status_code=406,
+                headers=_NO_STORE,
+                media_type="text/html;charset=iso-8859-1",
+            )
+        return Response(status_code=406)
     return None
 
 

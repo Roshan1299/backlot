@@ -294,6 +294,18 @@ async def refuse_an_unserved_hubspot_operation(request: Request, call_next):
 
 
 @app.middleware("http")
+async def answer_a_hubspot_method_or_accept_no_route_takes(request: Request, call_next):
+    """`OPTIONS`, `GET` on `search` and `batch/read`, `PUT` on a record and an `Accept` that admits
+    no JSON are answered on `/hubspot` as real answers them, ahead of the credential and the router
+    (``backlot.routers.hubspot.answer_ahead_of_the_routes``)."""
+    if request.scope["path"].startswith("/hubspot/"):
+        answer = hubspot.answer_ahead_of_the_routes(request)
+        if answer is not None:
+            return answer
+    return await call_next(request)
+
+
+@app.middleware("http")
 async def echo_github_api_version(request: Request, call_next):
     """Report which API version served the response, on the `/github` answers real echoes one for,
     200 and error alike.
@@ -577,6 +589,24 @@ async def serve_a_slashed_notion_path_as_the_path_without_it(request: Request, c
     return await call_next(request)
 
 
+@app.middleware("http")
+async def serve_a_slashed_hubspot_path_as_the_path_without_it(request: Request, call_next):
+    """One trailing slash on a `/hubspot` path is not part of the path: real serves what the
+    slash-free spelling serves, where Starlette's router would answer a 307 to it.
+
+    Measured against api.hubapi.com on 2026-10-19 with a service key: `GET` on the contacts listing,
+    a contact and its v4 associations, and `POST` on `search` and `batch/read`, each with a slash,
+    answered 200; the associations page and the search answer were byte for byte the slash-free
+    ones, and the contact was the same contact. A second slash was not sent, so this drops one, as
+    the Notion rewrite above does."""
+    path = request.url.path
+    if path.startswith("/hubspot/") and path.endswith("/") and len(path) > len("/hubspot/"):
+        trimmed = path[:-1]
+        request.scope["path"] = trimmed
+        request.scope["raw_path"] = trimmed.encode()
+    return await call_next(request)
+
+
 def _google_route_match(scope: Scope) -> Match:
     """How the best Google route matches this scope: in full, by its path alone (``PARTIAL``, the
     router's 405), or not at all. Asked of ``backlot.routers.google.router``, which holds the Google
@@ -765,6 +795,7 @@ _HEAD_IS_THE_GET_WITHOUT_ITS_BODY = (
     "/notion",
     "/drive/v3",
     "/gmail/v1",
+    "/hubspot",
     "/health",
     "/_meta",
 )
@@ -805,7 +836,7 @@ async def answer_an_atlassian_write_that_fails(request: Request, call_next):
 @app.middleware("http")
 async def answer_head_as_the_get_without_its_body(request: Request, call_next):
     """Answer a `HEAD` as the `GET` with the body left off, which is how real GitHub, both Atlassian
-    products, Notion, Drive and Gmail answer one.
+    products, Notion, Drive, Gmail and HubSpot answer one.
 
     FastAPI's ``APIRoute`` does not add `HEAD` to a GET route the way Starlette's ``Route`` does, so
     without this a `HEAD` on a route that serves the GET is a 405, whatever the GET answers. Real
@@ -829,8 +860,9 @@ async def answer_head_as_the_get_without_its_body(request: Request, call_next):
     `content-length` a client reads a `HEAD` for is the GET body's length and computing the body is
     the only way to have that number; a `HEAD` costs what its GET costs, here as on real.
 
-    What the vendors do NOT share is the `content-length`: GitHub and Notion declare the length of
-    the body the `GET` would have carried, and Atlassian's and Google's answers split, so that
+    What the vendors do NOT share is the `content-length`: GitHub, Notion and HubSpot declare the
+    length of the body the `GET` would have carried (HubSpot's `HEAD` on `search` declared the 229
+    of its `GET`'s 405 page, measured 2026-10-19), and Atlassian's and Google's answers split, so that
     header is asked for rather than assumed, through ``errors.head_content_length``. The request
     is marked ``answering_head`` on its state for ``errors.google.jsonp_callback`` and
     ``routers.github._validate_api_version``, which read it.

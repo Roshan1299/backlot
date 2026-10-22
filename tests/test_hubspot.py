@@ -688,6 +688,159 @@ def test_hubspot_does_not_refuse_an_unpublished_path_for_its_credential(client):
     assert client.get("/hubspot/crm/v3/nonexistent-xyz").status_code == 404
 
 
+_PAGE_TYPE = "text/html;charset=iso-8859-1"
+
+_METHOD_NOT_ALLOWED_PAGE = (
+    b"<html>\n<head>\n"
+    b'<meta http-equiv="Content-Type" content="text/html;charset=utf-8"/>\n'
+    b"<title>Error 405 Method Not Allowed</title>\n</head>\n"
+    b"<body><h2>HTTP ERROR 405</h2>\n<p>Reason:\n<pre>    Method Not Allowed</pre></p>\n"
+    b"</body>\n</html>\n"
+)
+
+_NOT_ACCEPTABLE_PAGE = (
+    b"<html>\n<head>\n"
+    b'<meta http-equiv="Content-Type" content="text/html;charset=utf-8"/>\n'
+    b"<title>Error 406 Not Acceptable</title>\n</head>\n"
+    b"<body><h2>HTTP ERROR 406</h2>\n<p>Reason:\n<pre>    Not Acceptable</pre></p>\n"
+    b"</body>\n</html>\n"
+)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/crm/v3/objects/contacts",
+        "/crm/v3/objects/contacts/{ava}",
+        "/crm/v4/objects/contacts/{ava}/associations/companies",
+        "/crm/v3/objects/contacts/1",
+        "/crm/v3/objects/contacts/abc",
+        "/crm/v3/objects/contacts/search",
+        "/crm/v3/objects/contacts/batch/read",
+    ],
+)
+@pytest.mark.parametrize("keyed", [True, False])
+def test_hubspot_answers_head_as_the_get_without_its_body(client, admin_h, ava, path, keyed):
+    """A `HEAD` is the `GET`'s status and headers with no body, declaring the length of the body
+    the `GET` carries (``answer_head_as_the_get_without_its_body`` in `backlot.main`)."""
+    url = "/hubspot" + path.format(ava=ava)
+    headers = admin_h if keyed else {}
+    got, head = client.get(url, headers=headers), client.head(url, headers=headers)
+    assert head.status_code == got.status_code
+    assert head.content == b""
+    assert head.headers["content-type"] == got.headers["content-type"]
+    assert head.headers["content-length"] == str(len(got.content))
+    assert head.headers.get("allow") == got.headers.get("allow")
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/crm/v3/objects/contacts",
+        "/crm/v3/objects/contacts/{ava}",
+        "/crm/v4/objects/contacts/{ava}/associations/companies",
+    ],
+)
+@pytest.mark.parametrize(
+    "headers",
+    [
+        "key",
+        "none",
+        {"Origin": "https://example.com", "Access-Control-Request-Method": "GET"},
+    ],
+)
+def test_hubspot_refuses_options_for_its_own_credentials(client, admin_h, ava, path, headers):
+    """`OPTIONS` is real's 401 naming the credentials its front door looks for, the key sent or not
+    and as a CORS preflight, with no `Allow` and no CORS headers (`answer_ahead_of_the_routes` in
+    `backlot.routers.hubspot`)."""
+    sent = {"key": admin_h, "none": {}}.get(headers) if isinstance(headers, str) else headers
+    r = client.options("/hubspot" + path.format(ava=ava), headers=sent)
+    assert r.status_code == 401
+    assert list(r.json()) == ["status", "message", "engagement"]
+    assert r.json()["message"] == "Any of the listed authentication credentials are missing"
+    assert list(r.json()["engagement"]) == ["service-to-service", "internal-cookie", "app-cookie"]
+    assert not {"allow", "access-control-allow-origin", "access-control-allow-methods"} & set(
+        r.headers
+    )
+
+
+@pytest.mark.parametrize(("operation", "nosniff"), [("search", True), ("batch/read", False)])
+@pytest.mark.parametrize("keyed", [True, False])
+def test_hubspot_refuses_get_on_a_post_only_operation_ahead_of_the_credential(
+    client, admin_h, operation, nosniff, keyed
+):
+    """`GET` on `search` or `batch/read` is real's 405 page, with no key as with one, and `search`'s
+    carries `nosniff` (`answer_ahead_of_the_routes` in `backlot.routers.hubspot`)."""
+    r = client.get(
+        f"/hubspot/crm/v3/objects/contacts/{operation}", headers=admin_h if keyed else {}
+    )
+    assert (r.status_code, r.content) == (405, _METHOD_NOT_ALLOWED_PAGE)
+    assert len(r.content) == 229
+    assert r.headers["content-type"] == _PAGE_TYPE
+    assert r.headers["allow"] == "POST,OPTIONS"
+    assert r.headers["cache-control"] == "must-revalidate,no-cache,no-store"
+    assert (r.headers.get("x-content-type-options") == "nosniff") is nosniff
+
+
+def test_hubspot_refuses_put_on_a_record_with_no_body(client, admin_h):
+    """`PUT` on a record is real's empty 405 naming the methods a record takes
+    (`answer_ahead_of_the_routes` in `backlot.routers.hubspot`)."""
+    r = client.put("/hubspot/crm/v3/objects/contacts/1", headers=admin_h, json={})
+    assert (r.status_code, r.content) == (405, b"")
+    assert r.headers["allow"] == "DELETE,GET,OPTIONS,PATCH"
+    assert "content-type" not in r.headers
+
+
+@pytest.mark.parametrize(
+    ("accept", "body", "content_type"),
+    [
+        ("text/html", _NOT_ACCEPTABLE_PAGE, _PAGE_TYPE),
+        ("application/xml", b"", None),
+    ],
+)
+def test_hubspot_refuses_an_accept_that_admits_no_json(client, admin_h, accept, body, content_type):
+    """An `Accept` that admits no JSON is real's 406, the page for `text/html` and no body for
+    `application/xml` (`answer_ahead_of_the_routes` in `backlot.routers.hubspot`)."""
+    r = client.get("/hubspot/crm/v3/objects/contacts", headers={**admin_h, "Accept": accept})
+    assert (r.status_code, r.content) == (406, body)
+    assert r.headers.get("content-type") == content_type
+    if body:
+        assert len(body) == 221
+        assert r.headers["cache-control"] == "must-revalidate,no-cache,no-store"
+        assert "x-content-type-options" not in r.headers
+
+
+@pytest.mark.parametrize("accept", ["application/json", "*/*", "text/html, */*;q=0.8"])
+def test_hubspot_serves_an_accept_that_admits_json(client, admin_h, accept):
+    """An `Accept` that names JSON, or any type, is served (`answer_ahead_of_the_routes` in
+    `backlot.routers.hubspot`)."""
+    r = client.get("/hubspot/crm/v3/objects/contacts", headers={**admin_h, "Accept": accept})
+    assert r.status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "body"),
+    [
+        ("GET", "/crm/v3/objects/contacts", None),
+        ("GET", "/crm/v3/objects/contacts/{ava}", None),
+        ("GET", "/crm/v4/objects/contacts/{ava}/associations/companies", None),
+        ("POST", "/crm/v3/objects/contacts/search", {}),
+        ("POST", "/crm/v3/objects/contacts/batch/read", {"inputs": [{"id": "{ava}"}]}),
+    ],
+)
+def test_hubspot_serves_a_trailing_slash_as_the_path_without_it(
+    client, admin_h, ava, method, path, body
+):
+    """One trailing slash is served as the path without it, not redirected
+    (``serve_a_slashed_hubspot_path_as_the_path_without_it`` in `backlot.main`)."""
+    url = "/hubspot" + path.format(ava=ava)
+    sent = json.loads(json.dumps(body).replace("{ava}", ava)) if body is not None else None
+    bare = client.request(method, url, headers=admin_h, json=sent)
+    slashed = client.request(method, url + "/", headers=admin_h, json=sent, follow_redirects=False)
+    assert bare.status_code == 200
+    assert (slashed.status_code, slashed.content) == (200, bare.content)
+
+
 def test_hubspot_acl_hides_restricted_record(client, tokens_yaml, admin_h):
     """`hs-co-secret` is readable only by hana; another user's crawl must not contain it, and a
     direct-by-id read must enforce the same grant -- not just the listing -- since get_object now
