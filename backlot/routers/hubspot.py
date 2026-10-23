@@ -20,6 +20,7 @@ omit it. :func:`_page` is the single place that decides this.
 from __future__ import annotations
 
 import json
+import math
 import re
 from functools import lru_cache
 
@@ -29,6 +30,7 @@ from pydantic import BaseModel, ConfigDict
 
 from backlot import auth, published, store, synth
 from backlot.acl import Caller
+from backlot.errors.atlassian import _java_double as _parse_java_double
 from backlot.openapi import qp
 from backlot.routers import json_body
 
@@ -183,25 +185,34 @@ _NO_STORE = {"Cache-Control": "must-revalidate,no-cache,no-store"}
 
 def _asks_for_the_page(accept: str | None) -> bool:
     """Whether an `Accept` gets real's 405 and 406 page: absent, or listing `text/html`, `text/*` or
-    `*/*` exactly as written, with no parameter but a `q` that is not zero.
+    `*/*` exactly as written, with no parameter but a `q` that is not zero, and no member's `q`
+    negative, `-0` included. A member's `q` is its last `q=` (lower-case), read the way Java's
+    `Double.parseDouble` reads one, and zero where that throws; real's answers below match that
+    reading, which HubSpot does not document.
 
     Measured against api.hubapi.com on 2026-10-22, on `GET …/search` and the contacts listing: no
     `Accept`, `*/*`, `text/*`, `application/json, text/html`, ` text/html`, `text/html;q=0.5` and
     `text/html ; q=0.5` got the page, and `application/json`, `application/xml`, `text/plain`,
-    `TEXT/HTML`, `text/html;level=1` and `text/html; q=0` got the status with no body.
+    `TEXT/HTML`, `text/html;level=1` and `text/html; q=0` got the status with no body. On
+    2026-10-23, on `GET …/search`: `text/html` with `q=NaN`, `q=-NaN`, `q=Infinity`, `q=1e0`,
+    `q=0x1p0`, `q=1d`, `q=.5` or `q=0;q=0.5` got the page, and with `q=abc`, `q=`, `q=inf`, `q=1_0`,
+    `q=-1`, `q=-0`, `q=-Infinity`, `q=0.5;q=0` or `Q=0.5` did not, nor did `application/*`,
+    `text/html, application/json;q=-1` or `application/json;q=-1, text/html`.
     """
     if accept is None:
         return True
+    page = False
     for entry in accept.split(","):
         media, *params = (part.strip() for part in entry.split(";"))
-        weights = [p[2:] for p in params if p[:2].lower() == "q="]
-        if media in ("text/html", "text/*", "*/*") and len(weights) == len(params):
-            try:
-                if not weights or float(weights[-1]) != 0:
-                    return True
-            except ValueError:
-                return True
-    return False
+        weights = [p[2:] for p in params if p.startswith("q=")]
+        weight = _parse_java_double(weights[-1]) if weights else 1.0
+        if weight is None:
+            weight = 0.0
+        if weight == weight and math.copysign(1.0, weight) < 0:
+            return False
+        if media in ("text/html", "text/*", "*/*") and len(weights) == len(params) and weight != 0:
+            page = True
+    return page
 
 
 def _error_page(request: Request, status: int, reason: str, headers: dict) -> Response:
@@ -1285,8 +1296,8 @@ def refuse_an_unserved_operation(request: Request) -> JSONResponse | None:
     return None
 
 
-#: The body of real's 401 for `OPTIONS`, which is not the INVALID_AUTHENTICATION one a route answers.
-#: Real's also carries a `correlationId`, after `message`, which this one leaves out.
+#: The body of real's 401 for `OPTIONS`, which is not the INVALID_AUTHENTICATION one a route
+#: answers. Real's also carries a `correlationId`, after `message`, which this one leaves out.
 _OPTIONS_REFUSAL = {
     "status": "error",
     "message": "Any of the listed authentication credentials are missing",

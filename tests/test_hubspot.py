@@ -773,8 +773,7 @@ _LISTING = "/crm/v3/objects/contacts"
 _RECORD = "/crm/v3/objects/contacts/1"
 _V4 = "/crm/v4/objects/contacts/{ava}/associations/companies"
 _FORBIDDEN_ROWS = [
-    # method, path, keyed, Accept (None leaves the client's `*/*`), status, Allow, page, `nosniff`,
-    # no-store
+    # method, path, keyed, Accept (None sends none), status, Allow, page, `nosniff`, no-store
     ("GET", _SEARCH, True, None, 405, "POST,OPTIONS", True, True, True),
     ("GET", _SEARCH, False, None, 405, "POST,OPTIONS", True, True, True),
     ("GET", _SEARCH, True, "application/json", 405, "POST,OPTIONS", False, True, True),
@@ -785,6 +784,26 @@ _FORBIDDEN_ROWS = [
     ("GET", _SEARCH, True, "text/html;level=1", 405, "POST,OPTIONS", False, True, True),
     ("GET", _SEARCH, True, "text/html; q=0", 405, "POST,OPTIONS", False, True, True),
     ("GET", _SEARCH, True, "text/html", 405, "POST,OPTIONS", True, True, True),
+    ("GET", _SEARCH, True, "application/*", 405, "POST,OPTIONS", False, True, True),
+    ("GET", _SEARCH, True, "text/html;q=abc", 405, "POST,OPTIONS", False, True, True),
+    ("GET", _SEARCH, True, "text/html;q=inf", 405, "POST,OPTIONS", False, True, True),
+    ("GET", _SEARCH, True, "text/html;q=1d", 405, "POST,OPTIONS", True, True, True),
+    ("GET", _SEARCH, True, "text/html;q=NaN", 405, "POST,OPTIONS", True, True, True),
+    ("GET", _SEARCH, True, "text/html;q=-NaN", 405, "POST,OPTIONS", True, True, True),
+    ("GET", _SEARCH, True, "text/html;q=-0", 405, "POST,OPTIONS", False, True, True),
+    (
+        "GET",
+        _SEARCH,
+        True,
+        "text/html, application/json;q=-1",
+        405,
+        "POST,OPTIONS",
+        False,
+        True,
+        True,
+    ),
+    ("GET", _SEARCH, True, "text/html;Q=0.5", 405, "POST,OPTIONS", False, True, True),
+    ("GET", _SEARCH, True, "text/html;q=0;q=0.5", 405, "POST,OPTIONS", True, True, True),
     ("GET", _BATCH, True, None, 405, "POST,OPTIONS", True, False, True),
     ("GET", _BATCH, True, "application/json", 405, "POST,OPTIONS", False, False, True),
     ("PUT", _SEARCH, True, None, 405, "POST,OPTIONS", False, True, False),
@@ -822,11 +841,15 @@ def test_hubspot_answers_a_method_or_accept_no_route_takes(
     client, admin_h, ava, method, path, keyed, accept, status, allow, page, nosniff, no_store
 ):
     """Each row is what `answer_ahead_of_the_routes` in `backlot.routers.hubspot` measures."""
-    headers = {**(admin_h if keyed else {})}
-    if accept is not None:
-        headers["Accept"] = accept
     body = b"{}" if method in ("POST", "PUT", "PATCH") else None
-    r = client.request(method, "/hubspot" + path.format(ava=ava), headers=headers, content=body)
+    request = client.build_request(
+        method, "/hubspot" + path.format(ava=ava), headers=admin_h if keyed else {}, content=body
+    )
+    if accept is None:
+        del request.headers["Accept"]
+    else:
+        request.headers["Accept"] = accept
+    r = client.send(request)
     expected = {405: _METHOD_NOT_ALLOWED_PAGE, 406: _NOT_ACCEPTABLE_PAGE}[status] if page else b""
     assert (r.status_code, r.content) == (status, expected)
     assert r.headers.get("content-type") == (_PAGE_TYPE if page else None)
