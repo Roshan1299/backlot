@@ -21,7 +21,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
-from starlette.routing import Match
+from starlette.routing import BaseRoute, Match
 from starlette.types import Scope
 
 from backlot import auth, errors, openapi, overlay, store, synth, telemetry
@@ -300,14 +300,31 @@ async def refuse_an_unserved_hubspot_operation(request: Request, call_next):
     return await call_next(request)
 
 
+def _hubspot_route(scope: Scope) -> BaseRoute | None:
+    """The route the router matches this scope to: the first HubSpot route that matches it in
+    full, else the first that matches its path alone (the router's 405). Asked of
+    ``backlot.routers.hubspot.router``, which holds the HubSpot routes and nothing else."""
+    partial = None
+    for route in hubspot.router.routes:
+        match = route.matches(scope)[0]
+        if match is Match.FULL:
+            return route
+        if match is Match.PARTIAL and partial is None:
+            partial = route
+    return partial
+
+
 @app.middleware("http")
 async def answer_a_hubspot_method_or_accept_no_route_takes(request: Request, call_next):
     """`OPTIONS`, `GET` on `search` and `batch/read`, `PUT` on a record and an `Accept` that admits
     no JSON are answered on `/hubspot` as real answers them, ahead of the credential and the router
-    (``backlot.routers.hubspot.answer_ahead_of_the_routes``)."""
+    (``backlot.routers.hubspot.answer_ahead_of_the_routes``). It leaves on the scope the route the
+    router matches the request to (``_hubspot_route``), where telemetry names the call by it
+    (``backlot.telemetry.naming.Namer.name``)."""
     if request.scope["path"].startswith("/hubspot/"):
         answer = hubspot.answer_ahead_of_the_routes(request)
         if answer is not None:
+            request.scope["route"] = _hubspot_route(request.scope)
             return answer
     return await call_next(request)
 
@@ -870,9 +887,9 @@ async def answer_head_as_the_get_without_its_body(request: Request, call_next):
 
     What the vendors do NOT share is the `content-length`: GitHub, Notion and HubSpot declare the
     length of the body the `GET` would have carried (HubSpot's `HEAD` on `search` declared the 229
-    of its `GET`'s 405 page, measured 2026-10-19), and Atlassian's and Google's answers split, so that
-    header is asked for rather than assumed, through ``errors.head_content_length``. The request
-    is marked ``answering_head`` on its state for ``errors.google.jsonp_callback`` and
+    of its `GET`'s 405 page, measured 2026-10-19), and Atlassian's and Google's answers split, so
+    that header is asked for rather than assumed, through ``errors.head_content_length``. The
+    request is marked ``answering_head`` on its state for ``errors.google.jsonp_callback`` and
     ``routers.github._validate_api_version``, which read it.
 
     The method goes back to `HEAD` on the scope once the GET has answered, because the server frames
