@@ -591,17 +591,18 @@ async def serve_a_slashed_notion_path_as_the_path_without_it(request: Request, c
 
 @app.middleware("http")
 async def serve_a_slashed_hubspot_path_as_the_path_without_it(request: Request, call_next):
-    """One trailing slash on a `/hubspot` path is not part of the path: real serves what the
+    """Trailing slashes on a `/hubspot` path are not part of the path: real serves what the
     slash-free spelling serves, where Starlette's router would answer a 307 to it.
 
-    Measured against api.hubapi.com on 2026-10-19 with a service key: `GET` on the contacts listing,
-    a contact and its v4 associations, and `POST` on `search` and `batch/read`, each with a slash,
-    answered 200; the associations page and the search answer were byte for byte the slash-free
-    ones, and the contact was the same contact. A second slash was not sent, so this drops one, as
-    the Notion rewrite above does."""
+    Measured against api.hubapi.com with a service key: on 2026-10-19, `GET` on the contacts
+    listing, a contact and its v4 associations, and `POST` on `search` and `batch/read`, each with a
+    slash, answered 200; the associations page and the search answer were byte for byte the
+    slash-free ones, and the contact was the same contact. On 2026-10-22 `contacts//` and
+    `contacts///` were the listing and `contacts/1//` the 404 page `contacts/1` gets, so every
+    trailing slash is dropped."""
     path = request.url.path
-    if path.startswith("/hubspot/") and path.endswith("/") and len(path) > len("/hubspot/"):
-        trimmed = path[:-1]
+    trimmed = path.rstrip("/")
+    if path.startswith("/hubspot/") and trimmed != path and len(trimmed) > len("/hubspot"):
         request.scope["path"] = trimmed
         request.scope["raw_path"] = trimmed.encode()
     return await call_next(request)

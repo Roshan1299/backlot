@@ -176,8 +176,50 @@ def _reason_page(status: int, reason: str) -> bytes:
     ) % (status, reason.encode(), status, reason.encode())
 
 
-# The `Cache-Control` real's 405 and 406 pages carry (api.hubapi.com, 2026-10-19).
+# The `Cache-Control` real's 405 and 406 carry on a `GET`, `POST` or `HEAD` (api.hubapi.com,
+# 2026-10-19 and 2026-10-22).
 _NO_STORE = {"Cache-Control": "must-revalidate,no-cache,no-store"}
+
+
+def _asks_for_the_page(accept: str | None) -> bool:
+    """Whether an `Accept` gets real's 405 and 406 page: absent, or listing `text/html`, `text/*` or
+    `*/*` exactly as written, with no parameter but a `q` that is not zero.
+
+    Measured against api.hubapi.com on 2026-10-22, on `GET …/search` and the contacts listing: no
+    `Accept`, `*/*`, `text/*`, `application/json, text/html`, ` text/html`, `text/html;q=0.5` and
+    `text/html ; q=0.5` got the page, and `application/json`, `application/xml`, `text/plain`,
+    `TEXT/HTML`, `text/html;level=1` and `text/html; q=0` got the status with no body.
+    """
+    if accept is None:
+        return True
+    for entry in accept.split(","):
+        media, *params = (part.strip() for part in entry.split(";"))
+        weights = [p[2:] for p in params if p[:2].lower() == "q="]
+        if media in ("text/html", "text/*", "*/*") and len(weights) == len(params):
+            try:
+                if not weights or float(weights[-1]) != 0:
+                    return True
+            except ValueError:
+                return True
+    return False
+
+
+def _error_page(request: Request, status: int, reason: str, headers: dict) -> Response:
+    """Real's 405 or 406, which its server writes for itself: a `GET`, `POST` or `HEAD` carries
+    :data:`_NO_STORE`, and the page when :func:`_asks_for_the_page`; a `PUT`, `PATCH` or `DELETE`
+    carries neither (measured 2026-10-22: `PATCH` and `DELETE` on a record with `Accept: text/html`
+    got a bare 406, and `PUT` on a record a bare 405)."""
+    if request.method not in ("GET", "POST", "HEAD"):
+        return Response(status_code=status, headers=headers)
+    headers = {**headers, **_NO_STORE}
+    if not _asks_for_the_page(request.headers.get("accept")):
+        return Response(status_code=status, headers=headers)
+    return Response(
+        _reason_page(status, reason),
+        status_code=status,
+        headers=headers,
+        media_type="text/html;charset=iso-8859-1",
+    )
 
 
 def _record_id(record_id: str) -> str | JSONResponse:
@@ -1258,55 +1300,54 @@ _OPTIONS_REFUSAL = {
     },
 }
 
-_POST_ONLY = re.compile(r"/crm/v3/objects/[^/]+/(search|batch/read)")
+# The paths a route here serves, each with the methods real takes on it in the order its 405's
+# `Allow` lists them (api.hubapi.com, 2026-10-19 and 2026-10-22).
+_ALLOWED_METHODS = (
+    (re.compile(r"/crm/v3/objects/[^/]+/(?:search|batch/read)"), "POST,OPTIONS"),
+    (re.compile(r"/crm/v3/objects/[^/]+/[^/]+"), "DELETE,GET,OPTIONS,PATCH"),
+    (re.compile(r"/crm/v3/objects/[^/]+"), "POST,GET,OPTIONS"),
+    (re.compile(r"/crm/v4/objects/[^/]+/[^/]+/associations/[^/]+"), "GET,OPTIONS"),
+)
 
 
-def _media_ranges(accept: str) -> set[str]:
-    """The media ranges an `Accept` header names, their parameters left off."""
-    return {r.partition(";")[0].strip() for r in accept.split(",")}
+def _admits_json(accept: str) -> bool:
+    """Whether an `Accept` names `application/json`, `application/*` or `*/*`, in any case and
+    whatever its `q`: `Application/JSON`, `APPLICATION/*`, `application/json;q=0` and `*/*;q=0` were
+    served on 2026-10-22, and `application/hal+json` was the 406."""
+    ranges = {entry.partition(";")[0].strip().lower() for entry in accept.split(",")}
+    return bool(ranges & {"application/json", "application/*", "*/*"})
 
 
 def answer_ahead_of_the_routes(request: Request) -> Response | None:
-    """Real's answer to a method or an `Accept` that no route here takes, or None to go on to the
-    routes. Measured against api.hubapi.com on 2026-10-19 with a service key, and on 2026-09-30 for
-    `PUT`.
+    """Real's answer to a method or an `Accept` that no route here takes on a path one serves, or
+    None to go on to the routes. Measured against api.hubapi.com on 2026-09-30, 2026-10-19 and
+    2026-10-22 with a service key.
 
-    `OPTIONS` is :data:`_OPTIONS_REFUSAL` at 401, the key sent or not: on the listing, a record and
-    the v4 associations path, and as a CORS preflight, with no `Allow` and no CORS headers. `GET` on
-    a type's `search` or `batch/read` is the 405 page with `Allow: POST,OPTIONS`, and with no key
-    too, so the method is checked ahead of the credential; `search`'s carries `nosniff` as well. A
-    `HEAD` arrives here as its `GET` (``backlot.main.answer_head_as_the_get_without_its_body``),
-    and real's `HEAD` on those two is the same 405 without the body. `PUT` on a record is a 405 with
-    no body. An `Accept` that admits no JSON is a 406: the page for `text/html`, no body for
-    `application/xml`. Those two are what was measured; the rule applied here, `text/html` gets the
-    page and any other type that admits no JSON gets the empty 406, is a reading of them.
+    `OPTIONS` is :data:`_OPTIONS_REFUSAL` at 401, the key sent or not: on the listing, a record,
+    `search`, the listing of a type real cannot infer and the v4 associations path, and as a CORS
+    preflight, with no `Allow` and no CORS headers. A `GET`, `POST`, `PUT`, `PATCH` or `DELETE` the
+    path's `Allow` (:data:`_ALLOWED_METHODS`) does not list is the 405 :func:`_error_page` writes,
+    with no key as with one and ahead of the type: `GET`, `PUT`, `PATCH` and `DELETE` on `search`
+    and `batch/read`, `PUT`, `PATCH` and `DELETE` on the listing, `PUT` and `POST` on a record and
+    `PUT` on the v4 associations path were each that 405. Every answer on `search` carries
+    `nosniff`, its `OPTIONS` and its 200 among them. Then an `Accept` that does not
+    :func:`_admits_json` is the 406 it writes, ahead of the credential, on each of those paths. A
+    path no route serves goes on to the router: real's `OPTIONS` on `/crm/v3/nonexistent-xyz` is
+    not this 401, and its `GET` with `Accept: text/html` is the 404 that path gets, not the 406. A
+    `HEAD` arrives here as its `GET` (``backlot.main.answer_head_as_the_get_without_its_body``).
     """
     path = request.scope["path"].removeprefix("/hubspot")
+    allowed = next((methods for route, methods in _ALLOWED_METHODS if route.fullmatch(path)), None)
+    if allowed is None:
+        return None
+    sniff = {"X-Content-Type-Options": "nosniff"} if path.endswith("/search") else {}
     if request.method == "OPTIONS":
-        return JSONResponse(status_code=401, content=_OPTIONS_REFUSAL)
-    post_only = _POST_ONLY.fullmatch(path)
-    if post_only and request.method == "GET":
-        headers = {"Allow": "POST,OPTIONS", **_NO_STORE}
-        if post_only[1] == "search":
-            headers["X-Content-Type-Options"] = "nosniff"
-        return Response(
-            _reason_page(405, "Method Not Allowed"),
-            status_code=405,
-            headers=headers,
-            media_type="text/html;charset=iso-8859-1",
-        )
-    if request.method == "PUT" and not post_only and _RECORD_PATH.fullmatch(path):
-        return Response(status_code=405, headers={"Allow": "DELETE,GET,OPTIONS,PATCH"})
-    ranges = _media_ranges(request.headers.get("accept") or "*/*")
-    if not ranges & {"application/json", "application/*", "*/*"}:
-        if "text/html" in ranges:
-            return Response(
-                _reason_page(406, "Not Acceptable"),
-                status_code=406,
-                headers=_NO_STORE,
-                media_type="text/html;charset=iso-8859-1",
-            )
-        return Response(status_code=406)
+        return JSONResponse(status_code=401, content=_OPTIONS_REFUSAL, headers=sniff)
+    if request.method in ("GET", "POST", "PUT", "PATCH", "DELETE"):
+        if request.method not in allowed.split(","):
+            return _error_page(request, 405, "Method Not Allowed", {"Allow": allowed, **sniff})
+    if not _admits_json(request.headers.get("accept") or "*/*"):
+        return _error_page(request, 406, "Not Acceptable", sniff)
     return None
 
 
