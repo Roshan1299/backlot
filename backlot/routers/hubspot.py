@@ -1264,9 +1264,30 @@ _WRITE_SCOPES = {
 }
 
 _RECORD_PATH = re.compile(r"/crm/v3/objects/([^/]+)/([^/]+)")
+# The keyed writes real answers ahead of their operation, each with the object types it names.
+_V3_CREATE_OR_BATCH_WRITE = re.compile(
+    r"/crm/v3/objects/([^/]+)(?:/batch/(?:archive|create|update|upsert))?"
+)
+_MERGE_PATH = re.compile(r"/crm/v3/objects/([^/]+)/merge")
+_RECORD_ASSOCIATION_PATH = re.compile(
+    r"/crm/v4/objects/([^/]+)/[^/]+/associations/(?:default/)?([^/]+)/[^/]+"
+)
+_ASSOCIATION_BATCH_WRITE = re.compile(
+    r"/crm/v4/associations/([^/]+)/([^/]+)/batch/"
+    r"(?:archive|associate/default|create|labels/archive)"
+)
+_HIGH_USAGE_REPORT = re.compile(r"/crm/v4/associations/usage/high-usage-report/([^/]+)")
+
+#: The order real's 403 lists two types' scopes in on a v4 association write, whichever side of the
+#: path each is on: all 25 ordered pairs of these on `batch/create` answered so on 2026-10-25.
+_PAIR_ORDER = ("contacts", "companies", "deals", "orders", "quotes")
+
+# A Java `int`, as `Integer.parseInt` reads one: a sign, then decimal digits. `parseInt` takes the
+# digits of other scripts too, as `\d` and `int` do here; `١` (U+0661) is the one sent to real.
+_JAVA_INT = re.compile(r"[+-]?\d+")
 
 
-def _missing_scopes(object_type: str) -> JSONResponse:
+def _missing_scopes(scopes: list[str]) -> JSONResponse:
     """Real's 403 for a write the key has no scope for. Its body also carries a `correlationId`,
     after `message`, which this one leaves out."""
     return JSONResponse(
@@ -1278,7 +1299,7 @@ def _missing_scopes(object_type: str) -> JSONResponse:
             "errors": [
                 {
                     "message": "One or more of the following scopes are required.",
-                    "context": {"requiredGranularScopes": _WRITE_SCOPES[object_type]},
+                    "context": {"requiredGranularScopes": scopes},
                 }
             ],
             "links": {"scopes": "https://developers.hubspot.com/scopes"},
@@ -1287,23 +1308,57 @@ def _missing_scopes(object_type: str) -> JSONResponse:
     )
 
 
+def _bare_error(status: int, content: dict) -> JSONResponse:
+    """One of real's errors with no `category`: `status`, then ``content``, `message` first. Real's
+    also carries a `correlationId`, after `message`, which this one leaves out."""
+    return JSONResponse(status_code=status, content={"status": "error", **content})
+
+
+def _java_int(value: str) -> int | None:
+    """``value`` as `Integer.parseInt` reads it, or None where that throws."""
+    if not _JAVA_INT.fullmatch(value):
+        return None
+    number = int(value)
+    return number if -(2**31) <= number < 2**31 else None
+
+
 def is_an_unserved_operation(method: str, path: str) -> bool:
     """Whether ``method`` on the `/hubspot` ``path`` is in :data:`_PUBLISHED_NOT_SERVED`, the path
     read as ``backlot.routers.github.is_an_unserved_operation`` reads one."""
     return published.includes(_PUBLISHED_NOT_SERVED, method, path.removeprefix("/hubspot"))
 
 
-def refuse_an_unserved_operation(request: Request) -> JSONResponse | None:
+async def refuse_an_unserved_operation(request: Request) -> JSONResponse | None:
     """The INVALID_AUTHENTICATION 401 for an operation of :data:`_PUBLISHED_NOT_SERVED` sent with no
     key or one that does not resolve, as a served route refuses it before running. With a key that
-    resolves, `PATCH` or `DELETE` on a record is the 400 for an object type real can't resolve, and
-    the 403 MISSING_SCOPES for a type of :data:`_WRITE_SCOPES`: real checks the credential, then the
-    type, then that the body parses, then the scopes, and doesn't look the record up first (`1`
-    names no contact and was the 403, against api.hubapi.com on 2026-10-18). A `PATCH` body that
-    doesn't parse, such as `{`, is real's JSON 400 ahead of the scopes; it is the 403 here, and that
-    parse belongs between the type and the scopes once Backlot parses request bodies the way real
-    does. None otherwise, so the request goes on to the router's own 404 or 405, an operation
-    Backlot cannot run.
+    resolves, a write is refused as real refuses it for this key, which may write none of
+    :data:`_WRITE_SCOPES`' types, and goes on to the router otherwise: its 404 or 405 stands for an
+    operation Backlot cannot run. Measured against api.hubapi.com on 2026-10-18 and 2026-10-25 with
+    a service key, real checks in this order: the 415 (`text/plain`, or a body with no
+    `Content-Type`), the credential, the object types in the path (:func:`_unknown_type`, on either
+    side of a v4 pair), an empty body and a `null` one (two 400s), a request with no body and no
+    `Content-Type` (below), and then the scopes; a body that doesn't parse, such as `{`, is a 400
+    between the types and the scopes. The 415, the two 400s and the parse belong with request
+    bodies, so a request sent with a body or a `Content-Type` goes on to the scopes here, as `{`
+    does.
+
+    - `PATCH` and `DELETE` on a record, and `POST` on `merge`: the 403 naming the type's scopes.
+      The record is not looked up first: `1` names no contact and was the 403.
+    - `POST` creating a record or on `batch/archive`, `batch/create`, `batch/update` or
+      `batch/upsert`: the same 403, and the 400 `The request body may not be null` for a request
+      with no body and no `Content-Type`.
+    - `DELETE` and `PUT` on a record's association, `default` or not: the 403 naming the first
+      type's scopes, whatever the second type is.
+    - `POST` on a v4 association batch write other than `batch/read`, which is a read the key is
+      allowed: the 403 naming both types' scopes, one after the other in :data:`_PAIR_ORDER`, or a
+      type's once when both are the same type; a 500 for a request with no body and no
+      `Content-Type`. A pair with a type outside :data:`_WRITE_SCOPES` goes on to the operation:
+      real answered `contacts/tickets` with an empty `inputs` with a 201.
+    - `high-usage-report`: real's 400 about the `userId`, ahead of the body. It names the id as
+      `Integer.parseInt` reads it (`+1`, `01` and `١` are `1`), since Backlot serves no HubSpot user
+      for one to name, and is `Unable to parse value for path parameter: userId` where that parse
+      throws. Real doesn't say which parse it uses; that one matches its answers to the 18 ids sent
+      on 2026-10-25.
 
     Measured against api.hubapi.com on 2026-09-28 with no `Authorization` header and with
     `Bearer nope`: `POST /crm/v3/objects/contacts`, `PATCH` and `DELETE`
@@ -1319,14 +1374,38 @@ def refuse_an_unserved_operation(request: Request) -> JSONResponse | None:
     path = request.scope["path"].removeprefix("/hubspot")
     if _caller(request) is None:
         return _error(401, "Authentication credentials not found.", "INVALID_AUTHENTICATION")
-    record = _RECORD_PATH.fullmatch(path)
-    if record and request.method in ("PATCH", "DELETE"):
-        object_type = record[1]
+    report = _HIGH_USAGE_REPORT.fullmatch(path)
+    if report:
+        user_id = _java_int(report[1])
+        if user_id is None:
+            message = "Unable to parse value for path parameter: userId"
+        else:
+            message = f"This is not a valid userId ({user_id}) for your portal "
+        return _bare_error(400, {"message": message})
+    # Each write: the types its path names, how many of them its 403 names, and its answer to a
+    # request with no body and no `Content-Type`.
+    if request.method in ("PATCH", "DELETE") and (match := _RECORD_PATH.fullmatch(path)):
+        types, scoped, no_body = [match[1]], 1, None
+    elif request.method == "POST" and (match := _MERGE_PATH.fullmatch(path)):
+        types, scoped, no_body = [match[1]], 1, None
+    elif request.method == "POST" and (match := _V3_CREATE_OR_BATCH_WRITE.fullmatch(path)):
+        null = {"message": "validation error", "errors": ["The request body may not be null"]}
+        types, scoped, no_body = [match[1]], 1, (400, null)
+    elif match := _RECORD_ASSOCIATION_PATH.fullmatch(path):
+        types, scoped, no_body = [match[1], match[2]], 1, None
+    elif request.method == "POST" and (match := _ASSOCIATION_BATCH_WRITE.fullmatch(path)):
+        types, scoped, no_body = [match[1], match[2]], 2, (500, {"message": "internal error"})
+    else:
+        return None
+    for object_type in types:
         if _resolve_type(request, object_type) is None:
             return _unknown_type(object_type)
-        if _canonical(object_type) in _WRITE_SCOPES:
-            return _missing_scopes(_canonical(object_type))
-    return None
+    canonical = {_canonical(object_type) for object_type in types[:scoped]}
+    if not canonical <= _WRITE_SCOPES.keys():
+        return None
+    if no_body and "content-type" not in request.headers and not await request.body():
+        return _bare_error(*no_body)
+    return _missing_scopes([s for t in _PAIR_ORDER if t in canonical for s in _WRITE_SCOPES[t]])
 
 
 #: The body of real's 401 for `OPTIONS`, which is not the INVALID_AUTHENTICATION one a route
@@ -1373,10 +1452,11 @@ def answer_ahead_of_the_routes(request: Request) -> Response | None:
     path's `Allow` (:data:`_ALLOWED_METHODS`) does not list is the 405 :func:`_error_page` writes,
     with no key as with one and ahead of the type: `GET`, `PUT`, `PATCH` and `DELETE` on `search`
     and `batch/read`, `PUT`, `PATCH` and `DELETE` on the listing, `PUT` and `POST` on a record and
-    `PUT` on the v4 associations path were each that 405. Every answer on `search` carries
-    `nosniff`, its `OPTIONS` and its 200 among them. Then an `Accept` that does not
-    :func:`_admits_json` is the 406 it writes, ahead of the credential, on each of those paths. A
-    path no route serves goes on to the router: real's `OPTIONS` on `/crm/v3/nonexistent-xyz` is
+    `PUT` on the v4 associations path were each that 405; `POST` on `merge`, which this reads as a
+    record's path, is an operation of its own (:func:`refuse_an_unserved_operation`). Every answer
+    on `search` carries `nosniff`, its `OPTIONS` and its 200 among them. Then an `Accept` that does
+    not :func:`_admits_json` is the 406 it writes, ahead of the credential, on each of those paths.
+    A path no route serves goes on to the router: real's `OPTIONS` on `/crm/v3/nonexistent-xyz` is
     not this 401, and its `GET` with `Accept: text/html` is the 404 that path gets, not the 406. A
     `HEAD` arrives here as its `GET` (``backlot.main.answer_head_as_the_get_without_its_body``).
     """
@@ -1408,7 +1488,11 @@ def _answered_ahead(method: str, path: str, accept: str | None) -> tuple[int, st
         return None
     if method == "OPTIONS":
         return 401, allowed
-    if method in ("GET", "POST", "PUT", "PATCH", "DELETE") and method not in allowed.split(","):
+    if (
+        method in ("GET", "POST", "PUT", "PATCH", "DELETE")
+        and method not in allowed.split(",")
+        and not (method == "POST" and _MERGE_PATH.fullmatch(path))
+    ):
         return 405, allowed
     if not _admits_json(accept or "*/*"):
         return 406, allowed

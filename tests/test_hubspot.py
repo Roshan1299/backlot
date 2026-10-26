@@ -655,22 +655,213 @@ def test_hubspot_checks_a_record_writes_type_before_its_scopes(
     assert (r.status_code, r.json()) == (status, body)
 
 
+_COMPANY_SCOPES = [
+    "crm.objects.companies.write",
+    "crm.schemas.companies.write",
+    "crm.objects.companies.highly_sensitive.write.v2",
+    "crm.objects.companies.sensitive.write.v2",
+]
+_QUOTE_SCOPES = ["crm.schemas.quotes.write", "crm.objects.quotes.write", "cpq.quotes.write"]
+_ORDER_SCOPES = [
+    "crm.schemas.orders.write",
+    "crm.objects.orders.write",
+    "crm.pipelines.orders.write",
+]
+
+
+def _scopes_refused(r) -> list[str]:
+    assert (r.status_code, r.json()["category"]) == (403, "MISSING_SCOPES")
+    return r.json()["errors"][0]["context"]["requiredGranularScopes"]
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "scopes"),
+    [
+        ("POST", "/crm/v3/objects/contacts", _CONTACT_SCOPES),
+        ("POST", "/crm/v3/objects/0-1", _CONTACT_SCOPES),
+        ("POST", "/crm/v3/objects/quotes", _QUOTE_SCOPES),
+        ("POST", "/crm/v3/objects/contacts/batch/archive", _CONTACT_SCOPES),
+        ("POST", "/crm/v3/objects/contacts/batch/create", _CONTACT_SCOPES),
+        ("POST", "/crm/v3/objects/companies/batch/update", _COMPANY_SCOPES),
+        ("POST", "/crm/v3/objects/contacts/batch/upsert", _CONTACT_SCOPES),
+        ("POST", "/crm/v3/objects/contacts/merge", _CONTACT_SCOPES),
+        ("DELETE", "/crm/v4/objects/contacts/1/associations/companies/2", _CONTACT_SCOPES),
+        ("PUT", "/crm/v4/objects/companies/1/associations/contacts/2", _COMPANY_SCOPES),
+        ("PUT", "/crm/v4/objects/quotes/1/associations/default/tickets/2", _QUOTE_SCOPES),
+        (
+            "POST",
+            "/crm/v4/associations/contacts/companies/batch/create",
+            _CONTACT_SCOPES + _COMPANY_SCOPES,
+        ),
+        (
+            "POST",
+            "/crm/v4/associations/companies/contacts/batch/archive",
+            _CONTACT_SCOPES + _COMPANY_SCOPES,
+        ),
+        (
+            "POST",
+            "/crm/v4/associations/quotes/orders/batch/associate/default",
+            _ORDER_SCOPES + _QUOTE_SCOPES,
+        ),
+        (
+            "POST",
+            "/crm/v4/associations/CONTACTS/company/batch/labels/archive",
+            _CONTACT_SCOPES + _COMPANY_SCOPES,
+        ),
+        ("POST", "/crm/v4/associations/contacts/contacts/batch/create", _CONTACT_SCOPES),
+    ],
+)
+def test_hubspot_refuses_a_keyed_write_for_the_scopes_of_its_types(
+    client, admin_h, method, path, scopes
+):
+    """With a key that resolves, a write with a body that parses is the 403 MISSING_SCOPES. A v4
+    record association names its first type's scopes, and a v4 association batch write both
+    types', in `_PAIR_ORDER`, as `refuse_an_unserved_operation` in `backlot.routers.hubspot`
+    records."""
+    r = client.request(method, f"/hubspot{path}", headers=admin_h, json={"inputs": []})
+    assert _scopes_refused(r) == scopes
+
+
+@pytest.mark.parametrize(
+    ("path", "status", "body"),
+    [
+        (
+            "/crm/v3/objects/contacts",
+            400,
+            {
+                "status": "error",
+                "message": "validation error",
+                "errors": ["The request body may not be null"],
+            },
+        ),
+        (
+            "/crm/v3/objects/deals/batch/upsert",
+            400,
+            {
+                "status": "error",
+                "message": "validation error",
+                "errors": ["The request body may not be null"],
+            },
+        ),
+        (
+            "/crm/v4/associations/contacts/companies/batch/create",
+            500,
+            {"status": "error", "message": "internal error"},
+        ),
+    ],
+)
+def test_hubspot_answers_a_keyed_write_with_no_body_and_no_content_type(
+    client, admin_h, path, status, body
+):
+    """A v3 create or batch write sent with no body and no `Content-Type` is real's null-body 400
+    ahead of the scopes, and a v4 association batch write its 500
+    (`refuse_an_unserved_operation` in `backlot.routers.hubspot`)."""
+    r = client.post(f"/hubspot{path}", headers=admin_h)
+    assert (r.status_code, r.json()) == (status, body)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/crm/v3/objects/contacts/merge",
+        "/crm/v4/objects/contacts/1/associations/companies/2",
+    ],
+)
+def test_hubspot_answers_a_keyed_write_with_no_body_with_the_scopes_where_real_does(
+    client, admin_h, path
+):
+    """`merge` and a v4 record association read no null body: with no body and no `Content-Type`
+    they are the 403 (`refuse_an_unserved_operation` in `backlot.routers.hubspot`)."""
+    method = "POST" if path.endswith("merge") else "PUT"
+    r = client.request(method, f"/hubspot{path}", headers=admin_h)
+    assert _scopes_refused(r) == _CONTACT_SCOPES
+
+
+@pytest.mark.parametrize(
+    ("content_type", "content"),
+    [("application/json", "{"), ("application/json", ""), (None, "{}")],
+)
+def test_hubspot_answers_a_create_sent_with_a_body_or_a_content_type_with_the_scopes(
+    client, admin_h, content_type, content
+):
+    """Only a request with no body and no `Content-Type` is the null-body 400: one with either is
+    answered as `{` is, with the scopes' 403 (`refuse_an_unserved_operation` in
+    `backlot.routers.hubspot`)."""
+    headers = {**admin_h, **({"Content-Type": content_type} if content_type else {})}
+    r = client.post("/hubspot/crm/v3/objects/contacts", headers=headers, content=content)
+    assert _scopes_refused(r) == _CONTACT_SCOPES
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "name"),
+    [
+        ("POST", "/crm/v3/objects/zzz", "zzz"),
+        ("POST", "/crm/v3/objects/zzz/batch/create", "zzz"),
+        ("POST", "/crm/v3/objects/zzz/merge", "zzz"),
+        ("PUT", "/crm/v4/objects/contacts/1/associations/zzz/2", "zzz"),
+        ("POST", "/crm/v4/associations/zzz/companies/batch/create", "zzz"),
+        ("POST", "/crm/v4/associations/contacts/zzz/batch/create", "zzz"),
+    ],
+)
+def test_hubspot_checks_a_keyed_writes_types_before_its_body_and_scopes(
+    client, admin_h, method, path, name
+):
+    """A type real can't resolve, on either side of a v4 pair, is its 400 ahead of the body and the
+    scopes (`refuse_an_unserved_operation` in `backlot.routers.hubspot`)."""
+    r = client.request(method, f"/hubspot{path}", headers=admin_h)
+    assert (r.status_code, r.json()) == (
+        400,
+        {"status": "error", "message": f"Unable to infer object type from: {name}"},
+    )
+
+
+@pytest.mark.parametrize(
+    ("user_id", "message"),
+    [
+        ("1", "This is not a valid userId (1) for your portal "),
+        ("-2147483648", "This is not a valid userId (-2147483648) for your portal "),
+        ("%2B1", "This is not a valid userId (1) for your portal "),
+        ("01", "This is not a valid userId (1) for your portal "),
+        ("%D9%A1", "This is not a valid userId (1) for your portal "),
+        ("2147483648", "Unable to parse value for path parameter: userId"),
+        ("1.0", "Unable to parse value for path parameter: userId"),
+        ("abc", "Unable to parse value for path parameter: userId"),
+        ("%201", "Unable to parse value for path parameter: userId"),
+    ],
+)
+def test_hubspot_refuses_a_high_usage_report_for_its_user_id(client, admin_h, user_id, message):
+    """`high-usage-report` is real's 400 about its `userId`, which names the id as
+    `Integer.parseInt` reads it, ahead of the body (`refuse_an_unserved_operation` in
+    `backlot.routers.hubspot`)."""
+    r = client.post(
+        f"/hubspot/crm/v4/associations/usage/high-usage-report/{user_id}",
+        headers={**admin_h, "Content-Type": "application/json"},
+        content="{",
+    )
+    assert (r.status_code, r.json()) == (400, {"status": "error", "message": message})
+
+
 @pytest.mark.parametrize(
     ("method", "path", "status"),
     [
         ("PATCH", "/hubspot/crm/v3/objects/tickets/1", 405),
         ("DELETE", "/hubspot/crm/v3/objects/tickets/1", 405),
-        ("POST", "/hubspot/crm/v3/objects/contacts/merge", 405),
-        ("DELETE", "/hubspot/crm/v4/objects/contacts/1/associations/companies/2", 404),
+        ("POST", "/hubspot/crm/v3/objects/tickets", 405),
+        ("POST", "/hubspot/crm/v3/objects/tickets/merge", 405),
+        ("POST", "/hubspot/crm/v3/objects/tickets/batch/create", 404),
+        ("DELETE", "/hubspot/crm/v4/objects/tickets/2/associations/contacts/2", 404),
+        ("POST", "/hubspot/crm/v4/associations/contacts/tickets/batch/create", 404),
+        ("POST", "/hubspot/crm/v4/associations/contacts/companies/batch/read", 404),
     ],
 )
 def test_hubspot_leaves_the_other_keyed_operations_to_the_router(
     client, admin_h, method, path, status
 ):
-    """With a key that resolves, a record write on a type outside `_WRITE_SCOPES`, and an operation
-    other than `PATCH` and `DELETE` on a record, go on to the router, whose 404 or 405 stands for an
-    operation Backlot cannot run (`refuse_an_unserved_operation` in `backlot.routers.hubspot`)."""
-    assert client.request(method, path, headers=admin_h, json={}).status_code == status
+    """With a key that resolves, a write whose types the 403 would name include one outside
+    `_WRITE_SCOPES`, and the v4 association `batch/read`, which the key may read, go on to the
+    router, whose 404 or 405 stands for an operation Backlot cannot run
+    (`refuse_an_unserved_operation` in `backlot.routers.hubspot`)."""
+    assert client.request(method, path, headers=admin_h, json={"inputs": []}).status_code == status
 
 
 def test_hubspot_answers_a_record_patch_that_does_not_parse_with_the_scopes(client, admin_h):
