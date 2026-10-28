@@ -233,7 +233,7 @@ def order_columns(source_type: str) -> tuple[str, ...]:
 # path is byte-identical to a build without writes, which is what lets a new write surface ship
 # without re-validating every other vendor. Adding one is this entry, its PATCHABLE columns, and
 # its endpoints.
-WRITABLE = frozenset({"slack"})
+WRITABLE = frozenset({"slack", "google_drive"})
 
 # Per source, the columns a served write may overwrite. Everything else is immutable once written:
 # a patch to an identifier column would move a row out from under its own ACL grant, since a grant
@@ -246,6 +246,24 @@ PATCHABLE = {
     # `subtype` is here because a deleted thread root becomes a `tombstone` rather than
     # disappearing (`chat_delete`), which is a change to the message real keeps serving.
     "slack": frozenset({"content", "reactions", "edited", "thread_ts", "subtype"}),
+    # A Sheets write changes a file's cells, which live in `gdrive_sheets` (see SATELLITES), and
+    # these two follow from them. `content` is the first sheet's CSV, which `files.export` and
+    # fullText search read: measured 2026-10-26, both reflect a `values.update` on real Drive.
+    # `updated_ts` is `modifiedTime`, which real moves to the write's own time.
+    "google_drive": frozenset({"content", "updated_ts"}),
+}
+
+# Per source, the corpus tables that hold PARTS of a document rather than documents, each with the
+# columns that name the document it belongs to. The overlay mirrors each one, and a document the
+# overlay holds parts for in a table reads that table's from the overlay alone (`parts_for`): a
+# spreadsheet's sheets are written together, so a read never mixes a written sheet with a corpus
+# one, whatever the write did to which sheets there are.
+SATELLITES = {
+    "google_drive": {
+        "gdrive_sheets": ("file_id",),
+        "gdrive_spreadsheets": ("file_id",),
+        "gdrive_doc_bodies": ("file_id",),
+    }
 }
 
 
@@ -459,14 +477,32 @@ DROP INDEX IF EXISTS idx_gdrive_served;
 -- per file because it is what a client addresses a sheet by -- two sharing one would leave the
 -- loser unreachable -- and a collision here is a loud import failure instead of a silent shadow.
 --
--- A cell in `grid` is a JSON scalar, so the type a corpus stated survives the round trip and
+-- A cell in `grid` is a JSON scalar as a corpus states it, or after a served write the object
+-- `gsheets.Cell` describes, so the type a corpus stated survives the round trip and
 -- `valueRenderOption` has something to distinguish.
+--
+-- `properties` is the sheet's `SheetProperties` past its id, title and index -- its grid size,
+-- `hidden`, `tabColor` and the rest -- as JSON, and NULL for a sheet a corpus stated, whose size
+-- is then `gsheets.Sheet.rows`/`cols`. A served write states it, so a sheet keeps the size
+-- a write gave it rather than one derived from how far its cells reach.
 CREATE TABLE IF NOT EXISTS gdrive_sheets (
     file_id TEXT NOT NULL, sheet_index INTEGER NOT NULL,
-    sheet_id INTEGER NOT NULL, title TEXT NOT NULL, grid TEXT NOT NULL,
+    sheet_id INTEGER NOT NULL, title TEXT NOT NULL, grid TEXT NOT NULL, properties TEXT,
     PRIMARY KEY (file_id, sheet_index)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_gdrive_sheets_id ON gdrive_sheets(file_id, sheet_id);
+
+-- A spreadsheet's own `SpreadsheetProperties` past its title (which is the Drive file's name):
+-- `locale`, `timeZone`, `autoRecalc`, as JSON. No row is the defaults a new workbook has, which is
+-- every spreadsheet a corpus states; a workbook created through the API states its own.
+CREATE TABLE IF NOT EXISTS gdrive_spreadsheets (
+    file_id TEXT PRIMARY KEY, properties TEXT NOT NULL
+);
+
+-- A document's stored body (`backlot.gdocs`).
+CREATE TABLE IF NOT EXISTS gdrive_doc_bodies (
+    file_id TEXT PRIMARY KEY, body TEXT NOT NULL
+);
 
 -- `path` names the file THIS row is (only kind='file' rows have one). `changed_paths` is the other
 -- direction: a JSON list of the paths a PULL touched, so a corpus can state which files a pull
@@ -1208,6 +1244,11 @@ def merged_source(
     costs SQLite the primary-key lookup it would otherwise use — measured at +43% on an 800k-row
     channel of the 11 GB corpus, against +2% for the ACL view and +6% for the re-index filter.
     Overlay hits reach that path through :func:`_overlay_hits` instead.
+
+    Drive's readers pay more for the union once a write has landed. Measured 2026-10-27 on a
+    100,000-file Drive corpus, median of five, before and after one Sheets write: `files.list`
+    100 to 229 ms, `name contains` 21 to 112 ms, `fullText contains` 141 to 237 ms and `about` 55
+    to 79 ms; four other reads moved by 1.2x or less.
     """
     from backlot import overlay  # local: overlay imports store
 
@@ -1278,10 +1319,16 @@ def _require_patchable(source_type: str, field: str) -> None:
         )
 
 
-def insert_document(conn, source_type: str, values: dict) -> None:
+def insert_document(
+    conn, source_type: str, values: dict, *, grants: list | None = None, parts: dict | None = None
+) -> None:
     """Write one document to the overlay, grant it what its container grants, and index it.
 
     ``values`` maps column name to value, and its identifier columns must already be minted.
+    ``grants`` replaces the container's with exactly these ``(principal_type, principal_id)``
+    pairs, for a document that belongs to no container that shares it: a Drive file created at the
+    root is its owner's alone. ``parts`` is written as :func:`replace_parts` writes it, in the same
+    commit.
 
     The grants copied are the container's own distinct set — the org for a public Slack channel,
     the grantee list for a private one — so a written document is exactly as visible as the
@@ -1313,16 +1360,25 @@ def insert_document(conn, source_type: str, values: dict) -> None:
             f"INSERT INTO ov.{tbl} ({', '.join(cols)}) VALUES ({','.join('?' for _ in cols)})",
             [values[c] for c in cols],
         )
-        conn.execute(
-            f"INSERT INTO ov.{names['acl']} ({key_cols}, principal_type, principal_id) "
-            f"SELECT {', '.join('?' for _ in key)}, principal_type, principal_id FROM ("
-            f"  SELECT DISTINCT principal_type, principal_id FROM main.{names['acl']} "
-            f"  WHERE {container} = ?"
-            f"  UNION SELECT DISTINCT principal_type, principal_id FROM ov.{names['acl']} "
-            f"  WHERE {container} = ?"
-            f")",
-            [*(values[c] for c in key), values[container], values[container]],
-        )
+        if grants is None:
+            conn.execute(
+                f"INSERT INTO ov.{names['acl']} ({key_cols}, principal_type, principal_id) "
+                f"SELECT {', '.join('?' for _ in key)}, principal_type, principal_id FROM ("
+                f"  SELECT DISTINCT principal_type, principal_id FROM main.{names['acl']} "
+                f"  WHERE {container} = ?"
+                f"  UNION SELECT DISTINCT principal_type, principal_id FROM ov.{names['acl']} "
+                f"  WHERE {container} = ?"
+                f")",
+                [*(values[c] for c in key), values[container], values[container]],
+            )
+        else:
+            conn.executemany(
+                f"INSERT INTO ov.{names['acl']} ({key_cols}, principal_type, principal_id) "
+                f"VALUES ({', '.join('?' for _ in key)}, ?, ?)",
+                [(*(values[c] for c in key), ptype, pid) for ptype, pid in grants],
+            )
+        if parts:
+            _replace_parts_locked(conn, source_type, tuple(values[c] for c in key), parts)
         _fts_index_overlay(conn, source_type, tuple(values[c] for c in key), values)
         conn.commit()
 
@@ -1411,6 +1467,65 @@ def tombstone_document(conn, source_type: str, key: tuple) -> None:
         )
         conn.execute(f"DELETE FROM ov.{names['fts']} WHERE {where}", list(key))
         conn.commit()
+
+
+def parts_for(conn, source_type: str, table: str, key: tuple, *, order_by: str) -> list:
+    """One document's rows in a :data:`SATELLITES` table: the overlay's when it holds any for that
+    document, the corpus's otherwise. Never both -- a write replaces a document's parts whole."""
+    from backlot import overlay
+
+    where = " AND ".join(f"{c} = ?" for c in SATELLITES[source_type][table])
+    if source_type in WRITABLE and overlay.is_attached(conn):
+        rows = conn.execute(
+            f"SELECT * FROM ov.{table} WHERE {where} ORDER BY {order_by}", list(key)
+        ).fetchall()
+        if rows:
+            return rows
+    return conn.execute(
+        f"SELECT * FROM main.{table} WHERE {where} ORDER BY {order_by}", list(key)
+    ).fetchall()
+
+
+def replace_parts(conn, source_type: str, key: tuple, parts: dict, patches: dict) -> None:
+    """Set a document's rows in each of its :data:`SATELLITES` tables ``parts`` names to exactly
+    the rows given, and overwrite the document's ``patches`` columns, in one commit under one lock.
+
+    One commit because they describe one state: a spreadsheet's `content` is derived from its first
+    sheet, so a reader that saw the new cells beside the old `content` would get two answers for
+    one file from Sheets and from Drive's export. Each row omits the columns that name the
+    document; ``key`` supplies them, in :data:`SATELLITES` order. An empty list leaves the table
+    holding none for it in the overlay, which reads as the corpus's (`parts_for`).
+    """
+    from backlot import overlay
+
+    _require_writable(source_type)
+    for field in patches:
+        _require_patchable(source_type, field)
+    with overlay.LOCK:
+        _replace_parts_locked(conn, source_type, key, parts)
+        for field, value in patches.items():
+            _patch_locked(conn, source_type, key, field, value)
+        conn.commit()
+
+
+def _replace_parts_locked(conn, source_type: str, key: tuple, parts: dict) -> None:
+    """The body of :func:`replace_parts` and of an insert that carries parts, lock held and commit
+    left to the caller."""
+    for table, rows in parts.items():
+        ref = SATELLITES[source_type][table]
+        known = {r[1] for r in conn.execute(f"PRAGMA main.table_info({table})")}
+        for row in rows:
+            if unknown := set(row) - known:
+                raise ValueError(f"{source_type}: no such column(s) {sorted(unknown)} on {table}")
+        where = " AND ".join(f"{c} = ?" for c in ref)
+        conn.execute(f"DELETE FROM ov.{table} WHERE {where}", list(key))
+        for row in rows:
+            values = {**dict(zip(ref, key)), **row}
+            conn.execute(
+                f"INSERT INTO ov.{table} ({', '.join(values)}) "
+                f"VALUES ({','.join('?' for _ in values)})",
+                list(values.values()),
+            )
 
 
 def document_by_key(conn, source_type: str, key: tuple, visible_ids=None) -> sqlite3.Row | None:
@@ -1613,7 +1728,7 @@ def list_documents(
     # other than True: `_drive_trash` reads a column only gdrive_files has. newest_first orders
     # gdrive_files rows by DRIVE_MODIFIED, newest first, ties by id. title matches the whole title,
     # ignoring ASCII case. subtype is Confluence's content type, where a row with none is a page.
-    tbl = table(source_type)
+    tbl = merged_source(conn, source_type)
     sql = f"SELECT * FROM {tbl} WHERE 1=1"
     params: list = []
     sql = _scope(sql, params, grouping_col(source_type), container, author_email, not_author_email)
@@ -2312,6 +2427,78 @@ def linear_visible_labels(conn, visible_ids=None) -> list[str]:
     ]
 
 
+# A team key starts with a letter, and the number has no leading zero: `KEY-019` and `019` named
+# no issue on api.linear.app on 2026-10-22. The key and the number are ASCII, as real reads them:
+# `KEY-19` followed by U+0663 (an Arabic-Indic three) named KEY-19 on 2026-10-25, where `\d` would
+# read it as a digit.
+_LINEAR_SEARCH_KEY = r"[A-Za-z][A-Za-z0-9]*"
+_LINEAR_SEARCH_NUM = r"[1-9][0-9]*"
+# The identifier with its hyphen or one space at the start of the term, and then the term's end or
+# a character outside A-Z, a-z and 0-9.
+_LINEAR_SEARCH_OPENING = re.compile(
+    rf"({_LINEAR_SEARCH_KEY})[- ]({_LINEAR_SEARCH_NUM})(?![A-Za-z0-9])"
+)
+# The identifier with no separator, the number being the trailing digits, so `KEY19` is key `KEY`
+# and number `19` rather than key `KEY1` and number `9`.
+_LINEAR_SEARCH_JOINED = re.compile(rf"([A-Za-z][A-Za-z0-9]*?)({_LINEAR_SEARCH_NUM})")
+# What a term with a key loses from each end: what JavaScript's `String.prototype.trim` takes. On
+# 2026-10-25 api.linear.app read `KEY19` after a tab, U+00A0, U+2028, U+3000 or U+FEFF as KEY-19,
+# and after U+001C, U+001F, U+0085, U+180E or U+200B as no issue; `str.strip()` takes U+001C to
+# U+001F and U+0085 and leaves U+FEFF.
+_LINEAR_SEARCH_TRIMMED = "\t\n\x0b\x0c\r \xa0\u1680\u2028\u2029\u202f\u205f\u3000\ufeff" + "".join(
+    map(chr, range(0x2000, 0x200B))
+)
+# The number alone, with at most one space and that on one side.
+_LINEAR_SEARCH_BARE = re.compile(rf" ?({_LINEAR_SEARCH_NUM})|({_LINEAR_SEARCH_NUM}) ")
+
+
+def _linear_search_identifier(term: str) -> tuple[str | None, str] | None:
+    """The issue a ``searchIssues`` term names, as ``(key, number)`` with ``key`` None for a number
+    alone, or None when it names none.
+
+    Measured on api.linear.app on 2026-10-22 and 2026-10-25, over one team's issues. For a term with
+    a key, what :data:`_LINEAR_SEARCH_TRIMMED` holds goes from either end (`   KEY-19`, `KEY 19  `,
+    a tab or a no-break space before `KEY19`), and so does one pair of `"` or of `'` around the
+    whole of it (`"KEY-19"`, `'KEY-19'`, `"KEY19"`), where one quote alone, two pairs, brackets or
+    backticks around it named no issue. `KEY-N` or `KEY N` names that issue when the term ends there
+    or goes on with a character outside A-Z, a-z and 0-9: `KEY-19.`, `KEY-19;`, `KEY-19!`,
+    `KEY-19-`, `KEY-19_`, `KEY-19é`, `KEY 19,`, `KEY-19 probe` and `KEY-19.probe` named KEY-19, and
+    `KEY-19x`, `KEY 19x`, `KEY  19` and `KEY<TAB>19` none. `KEYN` names it only as the whole term
+    (`KEY19.` and `KEY19 probe` named none). The number alone names it with at most one space, on
+    one side: `19`, ` 19` and `19 ` named KEY-19, and ` 19 `, `  19`, `19.`, `"19"` and `19` after a
+    tab none."""
+    text = term.strip(_LINEAR_SEARCH_TRIMMED)
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        text = text[1:-1]
+    named = _LINEAR_SEARCH_OPENING.match(text) or _LINEAR_SEARCH_JOINED.fullmatch(text)
+    if named:
+        return named.group(1), named.group(2)
+    bare = _LINEAR_SEARCH_BARE.fullmatch(term)
+    if bare:
+        return None, bare.group(1) or bare.group(2)
+    return None
+
+
+def _linear_identifier_ids(conn, key: str | None, number: str) -> list[str]:
+    """Ids whose identifier ends in ``-number``, and whose key is ``key`` when one is given.
+
+    A bare number is every issue the later ACL and ``team`` clauses still allow. The workspace
+    measured on 2026-10-22 had one team, so which team a bare number belongs to is unmeasured;
+    dropping one of two visible issues numbered the same would be the guess that hides a match
+    the caller can already see. ``teamId`` still narrows them, through the clause the search
+    applies after this."""
+    sql = (
+        "SELECT id FROM linear_issues "
+        "WHERE instr(identifier, '-') > 0 "
+        "AND substr(identifier, instr(identifier, '-') + 1) = ?"
+    )
+    params: list = [number]
+    if key is not None:
+        sql += " AND lower(substr(identifier, 1, instr(identifier, '-') - 1)) = lower(?)"
+        params.append(key)
+    return [row[0] for row in conn.execute(sql, params)]
+
+
 def search_linear_issues(
     conn,
     term: str,
@@ -2326,17 +2513,17 @@ def search_linear_issues(
     """``searchIssues``: every matching issue as ``(id, score)`` in the order served, and the count
     ``totalCount`` reports.
 
-    An issue matches when its identifier is ``term`` (any case), when a space-separated word of
-    ``term`` starts a word of its title or description, read through the porter-stemmed index with
-    a hyphenated word as the phrase it spells (measured 2026-10-22: `prob`, `pro` and `chil` matched
-    where `robe` did not, and `BRE-2` did not match a title holding `(child 2)`), or, with
-    ``include_comments``, when one of its comments contains a word. That count leaves
-    ``prefilter`` out, as api.linear.app's did on 2026-10-22: a `filter` narrowed the nodes and left
-    `totalCount` at the unfiltered total.
+    An issue matches when the term names its identifier (see :func:`_linear_search_identifier`),
+    when a space-separated word of ``term`` starts a word of its title or description, read
+    through the porter-stemmed index with a hyphenated word as the phrase it spells (measured
+    2026-10-22: `prob`, `pro` and `chil` matched where `robe` did not, and `BRE-2` did not match
+    a title holding `(child 2)`), or, with ``include_comments``, when one of its comments
+    contains a word. That count leaves ``prefilter`` out, as api.linear.app's did on 2026-10-22:
+    a `filter` narrowed the nodes and left `totalCount` at the unfiltered total.
 
     ``score`` is 1 for the identifier, as real's was, and ``|bm25| / (1 + |bm25|)`` for an index
     match, so it falls between 0 and 1 and orders as the rank does; a comment-only match scores 0.
-    Real's own scores are not reproducible."""
+    Real's own word scores are not reproducible."""
     words = re.findall(r"\w+", term.lower())
     # Each kind of match is collected on its own and the candidates are scoped afterwards: an FTS
     # MATCH joined into a scan of the issues is re-run per issue.
@@ -2358,17 +2545,8 @@ def search_linear_issues(
             f"SELECT DISTINCT issue_id FROM linear_comments WHERE {found}", words
         ):
             ranks.setdefault(row[0], None)
-    key, sep, suffix = term.strip().partition("-")
-    spellings = list(
-        dict.fromkeys((term.strip(), f"{key.upper()}{sep}{suffix}", term.strip().upper()))
-    )
-    exact = {
-        r[0]
-        for r in conn.execute(
-            f"SELECT id FROM linear_issues WHERE identifier IN ({','.join('?' * len(spellings))})",
-            spellings,
-        )
-    }
+    named = _linear_search_identifier(term)
+    exact = set(_linear_identifier_ids(conn, *named)) if named is not None else set()
     for issue_id in exact:
         ranks.setdefault(issue_id, None)
     where = " WHERE id IN (SELECT value FROM json_each(?))"
@@ -2441,7 +2619,9 @@ def list_drive_folder(
     SQL-paginated, so listing a big folder costs one page of rows per request, not a full-corpus
     scan on every page."""
     params: list = [folder]
-    sql = _drive_trash("SELECT * FROM gdrive_files WHERE folder = ?", params, trash)
+    sql = _drive_trash(
+        f"SELECT * FROM {merged_source(conn, 'google_drive')} WHERE folder = ?", params, trash
+    )
     clause, cparams = _acl_clause("google_drive", visible_ids=visible_ids)
     sql += clause + f" ORDER BY {DRIVE_MODIFIED} DESC, id LIMIT ? OFFSET ?"
     params += cparams + [limit, offset]
@@ -2490,11 +2670,11 @@ def list_drive_by_name(
         needle = _like_escape(name)
         # SQLite LIKE is case-insensitive for ASCII and exact elsewhere — real's `name =` rule;
         # no lower() wrapper, which would force a per-row scan.
-        sql = "SELECT * FROM gdrive_files WHERE title LIKE ? ESCAPE '\\'"
+        sql = f"SELECT * FROM {merged_source(conn, 'google_drive')} WHERE title LIKE ? ESCAPE '\\'"
         params: list = [needle]
     else:
         needle = _like_escape(drive_name_fold(name))
-        sql = "SELECT * FROM gdrive_files WHERE title_fold LIKE ? ESCAPE '\\'"
+        sql = f"SELECT * FROM {merged_source(conn, 'google_drive')} WHERE title_fold LIKE ? ESCAPE '\\'"
         params = [f"%{needle}%"]
     sql = _drive_trash(sql, params, trash)
     if container is not None:
@@ -2509,7 +2689,11 @@ def list_drive_by_name(
 def count_drive_folder(conn, folder, visible_ids=None, trash=False) -> int:
     """How many files `list_drive_folder` lists for the same arguments."""
     params: list = [folder]
-    sql = _drive_trash("SELECT COUNT(*) FROM gdrive_files WHERE folder = ?", params, trash)
+    sql = _drive_trash(
+        f"SELECT COUNT(*) FROM {merged_source(conn, 'google_drive')} WHERE folder = ?",
+        params,
+        trash,
+    )
     clause, cparams = _acl_clause("google_drive", visible_ids=visible_ids)
     sql += clause
     params += cparams
@@ -2520,7 +2704,7 @@ def drive_folder_has_visible(conn, folder, visible_ids=None) -> bool:
     """Whether the caller can see any file in a folder — a ``LIMIT 1`` existence check (stops at
     the first visible file), so deciding which folders to surface is a couple of cheap probes."""
     clause, params = _acl_clause("google_drive", visible_ids=visible_ids)
-    sql = f"SELECT 1 FROM gdrive_files WHERE folder = ?{clause} LIMIT 1"
+    sql = f"SELECT 1 FROM {merged_source(conn, 'google_drive')} WHERE folder = ?{clause} LIMIT 1"
     return conn.execute(sql, [folder, *params]).fetchone() is not None
 
 
@@ -2537,6 +2721,25 @@ def _drive_trash(sql: str, params: list, trash) -> str:
     return sql + " AND (COALESCE(trashed, 0) = 0 OR lower(COALESCE(author_email, '')) = lower(?))"
 
 
+# Real Drive never reports a native Docs-editors file (a Doc, Sheet or Slide deck) under 1024 bytes:
+# measured 2026-10-26 against Drive v3 across 80 native files, the smallest `size` was 1024 and an
+# empty spreadsheet reported 1024 too.
+DRIVE_NATIVE_MIN_BYTES = 1024
+# The subtypes that floor applies to, and the subtype a Drive row stored without one is served as.
+DRIVE_NATIVE_SUBTYPES = ("document", "spreadsheet", "presentation")
+DRIVE_DEFAULT_SUBTYPE = "document"
+
+
+def drive_file_bytes(subtype: str | None, content: str | None) -> int:
+    """The ``size`` and ``quotaBytesUsed`` a non-folder Drive file serves: its UTF-8 byte length,
+    floored at :data:`DRIVE_NATIVE_MIN_BYTES` for a native file. :func:`drive_usage_bytes` sums the
+    same in SQL."""
+    nbytes = len((content or "").encode("utf-8"))
+    if (subtype or DRIVE_DEFAULT_SUBTYPE) in DRIVE_NATIVE_SUBTYPES:
+        return max(nbytes, DRIVE_NATIVE_MIN_BYTES)
+    return nbytes
+
+
 def drive_usage_bytes(conn, visible_ids=None) -> tuple[int, int]:
     """``(bytes stored, bytes in the trash)`` over the Drive files this caller can see — what
     ``about.get`` serves as ``storageQuota``. One query, so the quota costs a single scan.
@@ -2544,12 +2747,20 @@ def drive_usage_bytes(conn, visible_ids=None) -> tuple[int, int]:
     ``length(CAST(content AS BLOB))`` is deliberate: SQLite's ``length()`` on a TEXT column counts
     CHARACTERS, while the ``size`` every file resource carries is ``len(content.encode("utf-8"))``.
     Without the cast a corpus holding any non-ASCII text reports a quota smaller than the sum of
-    the sizes the same caller reads out of ``files.list`` — a divergence no client could explain."""
-    nbytes = "length(CAST(content AS BLOB))"
+    the sizes the same caller reads out of ``files.list`` — a divergence no client could explain.
+
+    A native file counts at least :data:`DRIVE_NATIVE_MIN_BYTES`, the floor its ``size`` carries,
+    so the quota stays the sum of the sizes ``files.list`` serves."""
+    raw = "COALESCE(length(CAST(content AS BLOB)), 0)"
+    native = ", ".join(f"'{s}'" for s in DRIVE_NATIVE_SUBTYPES)
+    nbytes = (
+        f"(CASE WHEN COALESCE(NULLIF(subtype, ''), '{DRIVE_DEFAULT_SUBTYPE}') IN ({native}) "
+        f"THEN MAX({raw}, {DRIVE_NATIVE_MIN_BYTES}) ELSE {raw} END)"
+    )
     sql = (
         f"SELECT COALESCE(SUM({nbytes}), 0), "
         f"COALESCE(SUM(CASE WHEN COALESCE(trashed, 0) = 1 THEN {nbytes} ELSE 0 END), 0) "
-        "FROM gdrive_files WHERE 1=1"
+        f"FROM {merged_source(conn, 'google_drive')} WHERE 1=1"
     )
     clause, params = _acl_clause("google_drive", visible_ids=visible_ids)
     total, trashed = conn.execute(sql + clause, params).fetchone()
@@ -2562,19 +2773,18 @@ def gdrive_by_id(conn, file_id, visible_ids=None) -> sqlite3.Row | None:
     straight through the ACL clause."""
     clause, cp = _acl_clause("google_drive", visible_ids=visible_ids)
     return conn.execute(
-        f"SELECT * FROM gdrive_files WHERE id = ?{clause}", [file_id, *cp]
+        f"SELECT * FROM {merged_source(conn, 'google_drive')} WHERE id = ?{clause}",
+        [file_id, *cp],
     ).fetchone()
 
 
 def gdrive_sheets_for(conn, file_id: str) -> list[sqlite3.Row]:
-    """A spreadsheet's stored sheets in index order, or an empty list when it states no grid.
+    """A spreadsheet's sheets in index order, or an empty list when it states no grid.
 
     No ACL clause: every caller has already resolved the file through :func:`gdrive_by_id`, which
     enforces visibility, and a sheet is not separately grantable -- reading one is reading the file
     it belongs to."""
-    return conn.execute(
-        "SELECT * FROM gdrive_sheets WHERE file_id = ? ORDER BY sheet_index", [file_id]
-    ).fetchall()
+    return parts_for(conn, "google_drive", "gdrive_sheets", (file_id,), order_by="sheet_index")
 
 
 def gdrive_replace_sheets(conn, file_id: str, rows) -> None:
@@ -2590,6 +2800,24 @@ def gdrive_replace_sheets(conn, file_id: str, rows) -> None:
         "VALUES (?, ?, ?, ?, ?)",
         [(file_id, *r) for r in rows],
     )
+
+
+def gdrive_doc_body_for(conn, file_id: str) -> list | None:
+    """A document's stored body (`backlot.gdocs`), or None when it states no structure. No ACL
+    clause, for the reason :func:`gdrive_sheets_for` gives."""
+    rows = parts_for(conn, "google_drive", "gdrive_doc_bodies", (file_id,), order_by="file_id")
+    return json.loads(rows[0]["body"]) if rows else None
+
+
+def gdrive_replace_doc_body(conn, file_id: str, body: list | None) -> None:
+    """Set a file's stored body to ``body``, or to none, so a re-import that stops stating
+    paragraphs stops serving them."""
+    conn.execute("DELETE FROM gdrive_doc_bodies WHERE file_id = ?", [file_id])
+    if body is not None:
+        conn.execute(
+            "INSERT INTO gdrive_doc_bodies (file_id, body) VALUES (?, ?)",
+            [file_id, json.dumps(body, ensure_ascii=False)],
+        )
 
 
 # A Gmail thread is listed once, under its root. ``thread_id`` holds the ROOT'S OWN served id (see
@@ -2609,7 +2837,7 @@ def has_visible_document(conn, source_type, container=None, visible_ids=None) ->
     ``visible_ids`` keeps :func:`_acl_clause`'s three states, the empty set included: an anonymous
     caller reaches nothing, so every container answers False rather than True.
     """
-    tbl = table(source_type)
+    tbl = merged_source(conn, source_type)
     sql = f"SELECT 1 FROM {tbl} WHERE 1=1"
     params: list = []
     sql = _scope(sql, params, grouping_col(source_type), container, None, None)
@@ -2634,7 +2862,7 @@ def count_documents(
     # column; passing it for any other source_type raises sqlite3.OperationalError. trash is
     # list_documents', and roots_only counts gmail THREADS rather than messages. It has to track
     # list_documents': a count that includes rows the listing drops makes nextPageToken lie.
-    tbl = table(source_type)
+    tbl = merged_source(conn, source_type)
     sql = f"SELECT COUNT(*) FROM {tbl} WHERE 1=1"
     params: list = []
     sql = _scope(sql, params, grouping_col(source_type), container, author_email)
@@ -2668,7 +2896,7 @@ def get_document(conn, source_type, *ident, visible_ids=None) -> sqlite3.Row | N
             f"get_document: {source_type!r} is identified by {key}, so it takes "
             f"{len(key)} value(s), not {len(ident)}"
         )
-    tbl = table(source_type)
+    tbl = merged_source(conn, source_type)
     sql = f"SELECT * FROM {tbl} WHERE " + " AND ".join(f"{c} = ?" for c in key)
     params: list = list(ident)
     clause, cparams = _acl_clause(source_type, visible_ids=visible_ids)
@@ -4735,6 +4963,28 @@ def doc_grants(conn, source_type, *ident) -> list[sqlite3.Row]:
         "ORDER BY principal_type, principal_id",
         ident,
     ).fetchall()
+
+
+def gdrive_shared(conn, file_ids: list) -> set:
+    """The subset of ``file_ids`` some grant shares with anyone besides the owner: a grant to the
+    file's own author is not sharing. Measured 2026-10-26, a spreadsheet created through the API,
+    whose one permission is its owner's, is `shared: false`."""
+    out: set = set()
+    acl = acl_table("google_drive")
+    for i in range(0, len(file_ids), 900):
+        chunk = list(file_ids[i : i + 900])
+        marks = ",".join("?" for _ in chunk)
+        out.update(
+            r[0]
+            for r in conn.execute(
+                f"SELECT DISTINCT a.id FROM {acl} a "
+                f"JOIN {merged_source(conn, 'google_drive')} ON gdrive_files.id = a.id "
+                f"WHERE a.id IN ({marks}) AND NOT (a.principal_type = 'user' "
+                f"AND lower(a.principal_id) = lower(gdrive_files.author_email))",
+                chunk,
+            )
+        )
+    return out
 
 
 def docs_with_grants(conn, source_type, doc_keys: list) -> set:

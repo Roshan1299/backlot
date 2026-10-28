@@ -39,6 +39,7 @@ Object mapping: a Notion *page* is one doc (``subtype='page'``); a *database* is
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import re
@@ -76,6 +77,73 @@ PUBLISHED_VERSIONS = (
     "2025-09-03",
     "2026-03-11",
 )
+#: The headers real puts on an answer past its body reader (:func:`front_door_body`), one value
+#: each wherever they were measured against api.notion.com on 2026-10-27: the answers of each route
+#: here (200s, 400s, 401s, 404s and a 503, `HEAD`s among them), the OAuth client endpoints' 401 and
+#: the root's 302. The refusals that body reader answers carried none of them, and neither did the
+#: front door's `405 Not Allowed` page for `TRACE`: a method outside :data:`ROUTED_METHODS` is the
+#: framework's 405 here (:func:`unmatched_path`), and carries none of them either.
+#: `strict-transport-security` came beside them and is left off, a promise of HTTPS that a server
+#: answering over plain HTTP cannot keep.
+APPLICATION_HEADERS = {
+    "content-security-policy": "default-src 'none'",
+    "referrer-policy": "strict-origin-when-cross-origin",
+    "x-content-type-options": "nosniff",
+    "x-dns-prefetch-control": "off",
+    "x-download-options": "noopen",
+    "x-frame-options": "SAMEORIGIN",
+    "x-permitted-cross-domain-policies": "none",
+    "x-xss-protection": "0",
+}
+
+
+def weak_etag(body: bytes) -> str:
+    """The `ETag` real puts on a Notion answer: a weak tag holding the body's length in bytes, in
+    hex, and the first 27 characters of the base64 SHA-1 of the body, the form Express's `etag`
+    writes.
+
+    Measured against api.notion.com on 2026-10-27: the 200s of `users/me`, `pages/{id}` and
+    `search`, the 401s (the OAuth client endpoints' among them), the 400s, a 404 and a 503, and
+    the body reader's 413 and 415 each carried one over its own body, a `HEAD` the tag of the
+    body its `GET` answers; the root's 302 and a CORS preflight's 204 carried none. The
+    computation was checked against the bodies kept whole.
+    """
+    digest = base64.b64encode(hashlib.sha1(body).digest()).decode("ascii")[:27]
+    return f'W/"{len(body):x}-{digest}"'
+
+
+#: ``fresh``'s test for `no-cache` among the comma-separated parts of a request's `Cache-Control`,
+#: its `\s` written out as the characters JavaScript's `\s` holds in latin-1, which a header value
+#: is read as.
+_NO_CACHE = re.compile(r"(?:^|,)[\t\n\v\f\r \xa0]*?no-cache[\t\n\v\f\r \xa0]*?(?:,|$)")
+
+
+def not_modified(request: Request, status_code: int) -> bool:
+    """Whether real answers ``request`` with a 304 in place of its answer of ``status_code``: the
+    freshness check Express runs on a `GET`'s 2xx (``fresh`` 0.5.2), which finds `If-None-Match: *`
+    fresh unless a non-empty `If-Modified-Since`, or `no-cache` in `Cache-Control`, goes with it. A
+    `HEAD` reaches this as the `GET` it is rewritten to.
+
+    Measured against api.notion.com on 2026-10-27: `If-None-Match: *`, with or without spaces or a
+    tab around it, drew a 304 on a `GET` and a `HEAD` of `users/me`, and on a `GET` of `users`,
+    `pages/{id}` and `blocks/{id}/children`, carrying the `ETag` and every header the 200 carries
+    but `content-type`. Beside `If-Modified-Since` of a past or a future date, or
+    `Cache-Control: max-age=0, no-cache` sent as one header or as two, it drew the 200, and beside
+    an `If-Modified-Since` of U+00A0 alone or a `Cache-Control` of `no-cache` after a U+00A0 too;
+    beside an empty `If-Modified-Since` or one of spaces, or a `Cache-Control` of `NO-CACHE`,
+    `max-age=0`, `xno-cache` or `no-cache="set-cookie"`, the 304. A 400, a 404 and a `POST` were
+    answered as without it, and so were `"*"`, `W/"0-x", *` and a U+00A0 beside the `*`. No other
+    `If-None-Match` can match there, because each body carries a `request_id` minted for it; this
+    server's comes from the request (:func:`_request_id`), so its tag repeats, and matching one
+    would answer a 304 where real answers the 200. Only `*` is read.
+    """
+    if request.method != "GET" or not 200 <= status_code < 300:
+        return False
+    if request.headers.get("if-modified-since", "").strip(" \t"):
+        return False
+    if _NO_CACHE.search(", ".join(request.headers.getlist("cache-control"))):
+        return False
+    return request.headers.get("if-none-match", "").strip(" \t") == "*"
 
 
 # --- OpenAPI enrichment --------------------------------------------------
@@ -1403,9 +1471,11 @@ def _invalid_client(request: Request) -> JSONResponse:
     )
 
 
-@unmatched_router.api_route(
-    "/{rest:path}", methods=["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"]
-)
+#: The methods the catch-all below takes; :func:`unmatched_path` has why these six.
+ROUTED_METHODS = ("GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS")
+
+
+@unmatched_router.api_route("/{rest:path}", methods=list(ROUTED_METHODS))
 async def unmatched_path(request: Request, rest: str) -> JSONResponse:
     """Notion's answer for a URL no route here serves: the credential's refusal where Notion
     publishes the operation, and otherwise the URL's 400, which it gives before it reads anything

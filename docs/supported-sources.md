@@ -16,13 +16,13 @@ Generated from `backlot/schemas/*.schema.json` and the app's own `/openapi.json`
 | `source_type` | Service | URL prefix | Endpoints | Record schema | What one record is |
 |---|---|---|---|---|---|
 | `confluence` | Confluence | `/atlassian/wiki/rest/api` | 10 | [`confluence.schema.json`](../backlot/schemas/confluence.schema.json) | A Confluence page or blogpost. |
-| `fireflies` | Fireflies | `/fireflies/graphql` | GraphQL (one `POST`) | [`fireflies.schema.json`](../backlot/schemas/fireflies.schema.json) | A Fireflies.ai meeting transcript. |
+| `fireflies` | Fireflies | `/fireflies/graphql` | GraphQL (one endpoint, `POST` or `GET`) | [`fireflies.schema.json`](../backlot/schemas/fireflies.schema.json) | A Fireflies.ai meeting transcript. |
 | `github` | GitHub | `/github` | 34 | [`github.schema.json`](../backlot/schemas/github.schema.json) | A GitHub issue, pull request, file, or the repository itself. |
 | `gmail` | Gmail | `/gmail/v1` | 8 | [`gmail.schema.json`](../backlot/schemas/gmail.schema.json) | A Gmail message. |
-| `google_drive` | Google Drive, Docs, Sheets, Slides | `/drive/v3` `/docs/v1` `/sheets/v4` `/slides/v1` | 13 | [`google_drive.schema.json`](../backlot/schemas/google_drive.schema.json) | A Google Drive file. |
+| `google_drive` | Google Drive, Docs, Sheets, Slides | `/drive/v3` `/docs/v1` `/sheets/v4` `/slides/v1` | 21 | [`google_drive.schema.json`](../backlot/schemas/google_drive.schema.json) | A Google Drive file. |
 | `hubspot` | HubSpot | `/hubspot` | 5 | [`hubspot.schema.json`](../backlot/schemas/hubspot.schema.json) | A HubSpot CRM record (contact, company, deal, ticket, note, …). |
 | `jira` | Jira | `/atlassian/rest/api` | 14 | [`jira.schema.json`](../backlot/schemas/jira.schema.json) | A Jira issue. |
-| `linear` | Linear | `/linear/graphql` | GraphQL (one `POST`) | [`linear.schema.json`](../backlot/schemas/linear.schema.json) | A Linear issue. |
+| `linear` | Linear | `/linear/graphql` | GraphQL (one endpoint, `POST` or `GET`) | [`linear.schema.json`](../backlot/schemas/linear.schema.json) | A Linear issue. |
 | `msteams` | Microsoft Teams | `/msgraph/v1.0` | 13 | [`msteams.schema.json`](../backlot/schemas/msteams.schema.json) | A Microsoft Teams channel message. |
 | `notion` | Notion | `/notion/v1` | 12 | [`notion.schema.json`](../backlot/schemas/notion.schema.json) | A Notion page or database. |
 | `s3` | Amazon S3 | `/s3` | 5 | [`s3.schema.json`](../backlot/schemas/s3.schema.json) | An S3 object. |
@@ -87,7 +87,10 @@ what `search` answers a `GET` or `HEAD`, but for a 401 and a refusal of its `Acc
 
 ### Fireflies — `/fireflies/graphql`
 
-**GraphQL only**, one `POST`. Root `Query` fields:
+**GraphQL only**, one endpoint: a `POST` with a JSON or form body, or a `GET` with the query in its
+query string and a JSON `Content-Type` or none. Apollo Server serves a form, or a `GET` with no
+`Content-Type`, only beside an `apollo-require-preflight` or `x-apollo-operation-name` header, its
+check that a browser preflighted the request. Root `Query` fields:
 
 | Query field | Notes |
 |---|---|
@@ -151,11 +154,12 @@ there is the gateway's answer rather than that backend's, and carries the charse
 
 **`X-GitHub-Api-Version` is honoured too**, in both values real currently supports: `2026-03-10`
 drops `assignee` (issues and pulls) and `merge_commit_sha` (pulls), `2022-11-28` keeps them, an
-unpinned request and one whose header is empty get `2022-11-28`, any other value is the real API's
-400, and a response reports its choice in `X-GitHub-Api-Version-Selected` but on the answers
-`backlot.main.echo_github_api_version` names. `search/code` is the one route that does neither:
-real's code search backend does not read the header, so a pinned version there is served whatever it
-says and no response from it carries the `Selected` header (measured 2026-09-06).
+unpinned request and one whose header is empty get `2022-11-28`, the spaces and tabs around a value
+are trimmed (on contents and a pull's JSON, every Unicode White_Space character), any other value is
+the real API's 400, and a response reports its choice in `X-GitHub-Api-Version-Selected` but on the
+answers `backlot.main.echo_github_api_version` names. `search/code` is the one route that does
+neither: real's code search backend does not read the header, so a pinned version there is served
+whatever it says and no response from it carries the `Selected` header (measured 2026-09-06).
 
 **An operation GitHub publishes and Backlot does not serve is refused for its credential first**: a
 token that does not resolve is "Bad credentials", as on a served route, and no
@@ -174,40 +178,45 @@ not base64, are credentials that do not resolve, though that `Basic` value is no
 header a tab sets apart; a `Basic` value whose base64 holds, as its password or as its user beside
 an empty password or `x-oauth-basic`, a token that resolves or one shaped like real's (`ghp_`,
 `gho_`, `ghu_` or `ghs_` and 36 ASCII letters or digits) or like Backlot's (`usr-` and 20
-hexadecimal digits) is that token; and one that holds anything else is no credential at all.
+hexadecimal digits) is that token; so is one of 40 lower-case hexadecimal digits, or one of those
+four prefixes in another case and 36 ASCII letters or digits, whose "Bad credentials" carries the
+five and is counted in the window a `Basic` value naming no token is counted in; and one that
+holds anything else is no credential at all.
 
-**Every response carries the five `x-ratelimit-*` headers** real puts on every answer, the errors
-included: `limit` at real's numbers (60 an hour for a caller with no credential, 5000 for a token,
-30 and 10 for `search` and `code_search`), `remaining` and `used` counted per credential and per
-resource, `reset` the second that window closes, `resource` the one the request counted against.
-`core` measures an hour and the two search resources measure a minute, as real's do. A window that
-runs out is refused, 403, with `used` pinned at `limit` across the five headers, ahead of the API
-version check, the 401 a route that needs a credential answers a caller without one, and routing
-alike, for a caller with no credential (measured against api.github.com 2026-09-17 and 2026-09-22)
-and for a token (2026-09-23) alike; a bearer that does not resolve still gets its own 401, window
-spent or not (2026-09-23), when a space follows its scheme: in a header a tab sets apart (see the
-paragraph above) it is counted in the window real shares among the `Authorization` values it cannot
-parse, and refused once that window is spent (2026-10-14). The refused request is not itself
-counted, which is why `used` holds at `limit` rather than climbing past it. The body differs by
-caller: two members (`message`, `documentation_url`) for a caller with no credential, three
-(`status` besides) for a token, each with its own `documentation_url`.
-`BACKLOT_GITHUB_ENFORCE_RATE_LIMITS` turns the refusal off (see
-[configuration](configuration.md#github)). `GET /rate_limit` reports the same windows, does not
-count, and is never refused — the one route a client reads its way out of a spent window with;
+**Every response carries the five `x-ratelimit-*` headers** real puts on every answer its API gives,
+the errors included: `limit` at real's numbers (60 an hour for a caller with no credential, 5000 for
+a token, 30 and 10 for `search` and `code_search`), `remaining` and `used` counted per credential
+and per resource, `reset` the second that window closes, `resource` the one the request counted
+against. `core` measures an hour and the two search resources measure a minute, as real's do. A
+window that runs out is refused, 403, with `used` pinned at `limit` across the five headers, ahead
+of the API version check, the 401 a route that needs a credential answers a caller without one, and
+routing alike, for a caller with no credential (measured against api.github.com 2026-09-17 and
+2026-09-22) and for a token (2026-09-23) alike; a bearer that does not resolve still gets its own
+401, window spent or not (2026-09-23), when a space follows its scheme: in a header a tab sets apart
+(see the paragraph above) it is counted in the window real shares among the `Authorization` values
+it cannot parse, and refused once that window is spent (2026-10-14); the two `Basic` shapes the
+paragraph above counts in that window get their own 401 once it is spent, as with it fresh, when a
+space follows the scheme (2026-10-26). The refused request is not itself counted, which is why
+`used` holds at `limit` rather than climbing past it. The body differs by caller: two members
+(`message`, `documentation_url`) for a caller with no credential, three (`status` besides) for a
+token, each with its own `documentation_url`. `BACKLOT_GITHUB_ENFORCE_RATE_LIMITS` turns the refusal
+off (see [configuration](configuration.md#github)). `GET /rate_limit` reports the same windows, does
+not count, and is never refused — the one route a client reads its way out of a spent window with;
 `/rate_limit/` asked with no `Authorization` header is a plain-text `404 Not Found` that carries
 none of the five and counts nowhere, spent window or not (2026-09-23). Four answers carry none of
 the five and count nowhere, as real's do not: a credential that does not resolve, unless a tab sets
-its header apart, a path real does not route asked by a caller that sent one, and, on an operation
-Backlot does not serve, the 401 for an `Authorization` that carries no credential and the 401 for
-none at all on a `PATCH`, `PUT` or `DELETE` (measured 2026-09-10, 2026-09-21, 2026-10-14 and
-2026-10-16).
+its header apart or it is one of the two `Basic` shapes the paragraph above counts, a path real does
+not route asked by a caller that sent one, and, on an operation Backlot does not serve, the 401 for
+an `Authorization` that carries no credential and the 401 for none at all on a `PATCH`, `PUT` or
+`DELETE` (measured 2026-09-10, 2026-09-21, 2026-10-14 and 2026-10-16).
 
 **Every response carries an `x-github-request-id`**, as real's do, code search's and the refusals
 answered before a route runs included: five uppercase hex fields joined by colons, the last being
 the second the request arrived (measured 2026-09-22, 2026-09-23 and 2026-10-18), and a token's
-spent-window 403 quotes it and that second in its `message`. Real's `Date` is the second its answer
-left, the id's or one past it; under `backlot serve` it is uvicorn's, which reads the clock once a
-second, so it can be one behind the id's.
+spent-window 403 quotes it and that second in its `message`. The front door's 400 for a raw byte in
+the request target carries neither it nor the five `x-ratelimit-*`, on real (2026-10-23) as here.
+Real's `Date` is the second its answer left, the id's or one past it; under `backlot serve` it is
+uvicorn's, which reads the clock once a second, so it can be one behind the id's.
 
 An issue body and a pull body are the two distinct field sets real serves — a pull carries `_links`
 and its `*_url` siblings and none of the issue-only fields, `pull_request` included. A repository
@@ -263,16 +272,28 @@ One `source_type` (`google_drive`) across four prefixes.
 | `/drive/v3/files/{id}/permissions` | `fields`, validated and applied to the list and its entries |
 | `/drive/v3/drives` | `q`, as a member who is not the domain's administrator may send it: `name` with `contains`/`=`/`!=`/`<`/`<=`/`>`/`>=` and `hidden` with `=`/`!=` or alone; any other term is a 400. `fields`, validated and applied to the list and its entries |
 | `/drive/v3/about` | `fields` **required**, as in real Google Drive; `storageQuota` is measured from the caller's visible corpus |
-| `/docs/v1/documents/{id}` | |
+| `/docs/v1/documents/{id}` | `body.content` with each element's indices in UTF-16 code units (a `startIndex` of 0 left out, as real leaves it out), each paragraph's `paragraphStyle` and each run's `textStyle`, and the `documentStyle` and `namedStyles` of a document `documents.create` makes |
 | `/sheets/v4/spreadsheets/{id}` | One entry per sheet, with its own `sheetId`, `index`, `title` and `gridProperties`. Structure only — cells need `includeGridData=true`, as in real Sheets. `ranges` filters the `sheets` array itself, and gives a sheet one `data` block per range that touches it |
 | `/sheets/v4/spreadsheets/{id}/values/{range}` | A1 ranges incl. `Summary!A1:B2`, `A:A`, `1:3`, `A2:B`, a bare sheet name quoted or not, an empty one before the bang (`!A1` is the first sheet), and R1C1 — absolute (`R1C1:R2C2`) and bracketed offsets from A1 (`R[1]C[1]`), echoed as the A1 equivalent, with real's reversed-range rule. Any sheet in the workbook, matched case-insensitively; an unqualified range answers from the sheet at index 0. `majorDimension`, `valueRenderOption` |
 | `/sheets/v4/spreadsheets/{id}/values:batchGet` | As above; one unparseable range fails the whole call |
 | `/sheets/v4/spreadsheets/{id}:getByDataFilter` | The same read addressed by `DataFilter` (an `a1Range`, a `gridRange` or a `developerMetadataLookup`) instead of `ranges`. A read, over POST because the filters do not fit in a query string; no filter means every sheet, and so do lookups alone, since a corpus states no developer metadata for one to match. Two filters covering the same cells get a single `data` block |
 | `/sheets/v4/spreadsheets/{id}/values:batchGetByDataFilter` | Likewise for values. Each entry carries the filters that selected it, echoed as the proto real read, filters whose answers name the same range sharing one entry, and the entries come back ordered by where each range starts rather than as sent. A `gridRange` with no cells answers `#REF!`, and a lookup no entry |
+| `PUT /sheets/v4/spreadsheets/{id}/values/{range}` | `values.update`: `valueInputOption` `RAW` or `USER_ENTERED`, the latter read the way the Sheets UI reads typing, with the number format it infers. `includeValuesInResponse` and its two render options |
+| `POST /sheets/v4/spreadsheets/{id}/values/{range}:append` | `values.append`: below the table the range finds, `insertDataOption` `OVERWRITE` or `INSERT_ROWS` |
+| `POST /sheets/v4/spreadsheets/{id}/values/{range}:clear` | `values.clear`: values go, formats stay |
+| `POST /sheets/v4/spreadsheets/{id}/values:batchUpdate`, `values:batchClear` | Every entry checked before any is written; an option the body leaves unset is read from the query |
+| `POST /sheets/v4/spreadsheets/{id}/values:batchUpdateByDataFilter`, `values:batchClearByDataFilter` | The same, each range named by a `DataFilter`, and what a filter matches is a bound on what is written |
+| `POST /sheets/v4/spreadsheets` | `spreadsheets.create`: a workbook at the creator's My Drive root, visible to them alone, with the sheets, cells, number formats, `locale`, `timeZone` and `autoRecalc` the request states |
+| `POST /sheets/v4/spreadsheets/{id}/sheets/{sheetId}:copyTo` | Into a workbook the caller may write, titled in that workbook's language |
 | `/slides/v1/presentations/{id}` | |
 
 The three editor APIs serve native-doc content for editor-aware clients, read structurally instead
 of via Google Drive export.
+
+Only a spreadsheet's owner may write it: every grant a corpus states makes a reader, and a
+reader's write is real's 403. A write lands in a per-server overlay and the corpus file is never
+written; [Writes, and where they go](write-overlay.md) covers what a read then sees, what is not
+modelled, and how to read the overlay back and reset it.
 
 Folders are files here: they match `mimeType='…folder'`, project, sort and resolve permissions like
 stored rows. A trashed file is listed to its owner with the rest unless `q` leaves it out with
@@ -284,7 +305,12 @@ real workbook: named sheets over a 2D grid whose cells keep the type the corpus 
 string. A record that states only `content` keeps the older reading — one sheet, each stored **line**
 held in a single cell verbatim, with Backlot picking no column delimiter, so splitting (CSV, pipes,
 …) stays the corpus owner's decision. Either way `files.export` and the Sheets API describe the same
-cells. Reading a file of the wrong type through any of the three editor APIs is refused, as real
+cells.
+
+A document has two shapes in the same way. A record that states `paragraphs` gives each paragraph
+its named style and its runs bold, italic, underlined, struck through or linked, and its `content`
+is their text, one line each. A record that states only `content` is one plain paragraph per line
+of it. Reading a file of the wrong type through any of the three editor APIs is refused, as real
 Google does, not reinterpreted.
 
 #### OAuth and batch
@@ -554,7 +580,10 @@ operation's 415 carry the account id alone.
 
 ### Linear — `/linear/graphql`
 
-**GraphQL only**, one `POST`. Root `Query` fields:
+**GraphQL only**, one endpoint: a `POST` with a JSON body, or a `GET` with the query in its query
+string. Apollo Server serves a `GET` with no `Content-Type`, or a form or `text/plain` one, only
+beside an `apollo-require-preflight` or `x-apollo-operation-name` header, its check that a
+browser preflighted the request. Root `Query` fields:
 
 | Query field | Notes |
 |---|---|
@@ -729,7 +758,14 @@ a bearer whose token does not resolve is `API token is invalid.`, with `addition
 `{"reason":"token_invalid"}` ahead of the `request_id`. Each refusal named here but the
 framework's 405 carries a `request_id` in the body and `x-notion-request-id` on the response, one
 value; real's differs per response and this one is derived from the request, so a corpus served
-twice answers the same id.
+twice answers the same id. Past the front door, an answer to a `GET`, `HEAD`, `POST`, `PATCH`,
+`PUT`, `DELETE` or `OPTIONS` carries the eight headers real's application sets
+(`x-frame-options: SAMEORIGIN`, `content-security-policy: default-src 'none'` and the rest of
+`backlot.routers.notion.APPLICATION_HEADERS`), and the body reader's refusals below carry none, as
+on real. Each JSON answer to those methods carries Express's weak `ETag` over its body, the body
+reader's refusals included, and a `GET` or `HEAD` sent `If-None-Match: *` whose answer would be a
+2xx gets a 304 instead, as real answers one; the tag of a repeated request repeats here, where
+real's `request_id` makes each of its tags new.
 
 A request is read as the real API reads it before anything is looked up. A JSON body is read first,
 ahead of the credential and the version, as Express reads one: a body that does not parse is

@@ -87,7 +87,8 @@ unnoticed.
 Prefer the environment. A value passed on the command line is visible to any process that can run
 `ps`, and it lands in shell history.
 
-Exit codes are distinct on purpose: `1` is "the contracts disagree", `2` is "the vendor's contract
+Exit codes are distinct on purpose: `1` is "the measurement and the baseline disagree" — a new
+divergence, or a baseline entry for one the vendor no longer has — `2` is "the vendor's contract
 could not be read", and `3` is "a credential this source declares is not set anywhere". A vendor
 outage is not a fidelity finding, and a credential nobody set is this repository's problem rather
 than either — the scheduled run fails on `3` for that reason, because warned about and left green
@@ -349,8 +350,8 @@ The surface takes the shape of the contract:
   name and the message's (`sheets.Spreadsheet`): every message the responses of the methods the
   walk reads reach, with every field and the `type` it holds, since a `fields` mask is read against
   all of them and no served schema answers that offline. Which reads to make is the document's
-  `walk`, one of `backlot.fidelity.google_walks` (`sheets` for Sheets). A message one of its
-  answers was is `implemented`, each field they carried `implemented`, each they did not
+  `walk`, one of `backlot.fidelity.google_walks` (`sheets` for Sheets, `docs` for Docs). A message
+  one of its answers was is `implemented`, each field they carried `implemented`, each they did not
   `missing`, a gap, and each the message does not declare `extra`, breaking; a message none of
   them was is `missing`, with no finding. There is no `root`: the operations are under
   `operations`.
@@ -420,20 +421,24 @@ again, and left in the file as written — the note is the record of the reasoni
 does not delete it — until someone reads the new shape and rewrites it by hand.
 
 A run also reports **resolved** entries: an acknowledged divergence the vendor no longer has. The
-baseline has gone stale, which is its own kind of drift. Where Backlot is what changed — a route,
-a parameter or a field added while the file still records it `missing` — `tests/test_fidelity.py`
-reads the served surface off the app and the SDL, and S3's off a local Backlot, with no vendor
-network, and fails until the file is rewritten. Rewrite it with `--update-baseline`. By hand, delete
-the element's `kind`, `severity`, `detail` and `note`, and the element itself only where neither
-side has it any more: an element Backlot serves stays in the file, and deleting it fails that test.
+baseline has gone stale, which is its own kind of drift, and the run exits 1 for it as for a new
+finding. A stale `gap` entry is not inert: it is matched by what it names alone, so it would
+acknowledge, unreviewed, whatever the vendor later publishes at that name, and the GitHub, HubSpot,
+Notion, Slack, Atlassian and Google routers answer the path of a `missing` operation's entry as an
+operation the vendor publishes. Where Backlot is what changed — a route, a parameter or a field
+added while the file still records it `missing` — `tests/test_fidelity.py` reads the served surface
+off the app and the SDL, and S3's off a local Backlot, with no vendor network, and fails until the
+file is rewritten. Rewrite it with `--update-baseline`. By hand, delete the element's `kind`,
+`severity`, `detail` and `note`, and the element itself only where neither side has it any more: an
+element Backlot serves stays in the file, and deleting it fails that test.
 
 ## In CI
 
 [`.github/workflows/fidelity.yml`](../.github/workflows/fidelity.yml) runs every source daily,
 and on demand through `workflow_dispatch`. Never on a pull request: drift is this project's bug,
 but it is never the bug of whichever pull request happens to be open when a vendor ships a change,
-and a contributor fixing a typo must not be blocked by it. A new divergence opens an issue and
-turns the scheduled run red instead.
+and a contributor fixing a typo must not be blocked by it. A new divergence or a stale entry opens
+an issue and turns the scheduled run red instead.
 
 A source has one open issue at a time. It is opened under the `fidelity` label — the vendor API
 defines the right answer, so closing one needs a measurement against it — titled with the date the
@@ -488,7 +493,7 @@ suite.
 
 Declared, not served: six live routes are `include_in_schema=False` and so invisible to that check.
 Four are FastAPI's own (`/docs`, `/docs/oauth2-redirect`, `/openapi.json`, `/redoc`). The other two
-are the GraphQL POSTs at `/fireflies/graphql` and `/linear/graphql`, which their own comparison
+are the GraphQL endpoints at `/fireflies/graphql` and `/linear/graphql`, which their own comparison
 covers — introspection, not a path map, so there is no mount to say so. Walking `app.routes`
 instead was ruled out for `gen_docs.py`, and the same reasoning holds here.
 

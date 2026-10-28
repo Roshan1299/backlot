@@ -141,10 +141,42 @@ def test_atlassian_bearer_token_takes_only_the_spelling_the_real_site_reads(head
     implements neither, and sharing the permissive parser would authenticate five spellings the
     real site serves anonymously — so a client sending ``Authorization: bearer <t>`` would pass
     every test here and read nothing in production. Slack is strict in its own way (see
-    :func:`auth.slack_bearer_token`); it accepts the double space Atlassian refuses, which is why
-    that parser is not shared either.
+    :func:`auth.slack_bearer_token`), which is why that parser is not shared either.
     """
     assert auth.atlassian_bearer_token(_request(header)) == token
+
+
+@pytest.mark.parametrize(
+    "header, token",
+    [
+        ("Bearer usr-abc123", "usr-abc123"),
+        (" Bearer usr-abc123", "usr-abc123"),
+        ("Bearer usr-abc123 ", "usr-abc123"),
+        ("\tBearer usr-abc123", "usr-abc123"),
+        ("Bearer usr-abc123\t", "usr-abc123"),
+        ("Bearer  usr-abc123", " usr-abc123"),
+        ("Bearer   usr-abc123", "  usr-abc123"),
+        ("Bearer \tusr-abc123", "\tusr-abc123"),
+        ("Bearer \xa0usr-abc123", "\xa0usr-abc123"),
+        ("Bearer usr-abc123\xa0", "usr-abc123\xa0"),
+        ("Bearer usr-abc123\x85", "usr-abc123\x85"),
+        ("Bearer usr-abc123 x", "usr-abc123 x"),
+        ("bearer usr-abc123", None),
+        ("BEARER usr-abc123", None),
+        ("token usr-abc123", None),
+        ("Bearer\tusr-abc123", None),
+        ("Bearerusr-abc123", None),
+        ("Bearer", None),
+        ("Bearer ", None),
+        ("Bearer  ", None),
+        (None, None),
+    ],
+)
+def test_slack_bearer_token_reads_one_header_as_real_does(header, token):
+    """The token :func:`auth.slack_bearer_token` reads from one `Authorization` header, whose rows
+    its docstring records; two headers are `test_slack_reads_the_authorization_headers_as_real_does`
+    in tests/test_slack.py."""
+    assert auth.slack_bearer_token(_request(header)) == token
 
 
 # --- github_credential: which headers api.github.com reads as a credential -------
@@ -218,6 +250,25 @@ _A36 = "A" * 36
         (f"Basic b64(gho_{_A36}:x-oauth-basic)", f"gho_{_A36}"),
         (f"Basic b64(ghp_{_A36})", f"ghp_{_A36}"),
         (f"Basic b64(x:usr-{'0' * 20})", f"usr-{'0' * 20}"),
+        # refused too, but counted: 40 lower-case hex digits, or a prefix in another case
+        (f"Basic b64(x:{'a' * 40})", "a" * 40),
+        (f"Basic b64(x:{'0' * 40})", "0" * 40),
+        (f"Basic b64(x:{'f' * 40})", "f" * 40),
+        (
+            "Basic b64(x:0123456789abcdef0123456789abcdef01234567)",
+            "0123456789abcdef0123456789abcdef01234567",
+        ),
+        (f"Basic b64({'a' * 40})", "a" * 40),
+        (f"Basic b64({'a' * 40}:)", "a" * 40),
+        (f"Basic b64({'a' * 40}:x-oauth-basic)", "a" * 40),
+        (f"Basic b64(x:GHP_{_A36})", f"GHP_{_A36}"),
+        (f"Basic b64(x:Ghp_{_A36})", f"Ghp_{_A36}"),
+        (f"Basic b64(x:gHp_{_A36})", f"gHp_{_A36}"),
+        (f"Basic b64(x:ghP_{_A36})", f"ghP_{_A36}"),
+        (f"Basic b64(x:GHO_{_A36})", f"GHO_{_A36}"),
+        (f"Basic b64(x:GHS_{_A36})", f"GHS_{_A36}"),
+        (f"Basic b64(x:GHU_{_A36})", f"GHU_{_A36}"),
+        (f"Basic b64(x:GHP_{'a' * 36})", f"GHP_{'a' * 36}"),
         # served as no credential at all
         ("Basic abcd", None),
         ("Basic Zm9vOmJhcg==", None),
@@ -242,6 +293,25 @@ _A36 = "A" * 36
         (f"Basic b64(x:github_pat_{'A' * 82})", None),
         (f"Basic b64(ghp_{_A36}:x)", None),
         (f"Basic b64(x:usr-{'0' * 19}g)", None),
+        (f"Basic b64(x:{'g' * 40})", None),
+        (f"Basic b64(x:{'A' * 40})", None),
+        (f"Basic b64(x:{'F' * 40})", None),
+        (f"Basic b64(x:{'aB' * 20})", None),
+        (f"Basic b64(x:{'-' * 40})", None),
+        (f"Basic b64(x:{'_' * 40})", None),
+        (f"Basic b64(x:{'a' * 39})", None),
+        (f"Basic b64(x:{'a' * 41})", None),
+        (f"Basic b64({'a' * 40}:x)", None),
+        (f"Basic b64(x:GHA_{_A36})", None),
+        (f"Basic b64(x:GHR_{_A36})", None),
+        (f"Basic b64(x:GHP_{'A' * 35})", None),
+        (f"Basic b64(x:GHP_{'A' * 37})", None),
+        (f"Basic b64(x:GHP_{'A' * 35}_)", None),
+        # the shapes are ASCII: no long s (U+017F) for `s`, no Kelvin sign (U+212A) for a letter
+        (f"Basic b64(x:gh\u017f_{_A36})", None),
+        (f"Basic b64(x:GH\u017f_{_A36})", None),
+        (f"Basic b64(x:GHP_{'A' * 35}\u212a)", None),
+        (f"Basic b64(x:{'a' * 39}\u212a)", None),
         # no base64 after a tab, and no comma anywhere
         ("Basic\t!!!!", None),
         ("Basic\ta", None),

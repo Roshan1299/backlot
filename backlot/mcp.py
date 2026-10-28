@@ -56,10 +56,25 @@ from typing import Any
 
 from backlot import sigv4
 from backlot.openapi import SOURCE_PREFIXES
+from backlot.version import version
 
 OPENAPI_SOURCES: tuple[str, ...] = tuple(SOURCE_PREFIXES)
 GRAPHQL_SOURCES: tuple[str, ...] = ("linear", "fireflies")
 SOURCES: tuple[str, ...] = OPENAPI_SOURCES + GRAPHQL_SOURCES
+
+# Backlot's icons as ``serverInfo`` and server.json both list them: a PNG and an SVG per theme, the
+# theme naming the background each one is drawn for.
+_ICON_ROOT = "https://raw.githubusercontent.com/brekkylab/backlot/main/assets/icon"
+ICONS: tuple[dict[str, Any], ...] = tuple(
+    {
+        "src": f"{_ICON_ROOT}/backlot-icon-{theme}.{ext}",
+        "mimeType": mime,
+        "sizes": [size],
+        "theme": theme,
+    }
+    for ext, mime, size in (("png", "image/png", "1024x1024"), ("svg", "image/svg+xml", "any"))
+    for theme in ("light", "dark")
+)
 
 # Where `backlot serve` listens by default, and so the one place worth probing before starting a
 # server of our own.
@@ -74,7 +89,7 @@ DEFAULT_URL = "http://127.0.0.1:8000"
 PROBE_TIMEOUT = 2
 NAMED_SERVER_TIMEOUT = 10
 
-# The prefix a source's route handlers carry to stay unique inside one module (`routers/google.py`
+# The prefix a source's route handlers carry to stay unique on one router (`routers.google.router`
 # holds all five Google surfaces), which under the `<source>_` namespace would be said twice:
 # `gmail_gmail_messages_list`, `gdrive_drive_files_list`. `mounted_name` folds it into the namespace.
 # Only the prefix that repeats the namespace is folded. `gdrive` bridges Docs, Sheets and Slides
@@ -274,9 +289,16 @@ def openapi_server(base_url: str, creds: Credentials, source: str, *, spec: dict
         timeout=30,
     )
     # validate_output=False: Backlot's responses are the source of truth; a passthrough must never
-    # reject a real server response for not matching a loose schema.
+    # reject a real server response for not matching a loose schema. Every FastMCP built here takes
+    # ``version=``: one built without it reports FastMCP's own version in ``serverInfo``. Each takes
+    # ``icons=`` too, so a client shows Backlot's icon whichever server it connected to.
     return FastMCP.from_openapi(
-        openapi_spec=spec, client=client, name=f"{source}-bridge", validate_output=False
+        openapi_spec=spec,
+        client=client,
+        name=f"{source}-bridge",
+        version=version(),
+        icons=list(ICONS),
+        validate_output=False,
     )
 
 
@@ -300,6 +322,7 @@ def graphql_server(base_url: str, creds: Credentials, source: str, *, depth: int
     from fastmcp import FastMCP
     from fastmcp.tools import Tool, ToolResult
 
+    from backlot import telemetry
     from backlot.graphql import mcp_tools
 
     endpoint = f"{base_url}/{source}/graphql"
@@ -307,7 +330,9 @@ def graphql_server(base_url: str, creds: Credentials, source: str, *, depth: int
     # The introspection request carries the credential, so a bad token fails here, before a single
     # tool exists, with the endpoint's own error body.
     introspection = _fetch_json(
-        endpoint, headers=headers, body={"query": mcp_tools.INTROSPECTION_QUERY}
+        endpoint,
+        headers={**headers, telemetry.INTERNAL: "mcp"},
+        body={"query": mcp_tools.INTROSPECTION_QUERY},
     )
     if depth is None:
         depth = DEPTH.get(source, mcp_tools.DEFAULT_DEPTH)
@@ -333,7 +358,7 @@ def graphql_server(base_url: str, creds: Credentials, source: str, *, depth: int
             content, failed = graphql_outcome(r.json())
             return ToolResult(content=content, is_error=failed)
 
-    server = FastMCP(name=f"{source}-graphql-bridge")
+    server = FastMCP(name=f"{source}-graphql-bridge", version=version(), icons=list(ICONS))
     for tool in tools:
         server.add_tool(
             _Field(
@@ -391,7 +416,7 @@ def build_server(
     )
     if "atlassian" in servers:
         instructions += " atlassian_* covers both Jira and Confluence."
-    root = FastMCP(name="backlot", instructions=instructions)
+    root = FastMCP(name="backlot", instructions=instructions, version=version(), icons=list(ICONS))
     for source, server in servers.items():
         # `tool_names` renames a tool before the namespace is prefixed, so what goes in is the
         # tail `mounted_name` wants after `<source>_`. Only the tools whose default name would

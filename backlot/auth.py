@@ -58,6 +58,12 @@ _GITHUB_BASE64 = re.compile(r"(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z
 # importers give each user, which stands for a real token here though real serves it as no
 # credential.
 _GITHUB_TOKEN_SHAPE = re.compile(r"gh[pous]_[A-Za-z0-9]{36}|usr-[0-9a-f]{20}")
+# Two more shapes real refuses out of a `Basic` value, but counted, in the window a `Basic` value
+# naming no token is counted in: 40 lower-case hexadecimal digits, and one of the four prefixes of
+# `_GITHUB_TOKEN_SHAPE` in any other case, then 36 ASCII letters or digits (2026-10-25).
+_GITHUB_COUNTED_TOKEN_SHAPE = re.compile(
+    r"[0-9a-f]{40}|(?!gh[pous]_)[gG][hH][pPoOuUsS]_[A-Za-z0-9]{36}"
+)
 
 
 def github_credential(request: Request) -> str | None:
@@ -102,15 +108,27 @@ def github_credential(request: Request) -> str | None:
     ``x:ghp_<37 A>``, ``x:ghp_<35 A>_``, ``x:github_pat_<82 A>`` and ``ghp_<36 A>:x`` was the 200
     (2026-10-24 and 2026-10-25).
 
+    Two more shapes are the 401 out of a `Basic` value, but counted, with the five of the window a
+    `Basic` value naming no token is counted in (:data:`_GITHUB_COUNTED_TOKEN_SHAPE`): the base64 of
+    ``x:<40 a>``, ``x:<40 0>``, ``x:<40 f>``, ``x:0123456789abcdef0123456789abcdef01234567``,
+    ``<40 a>``, ``<40 a>:`` and ``<40 a>:x-oauth-basic``, and of ``x:GHP_<36 A>``, ``x:Ghp_<36 A>``,
+    ``x:gHp_<36 A>``, ``x:ghP_<36 A>``, ``x:GHO_<36 A>``, ``x:GHS_<36 A>``, ``x:GHU_<36 A>`` and
+    ``x:GHP_<36 a>``. ``x:<40 g>``, ``x:<40 A>``, ``x:<40 F>``, ``x:<40 ->``, ``x:<40 _>``, forty of
+    ``aB``, ``x:<39 a>``, ``x:<41 a>``, ``x:GHA_<36 A>``, ``x:GHR_<36 A>``, ``x:GHP_<35 A>``,
+    ``x:GHP_<37 A>``, ``x:GHP_<35 A>_`` and ``<40 a>:x`` were the 200, and so were
+    ``x:gh<U+017F>_<36 A>`` and ``x:GH<U+017F>_<36 A>``, a long s for the `s`, and
+    ``x:GHP_<35 A><U+212A>`` and ``x:<39 a><U+212A>``, each ending in the Kelvin sign (2026-10-25
+    and 2026-10-26).
+
     So real splits the scheme off at the first space, tab or comma, reads the password of a `Basic`
     value that decodes, or its user when there is no colon or the password is empty or
     `x-oauth-basic`, and serves one whose token does not resolve as no credential at all, as it does
     an unknown scheme, unless that token is shaped like one of real's (:data:`_GITHUB_TOKEN_SHAPE`,
-    which takes Backlot's too). A `Basic` value that does not decode is no credential either where
-    :func:`github_scheme_then_a_tab` holds. A space and a tab are the only whitespace it trims:
-    ``Bearer <NBSP>``, ``Bearer <t><NBSP>``, ``Bearer <NBSP><t>``, ``Bearer <t><NEL>``,
-    ``Bearer <t><0x1F>``, ``Basic <NBSP>`` and base64, and the base64 of ``x:<t>`` followed by a
-    no-break space were each the 401 (2026-10-16).
+    which takes Backlot's too, or :data:`_GITHUB_COUNTED_TOKEN_SHAPE`). A `Basic` value that does
+    not decode is no credential either where :func:`github_scheme_then_a_tab` holds. A space and a
+    tab are the only whitespace it trims: ``Bearer <NBSP>``, ``Bearer <t><NBSP>``,
+    ``Bearer <NBSP><t>``, ``Bearer <t><NEL>``, ``Bearer <t><0x1F>``, ``Basic <NBSP>`` and base64,
+    and the base64 of ``x:<t>`` followed by a no-break space were each the 401 (2026-10-16).
 
     More than one `Authorization` header is the 401 whatever each holds, with none of the five
     `x-ratelimit-*`: on `/rate_limit` and `/search/issues`, ``Bearer <t>`` with a second copy, and
@@ -133,10 +151,29 @@ def github_credential(request: Request) -> str | None:
             return None if github_scheme_then_a_tab(request) else ""
         user, _, password = base64.b64decode(value).decode("utf-8", "replace").partition(":")
         token = user if password in ("", "x-oauth-basic") else password
-        if acl(request).resolve(token) is not None or _GITHUB_TOKEN_SHAPE.fullmatch(token):
+        if (
+            acl(request).resolve(token) is not None
+            or _GITHUB_TOKEN_SHAPE.fullmatch(token)
+            or _GITHUB_COUNTED_TOKEN_SHAPE.fullmatch(token)
+        ):
             return token
         return None
     return None
+
+
+def github_basic_token_counted(request: Request) -> bool:
+    """Whether the request's `Authorization` is `Basic` naming a token of
+    :data:`_GITHUB_COUNTED_TOKEN_SHAPE` that resolves to no one: the "Bad credentials" 401 real
+    counts in the window a `Basic` value naming no token is counted in, carrying its five
+    `x-ratelimit-*`. A `Bearer` with the same token is the 401 with none of the five."""
+    if repeated_authorization(request) or github_scheme(request)[0] != "basic":
+        return False
+    token = github_credential(request)
+    return (
+        bool(token)
+        and _GITHUB_COUNTED_TOKEN_SHAPE.fullmatch(token) is not None
+        and acl(request).resolve(token) is None
+    )
 
 
 def github_scheme(request: Request) -> tuple[str, str]:
@@ -160,6 +197,28 @@ def github_scheme_then_a_tab(request: Request) -> bool:
 def repeated_authorization(request: Request) -> bool:
     """Whether the request carries more than one `Authorization` header."""
     return len(request.headers.getlist("authorization")) > 1
+
+
+#: The conditional headers Cloudflare, in front of Notion, HubSpot, Linear and Fireflies,
+#: refuses with its 400 page when one of them comes more than once, as it does `Authorization`.
+_CLOUDFLARE_REFUSED_HEADERS = (
+    "if-none-match",
+    "if-match",
+    "if-modified-since",
+    "if-unmodified-since",
+    "if-range",
+)
+
+
+def repeated_cloudflare_refused_header(request: Request) -> bool:
+    """Whether the request carries more than once `Authorization` or one of the conditional
+    headers Cloudflare refuses (:data:`_CLOUDFLARE_REFUSED_HEADERS`): api.notion.com,
+    api.linear.app, api.fireflies.ai and api.hubapi.com answered `Authorization` and each of the
+    five, sent twice with the same value, with the 155-byte `400 Bad Request` page on 2026-10-27
+    (UTC), where one copy, and `Cache-Control` or `Range` twice, were served."""
+    return repeated_authorization(request) or any(
+        len(request.headers.getlist(name)) > 1 for name in _CLOUDFLARE_REFUSED_HEADERS
+    )
 
 
 def api_key_token(request: Request) -> str | None:
@@ -304,18 +363,25 @@ def basic_names_a_user(request: Request) -> bool:
 
 def slack_bearer_token(request: Request) -> str | None:
     """Parse the ``Authorization`` header the way Slack does, which is stricter than
-    :func:`bearer_token`: the scheme must be exactly ``Bearer``, separated from the token by one or
-    more SPACES.
+    :func:`bearer_token`: the scheme must be exactly ``Bearer``, followed by one space and the
+    token, which keeps whatever follows that space. Spaces and tabs around a header's value are no
+    part of it, and two headers are read as one, their values joined by a comma once the blank ones
+    are left out, so `Bearer <t>` sent twice is the token `<t>, Bearer <t>`.
 
     Measured against slack.com (a bogus token is enough — the presented/absent split needs no
     account). ``invalid_auth`` means the header counted as a credential, ``not_authed`` means it
     did not::
 
         Bearer <t>      invalid_auth      bearer <t>      not_authed
-        Bearer  <t>     invalid_auth      BEARER <t>      not_authed
-        ' Bearer <t>'   invalid_auth      token <t>       not_authed
-        Bearer <t>' '   invalid_auth      Bearer<TAB><t>  not_authed
+                                          BEARER <t>      not_authed
+                                          token <t>       not_authed
+                                          Bearer<TAB><t>  not_authed
                                           Bearer<t>       not_authed
+
+    With a user token that resolves, real's `auth.test` answered each row of
+    ``tests/test_slack.py::_SLACK_AUTHORIZATION_ROWS`` as that table gives it, the headers sent
+    over a raw socket on 2026-10-26 (one header first on 2026-10-20). U+00A0 and U+0085 after the
+    token were ``invalid_auth`` there, where ``str.strip()`` takes them off.
 
     A tab is not a space to Slack, so the generic whitespace split in :func:`bearer_token` is
     wrong here, and so is its case-insensitive scheme match. That function stays permissive because
@@ -325,10 +391,11 @@ def slack_bearer_token(request: Request) -> str | None:
     either — so a client sending ``Authorization: token <xoxb>`` would pass every test here and
     reach nothing in production.
     """
-    hdr = (_authorization(request) or "").strip()
+    values = (value.strip(" \t") for value in request.headers.getlist("authorization"))
+    hdr = ", ".join(value for value in values if value)
     if not hdr.startswith("Bearer "):
         return None
-    return hdr[len("Bearer ") :].strip() or None
+    return hdr[len("Bearer ") :] or None
 
 
 def msgraph_token(request: Request) -> tuple[str, str | None]:
@@ -451,8 +518,8 @@ def atlassian_bearer_token(request: Request) -> str | None:
     answering them with a 400 on real and here. Sharing :func:`bearer_token` would authenticate six
     of those spellings — every "not read" row above but ``OAuth <t>``, ``Bearer<t>`` and the bare
     ``Bearer`` — so a client sending ``Authorization: token <t>`` would pass every test here and
-    read nothing in production. Slack refuses a different set: it takes the double space this
-    refuses.
+    read nothing in production. Slack reads the double space this refuses as a credential, the
+    second space part of a token that then resolves to nobody.
     """
     hdr = (_authorization(request) or "").strip(" \t")
     if not hdr.startswith("Bearer "):

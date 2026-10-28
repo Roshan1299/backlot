@@ -1,6 +1,6 @@
 """The ``backlot`` console script — every command and every option it accepts, declared here.
 
-    backlot serve                       # uvicorn backlot.main:app, with uvicorn's own defaults
+    backlot serve                       # uvicorn backlot.main:app, on backlot.protocol
     backlot import <corpus.jsonl>       # backlot.importer.byo   (--type byo, the default)
     backlot import --type enterpriserag-bench   # backlot.importer.erb, no options
     backlot export out/                 # the bench as a BYO artifact instead of a database
@@ -22,13 +22,13 @@ from __future__ import annotations
 import os
 import sys
 from enum import Enum
-from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Annotated, NoReturn, Optional
 
 import typer
 
 from backlot import mcp as _mcp
+from backlot.version import version
 
 # The importers and uvicorn are imported inside each command, not here: `serve` must not pay for
 # `backlot.importer.erb` (2,400 lines) and `import` must not pull in uvicorn. `backlot.mcp` is the
@@ -169,13 +169,6 @@ app = typer.Typer(
 )
 
 
-def _version() -> str:
-    try:
-        return version("backlot")
-    except PackageNotFoundError:  # a source tree that was never installed
-        return "unknown"
-
-
 def _use_data_dir(data_dir: Path | None) -> None:
     """Point this run's settings at ``data_dir``.
 
@@ -253,7 +246,7 @@ def _root(
     ] = False,
 ) -> None:
     if version_:
-        typer.echo(f"backlot {_version()}")
+        typer.echo(f"backlot {version()}")
         raise typer.Exit()
 
 
@@ -323,7 +316,7 @@ def serve(
 ) -> None:
     """Serve Backlot APIs over the corpus in the data dir.
 
-    Every default here is uvicorn's own, so this is a shorter spelling of `python -m uvicorn backlot.main:app` rather than a second set of behaviour to keep in step with it.
+    Every default here is uvicorn's own but the HTTP protocol, which is backlot.protocol's.
     """  # noqa: E501 — one source line per paragraph: typer renders a docstring newline as a line break, so a wrapped paragraph reaches the help screen broken mid-sentence.
     _use_data_dir(data_dir)
     if disable_telemetry:
@@ -353,6 +346,8 @@ def serve(
         _stop_at_stdin_eof()
     import uvicorn
 
+    from backlot.protocol import Protocol
+
     # The app is passed as an import STRING because that is what --reload requires.
     uvicorn.run(
         "backlot.main:app",
@@ -364,6 +359,9 @@ def serve(
         log_level=log_level.value if log_level else None,
         proxy_headers=proxy_headers,
         forwarded_allow_ips=forwarded_allow_ips,
+        # the class, not its import string, which uvicorn resolves only from 0.36 on; --reload
+        # pickles it by reference
+        http=Protocol,
     )
 
 
@@ -773,7 +771,7 @@ def diff(
 ) -> None:
     """Compare the schema Backlot serves against the vendor's own, in both directions.
 
-    Fidelity is measured, never assumed — and until this command a measurement only happened when someone went looking. Run on a schedule, it is what notices the vendor changing something in March. Divergences already read and accepted live in `backlot/fidelity/baseline/<source>.json`, so a run reports what is NEW; accepting one is a file change that goes through review. Exits 1 when anything is unacknowledged, 2 when the vendor's contract could not be read at all — a vendor outage is not a fidelity finding — and 3 when a credential this source declares is not set anywhere or the baseline file cannot be read or written, which is a configuration problem rather than either.
+    Fidelity is measured, never assumed — and until this command a measurement only happened when someone went looking. Run on a schedule, it is what notices the vendor changing something in March. Divergences already read and accepted live in `backlot/fidelity/baseline/<source>.json`, so a run reports what is NEW; accepting one is a file change that goes through review. Exits 1 when anything is unacknowledged or the baseline acknowledges a divergence the vendor no longer has, 2 when the vendor's contract could not be read at all — a vendor outage is not a fidelity finding — and 3 when a credential this source declares is not set anywhere or the baseline file cannot be read or written, which is a configuration problem rather than either.
     """  # noqa: E501 — see the note on `serve`: a paragraph must be one source line.
     from backlot.fidelity import (
         BREAKING,
@@ -865,9 +863,10 @@ def diff(
             raise typer.Exit(1)
         return
 
+    # A stale entry fails the run as a new finding does; docs/fidelity.md says why one is not inert.
     if as_json:
         _emit_json(source, spec.endpoints, findings, new=fresh, resolved=stale)
-        if fresh:
+        if fresh or stale:
             raise typer.Exit(1)
         return
 
@@ -876,8 +875,10 @@ def diff(
         + typer.style(source, bold=True)
         + typer.style(" · " + ", ".join(spec.endpoints), dim=True)
     )
-    # The count that decides whether this run passed is the one worth colouring.
-    new_count = typer.style(f"{len(fresh)} new", fg="red" if fresh else "green", bold=True)
+    # Green only for a run that passes: a stale entry fails it with nothing new.
+    new_count = typer.style(
+        f"{len(fresh)} new", fg="red" if fresh else "yellow" if stale else "green", bold=True
+    )
     typer.echo(
         typer.style(
             f"   {len(findings)} divergence(s) · {len(findings) - len(fresh)} acknowledged · ",
@@ -898,6 +899,8 @@ def diff(
         for f in stale:
             typer.echo(f"     {typer.style(f.path, bold=True)}")
     if not fresh:
+        if stale:
+            raise typer.Exit(1)
         typer.echo("")
         typer.echo(typer.style("✅ nothing new", fg="green", bold=True))
         return
